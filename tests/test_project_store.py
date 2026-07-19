@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from foctwin.domain import MotorProfile
@@ -21,7 +22,7 @@ class ProjectStoreTests(unittest.TestCase):
             self.assertEqual(payload["payload"]["next_experiment"], experiment_id)
             self.assertTrue(store.db_path.exists())
 
-            with sqlite3.connect(store.db_path) as connection:
+            with closing(sqlite3.connect(store.db_path)) as connection:
                 result = connection.execute(
                     "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
                 ).fetchone()
