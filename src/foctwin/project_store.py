@@ -5,7 +5,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -13,7 +13,7 @@ from foctwin.domain import MotorProfile
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class ProjectStore:
@@ -142,4 +142,3 @@ class ProjectStore:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-
