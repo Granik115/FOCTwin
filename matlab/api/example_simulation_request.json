@@ -1,0 +1,17 @@
+{
+  "mode": "current",
+  "stop_time_s": 3,
+  "trajectory": {
+    "angle_rad": 0.2,
+    "velocity_rad_s": 0.2,
+    "iq_a": 0.5
+  },
+  "safety": {
+    "current_a": 1.0,
+    "voltage_v": 12.0,
+    "velocity_rad_s": 0.7,
+    "angle_min_rad": -6.283185307179586,
+    "angle_max_rad": 6.283185307179586
+  }
+}
+

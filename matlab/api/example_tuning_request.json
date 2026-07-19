@@ -1,0 +1,35 @@
+{
+  "simulation": {
+    "mode": "current",
+    "stop_time_s": 3,
+    "trajectory": {
+      "angle_rad": 1
+    }
+  },
+  "metric": "IAE_final",
+  "parameters": [
+    {
+      "path": "controllers.angle.p",
+      "lower": 1,
+      "upper": 200
+    },
+    {
+      "path": "controllers.velocity.p",
+      "lower": 1,
+      "upper": 50
+    },
+    {
+      "path": "controllers.velocity.i",
+      "lower": 0,
+      "upper": 3000
+    }
+  ],
+  "optimizer": {
+    "max_evaluations": 60,
+    "min_surrogate_points": 15,
+    "use_parallel": false,
+    "resume": false,
+    "top_count": 5,
+    "checkpoint_file": "surrogate-checkpoint.mat"
+  }
+}
