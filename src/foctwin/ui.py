@@ -8,8 +8,6 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -36,7 +34,6 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -821,4 +818,3 @@ class MainWindow(QMainWindow):
         if self.matlab.connected:
             self.matlab.stop()
         event.accept()
-
