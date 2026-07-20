@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - "release/v*"
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -13,6 +16,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -24,7 +29,7 @@ jobs:
         run: |
           $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
           $expectedBranch = "release/v$version"
-          if ("${{ github.ref_name }}" -ne $expectedBranch) {
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_name }}" -ne $expectedBranch) {
             throw "Release branch '${{ github.ref_name }}' does not match project version '$expectedBranch'."
           }
           "VERSION=$version" >> $env:GITHUB_ENV
@@ -68,12 +73,17 @@ jobs:
           $archive = "FOCTwin-$env:VERSION-windows-x64.zip"
           $checksum = "$archive.sha256"
           $repository = "${{ github.repository }}"
+          $target = if ("${{ github.event_name }}" -eq "pull_request") {
+            "${{ github.event.pull_request.head.sha }}"
+          } else {
+            "${{ github.sha }}"
+          }
           if (gh release view $tag --repo $repository 2>$null) {
             gh release upload $tag $archive $checksum --clobber --repo $repository
           } else {
             gh release create $tag $archive $checksum `
               --repo $repository `
-              --target "${{ github.sha }}" `
+              --target $target `
               --title "FOCTwin $env:VERSION" `
               --notes "Предварительная Windows-сборка для аппаратного тестирования. Распакуйте ZIP и запустите FOCTwin.exe. Сборка не подписана цифровой подписью, поэтому Windows SmartScreen может показать предупреждение." `
               --prerelease
