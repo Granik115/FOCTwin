@@ -1,7 +1,12 @@
 import unittest
 
 from foctwin.domain import MotionMode, TorqueMode
-from foctwin.protocol import CommanderProtocol, parse_commander_response, parse_monitor_line
+from foctwin.protocol import (
+    CommanderProtocol,
+    is_monitor_candidate,
+    parse_commander_response,
+    parse_monitor_line,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -23,7 +28,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(protocol.pid("velocity", "lpf", 0.01), "AVF0.01")
 
     def test_monitor_parser_normalizes_streamed_milliamps(self):
-        parsed = parse_monitor_line("1\t2\t3\t400\t-50\t6\t7")
+        parsed = parse_monitor_line(
+            "1.0000\t2.0000\t3.0000\t400.0000\t-50.0000\t6.0000\t7.0000"
+        )
         self.assertEqual(parsed, {
             "target": 1.0,
             "voltage_q_v": 2.0,
@@ -37,9 +44,18 @@ class ProtocolTests(unittest.TestCase):
 
     def test_monitor_parser_supports_selected_variables(self):
         self.assertEqual(
-            parse_monitor_line("1\t250\t0.5", "1001010"),
+            parse_monitor_line("1.0000\t250.0000\t0.5000", "1001010"),
             {"target": 1.0, "current_q_a": 0.25, "velocity_rad_s": 0.5},
         )
+
+    def test_monitor_parser_rejects_character_loss_that_still_looks_numeric(self):
+        lost_decimal = "10000\t0.1000\t0.0000\t1.0000\t2.0000\t0.0000\t1.0000"
+        lost_leading_digit = ".0000\t0.1000\t0.0000\t1.0000\t2.0000\t0.0000\t1.0000"
+
+        self.assertIsNone(parse_monitor_line(lost_decimal))
+        self.assertIsNone(parse_monitor_line(lost_leading_digit))
+        self.assertTrue(is_monitor_candidate(lost_decimal))
+        self.assertTrue(is_monitor_candidate(lost_leading_digit))
 
     def test_commander_response_parser_reads_limits_status_and_pid(self):
         current = parse_commander_response("Limits| curr: 1.000")

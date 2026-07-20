@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -37,6 +38,8 @@ MONITOR_FIELDS = (
     "velocity_rad_s",
     "angle_rad",
 )
+
+_MONITOR_NUMBER = re.compile(r"[-+]?\d+\.\d{4}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +128,12 @@ class CommanderProtocol:
 
 
 def parse_monitor_line(line: str, mask: str = "1111111") -> dict[str, float] | None:
-    """Parse a SimpleFOC monitor row and normalize streamed currents from mA to A."""
+    """Parse an intact SimpleFOC monitor row and normalize streamed currents from mA to A.
+
+    The bundled firmware prints every monitor value with four decimal places. Requiring that
+    exact shape is intentional: USB CDC corruption observed on hardware can remove one symbol
+    while leaving a syntactically valid but dangerously wrong number (``1.0000`` -> ``10000``).
+    """
 
     if len(mask) != 7 or any(bit not in "01" for bit in mask):
         raise ValueError("Monitor mask must contain exactly seven 0/1 digits")
@@ -133,15 +141,28 @@ def parse_monitor_line(line: str, mask: str = "1111111") -> dict[str, float] | N
     fields = line.strip().split("\t")
     if not names or len(fields) != len(names):
         return None
+    if any(_MONITOR_NUMBER.fullmatch(value) is None for value in fields):
+        return None
     try:
         values = [float(value) for value in fields]
     except ValueError:
+        return None
+    if any(not math.isfinite(value) for value in values):
         return None
     parsed = dict(zip(names, values, strict=True))
     for current_name in ("current_q_a", "current_d_a"):
         if current_name in parsed:
             parsed[current_name] /= 1000.0
     return parsed
+
+
+def is_monitor_candidate(line: str, mask: str = "1111111") -> bool:
+    """Return true when a line has the expected monitor field count but invalid contents."""
+
+    if len(mask) != 7 or any(bit not in "01" for bit in mask):
+        raise ValueError("Monitor mask must contain exactly seven 0/1 digits")
+    expected_fields = mask.count("1")
+    return expected_fields > 0 and len(line.strip().split("\t")) == expected_fields
 
 
 def parse_commander_response(line: str) -> CommanderResponse | None:
