@@ -50,6 +50,7 @@ from foctwin.protocol import (
     MONITOR_FIELDS,
     CommanderProtocol,
     CommanderResponse,
+    is_monitor_candidate,
     parse_commander_response,
     parse_monitor_line,
 )
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
         self.telemetry_statistics = TelemetryStatistics()
         self.telemetry_recorder = TelemetryRecorder()
         self._telemetry_sequence = 0
+        self._rejected_telemetry_count = 0
         self._telemetry_series: dict[str, tuple[list[float], list[float]]] = {
             name: ([], []) for name in MONITOR_FIELDS
         }
@@ -1165,6 +1167,7 @@ class MainWindow(QMainWindow):
             return
         self.monitor_mask = mask
         self.telemetry_statistics.reset()
+        self._rejected_telemetry_count = 0
         self._monitoring_requested = True
         self._monitor_restart_count = 0
         self._send_monitor_configuration("настроен пользователем")
@@ -1308,7 +1311,17 @@ class MainWindow(QMainWindow):
         parsed = parse_monitor_line(line, self.monitor_mask)
         if not parsed:
             self.raw_output.appendPlainText(f"RX  {line}")
-            self._log("RX", line)
+            if is_monitor_candidate(line, self.monitor_mask):
+                self._rejected_telemetry_count += 1
+                # Preserve evidence without flooding the persistent log when a cable is noisy.
+                count = self._rejected_telemetry_count
+                if count <= 3 or count & (count - 1) == 0:
+                    self._log(
+                        "TELEMETRY_DROP",
+                        f"Отброшена повреждённая строка #{count}: {line}",
+                    )
+            else:
+                self._log("RX", line)
             return
         if self.raw_telemetry_checkbox.isChecked():
             self.raw_output.appendPlainText(f"RX  {line}")
@@ -1350,10 +1363,15 @@ class MainWindow(QMainWindow):
                 value = getattr(sample, name)
                 if value is not None:
                     self.telemetry_values[name].setText(f"{value:.6g}")
+        rejected = (
+            f" · повреждено/отброшено: {self._rejected_telemetry_count}"
+            if self._rejected_telemetry_count
+            else ""
+        )
         self.monitor_stats_label.setText(
             f"{self.telemetry_statistics.sample_count} отсчётов · "
             f"{self.telemetry_statistics.frequency_hz:.1f} Гц · "
-            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс"
+            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс{rejected}"
         )
         self._refresh_live_plot()
         recorder_error = self.telemetry_recorder.last_error
