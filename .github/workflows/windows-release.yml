@@ -27,7 +27,11 @@ jobs:
       - name: Read and validate version
         shell: pwsh
         run: |
-          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          $match = Select-String -Path "pyproject.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) {
+            throw "Project version was not found in pyproject.toml."
+          }
+          $version = $match.Matches[0].Groups[1].Value
           $expectedBranch = "release/v$version"
           if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_name }}" -ne $expectedBranch) {
             throw "Release branch '${{ github.ref_name }}' does not match project version '$expectedBranch'."
