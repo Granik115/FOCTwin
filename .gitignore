@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec.tmp
+
+# FOCTwin user projects and runtime data
+*.foctwin/
+projects/
+runtime/
+logs/
+checkpoints/
+telemetry/
+
+# MATLAB generated files
+slprj/
+*.slxc
+*.mexw64
+*.asv
+surrogate_tuning_checkpoint.mat
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

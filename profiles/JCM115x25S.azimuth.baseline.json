@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "JCM115x25S / azimuth / baseline",
+  "source": "KUBO catalogue, current firmware, supplied init_params3 and prior experiments",
+  "motor": {
+    "model": "JCM115x25S",
+    "command_id": "A",
+    "pole_pairs": 15,
+    "phase_resistance_ohm": 0.675,
+    "ld_h": 0.0013,
+    "lq_h": 0.0013,
+    "back_emf_v_per_krpm": 92.6,
+    "flux_linkage_wb": 0.05897,
+    "torque_constant_nm_per_a": 1.3264,
+    "rotor_inertia_kg_m2": 0.00041
+  },
+  "identified": {
+    "inertia_kg_m2": 0.07,
+    "viscous_friction_nm_s_rad": 0.00001,
+    "coulomb_friction_nm": 0.0,
+    "breakaway_friction_nm": 0.0,
+    "breakaway_velocity_rad_s": 0.01,
+    "status": "initial guesses; J and friction must be identified"
+  },
+  "safety": {
+    "current_a": 1.0,
+    "voltage_v": 12.0,
+    "velocity_rad_s": 0.7,
+    "angle_min_rad": -6.283185307179586,
+    "angle_max_rad": 6.283185307179586,
+    "trial_timeout_s": 10.0,
+    "telemetry_timeout_s": 1.0
+  },
+  "controllers": {
+    "angle": {"p": 35.0, "i": 0.0, "d": 0.0, "output_ramp": 0.0, "output_limit": 0.7, "lpf_tf": 0.0, "anti_windup_kc": 0.8},
+    "velocity": {"p": 20.4, "i": 470.0, "d": 0.0, "output_ramp": 1000.0, "output_limit": 12.0, "lpf_tf": 0.01, "anti_windup_kc": 0.8},
+    "current_q": {"p": 8.4222, "i": 814.0, "d": 0.0, "output_ramp": 3000.0, "output_limit": 12.0, "lpf_tf": 0.005, "anti_windup_kc": 0.8},
+    "current_d": {"p": 8.4222, "i": 814.0, "d": 0.0, "output_ramp": 3000.0, "output_limit": 12.0, "lpf_tf": 0.005, "anti_windup_kc": 0.8}
+  },
+  "known_conflicts": [
+    "Supplied sources contain J_load=0.35, a comment mentioning 1.2 kg*m^2, and active J=0.07.",
+    "Previous friction experiments produced incompatible values; none is accepted as ground truth.",
+    "Application safety limits are intentionally stricter than firmware defaults."
+  ]
+}
+

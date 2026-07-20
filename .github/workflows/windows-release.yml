@@ -1,0 +1,94 @@
+name: Windows release
+
+on:
+  push:
+    branches:
+      - "release/v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Read and validate version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path "pyproject.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) {
+            throw "Project version was not found in pyproject.toml."
+          }
+          $version = $match.Matches[0].Groups[1].Value
+          $expectedBranch = "release/v$version"
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_name }}" -ne $expectedBranch) {
+            throw "Release branch '${{ github.ref_name }}' does not match project version '$expectedBranch'."
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install build dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Ruff
+        run: ruff check src tests
+
+      - name: Build portable application
+        run: python -m PyInstaller --noconfirm packaging/FOCTwin.spec
+
+      - name: Package portable ZIP and checksum
+        shell: pwsh
+        run: |
+          $archive = "FOCTwin-$env:VERSION-windows-x64.zip"
+          Compress-Archive -Path "dist/FOCTwin" -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content "$archive.sha256" -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FOCTwin-${{ env.VERSION }}-windows-x64
+          path: |
+            FOCTwin-${{ env.VERSION }}-windows-x64.zip
+            FOCTwin-${{ env.VERSION }}-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VERSION"
+          $archive = "FOCTwin-$env:VERSION-windows-x64.zip"
+          $checksum = "$archive.sha256"
+          $repository = "${{ github.repository }}"
+          $target = if ("${{ github.event_name }}" -eq "pull_request") {
+            "${{ github.event.pull_request.head.sha }}"
+          } else {
+            "${{ github.sha }}"
+          }
+          if (gh release view $tag --repo $repository 2>$null) {
+            gh release upload $tag $archive $checksum --clobber --repo $repository
+          } else {
+            gh release create $tag $archive $checksum `
+              --repo $repository `
+              --target $target `
+              --title "FOCTwin $env:VERSION" `
+              --notes "Предварительная Windows-сборка для аппаратного тестирования. Распакуйте ZIP и запустите FOCTwin.exe. Сборка не подписана цифровой подписью, поэтому Windows SmartScreen может показать предупреждение." `
+              --prerelease
+          }
