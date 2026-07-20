@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from foctwin.domain import TelemetrySample
-from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics
+from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics, monitor_stale_timeout
 
 
 class TelemetryTests(unittest.TestCase):
@@ -31,10 +31,16 @@ class TelemetryTests(unittest.TestCase):
                     raw="raw row",
                 )
             )
+            recorder.stop()
 
             with path.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
-            recorder.stop()
 
             self.assertEqual(rows[0]["current_q_a"], "0.4")
             self.assertEqual(rows[0]["raw"], "raw row")
+
+    def test_monitor_timeout_scales_with_downsample(self):
+        self.assertEqual(monitor_stale_timeout(20), 2.0)
+        self.assertGreater(monitor_stale_timeout(100000), 300.0)
+        with self.assertRaises(ValueError):
+            monitor_stale_timeout(0)

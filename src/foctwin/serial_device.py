@@ -16,6 +16,34 @@ LineCallback = Callable[[float, str], None]
 StateCallback = Callable[[bool, str], None]
 
 
+class SerialLineFramer:
+    """Accumulate USB CDC fragments and emit only complete newline-terminated records."""
+
+    def __init__(self, max_pending_bytes: int = 65536) -> None:
+        self.max_pending_bytes = max_pending_bytes
+        self._pending = bytearray()
+        self.overflow_count = 0
+
+    def feed(self, chunk: bytes) -> list[str]:
+        if not chunk:
+            return []
+        self._pending.extend(chunk)
+        lines: list[str] = []
+        while True:
+            newline = self._pending.find(b"\n")
+            if newline < 0:
+                break
+            raw = bytes(self._pending[:newline])
+            del self._pending[: newline + 1]
+            line = raw.rstrip(b"\r").decode("utf-8", errors="replace")
+            if line:
+                lines.append(line)
+        if len(self._pending) > self.max_pending_bytes:
+            self._pending.clear()
+            self.overflow_count += 1
+        return lines
+
+
 class SerialDevice:
     """Threaded, UI-independent transport for the existing USB CDC firmware."""
 
@@ -83,12 +111,13 @@ class SerialDevice:
         return sent
 
     def _read_loop(self) -> None:
+        framer = SerialLineFramer()
         try:
             while not self._stop.is_set() and self.connected:
-                raw = self._port.readline()
-                if raw:
-                    received_at = time.monotonic()
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                waiting = int(getattr(self._port, "in_waiting", 0) or 0)
+                raw = self._port.read(max(1, min(waiting, 4096)))
+                received_at = time.monotonic()
+                for line in framer.feed(raw):
                     self.on_line(received_at, line)
         except Exception as exc:
             self.on_state(False, f"Ошибка Serial: {exc}")

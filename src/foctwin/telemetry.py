@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import math
+import queue
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -81,10 +83,14 @@ class TelemetryRecorder:
         self.path: Path | None = None
         self._handle: TextIO | None = None
         self._writer: csv.DictWriter | None = None
+        self._queue: queue.Queue[TelemetrySample | None] | None = None
+        self._thread: threading.Thread | None = None
+        self._active = False
+        self.last_error: str | None = None
 
     @property
     def active(self) -> bool:
-        return self._handle is not None
+        return self._active
 
     def start(self, path: str | Path) -> Path:
         self.stop()
@@ -94,19 +100,68 @@ class TelemetryRecorder:
         self._writer = csv.DictWriter(self._handle, fieldnames=self.FIELDS)
         self._writer.writeheader()
         self._handle.flush()
+        self._queue = queue.Queue()
+        self._active = True
+        self.last_error = None
+        self._thread = threading.Thread(
+            target=self._write_loop,
+            args=(self._queue, self._writer, self._handle),
+            name="foctwin-telemetry-writer",
+            daemon=True,
+        )
+        self._thread.start()
         return self.path
 
     def append(self, sample: TelemetrySample) -> None:
-        if self._writer is None or self._handle is None:
+        if not self._active or self._queue is None:
             return
-        self._writer.writerow({field: getattr(sample, field) for field in self.FIELDS})
-        self._handle.flush()
+        self._queue.put(sample)
+
+    def _write_loop(
+        self,
+        pending: queue.Queue[TelemetrySample | None],
+        writer: csv.DictWriter,
+        handle: TextIO,
+    ) -> None:
+        try:
+            while True:
+                sample = pending.get()
+                if sample is None:
+                    break
+                writer.writerow({field: getattr(sample, field) for field in self.FIELDS})
+                # Keep completed rows durable without making the Qt event loop wait for disk I/O.
+                handle.flush()
+        except Exception as exc:  # pragma: no cover - depends on filesystem failures
+            self.last_error = str(exc)
+        finally:
+            try:
+                handle.flush()
+                handle.close()
+            except OSError as exc:  # pragma: no cover - depends on filesystem failures
+                self.last_error = self.last_error or str(exc)
+            if self._handle is handle:
+                self._handle = None
+                self._writer = None
+                self._active = False
 
     def stop(self) -> Path | None:
         path = self.path
-        if self._handle is not None:
-            self._handle.flush()
-            self._handle.close()
-        self._handle = None
-        self._writer = None
+        thread, pending = self._thread, self._queue
+        if thread is not None and thread.is_alive() and pending is not None:
+            pending.put(None)
+            thread.join(timeout=5.0)
+            if thread.is_alive():  # pragma: no cover - local CSV writes should complete promptly
+                self.last_error = "Таймаут завершения записи телеметрии"
+        self._thread = None
+        self._queue = None
+        self._active = False
         return path
+
+
+def monitor_stale_timeout(downsample: int) -> float:
+    """Return a tolerant stream timeout for the firmware's nominal 1 kHz motor loop."""
+
+    if downsample < 1:
+        raise ValueError("Monitor downsample must be positive")
+    expected_interval_s = downsample / 1000.0
+    return max(2.0, expected_interval_s * 3.0 + 0.5)
