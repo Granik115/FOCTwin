@@ -9,6 +9,9 @@
 - Start every trial from a recorded state and reject incomplete trials.
 - Keep the last accepted parameter set for rollback.
 
+Streamed SimpleFOC current values are expressed in mA by the bundled firmware. FOCTwin
+normalizes them to A before applying the configured host-side thresholds.
+
 ## What FOCTwin cannot guarantee with the current firmware
 
 - PWM shutdown after the USB cable disconnects.
@@ -31,3 +34,10 @@ operation. A human must remain able to remove motor power.
 7. Only then enable PWM and begin the bounded trial.
 8. Disable PWM between trials unless continuous hold is explicitly required.
 
+## Device-limit interaction
+
+The bundled firmware initializes `current_limit` to 10 A. Sending `ALC1` changes the live
+motor object to 1 A until another command or a controller reset. Because phase resistance is
+configured, SimpleFOC also uses that current limit as the velocity PID output limit in Voltage
+torque mode. A motor that no longer starts after `ALC1` is therefore current-limited rather
+than necessarily frozen.

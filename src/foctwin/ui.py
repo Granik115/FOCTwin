@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -39,12 +40,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from foctwin.domain import MotorProfile, MotionMode, SafetyGuard, TorqueMode
+from foctwin.domain import MotorProfile, MotionMode, SafetyGuard, TelemetrySample, TorqueMode
+from foctwin import __version__
 from foctwin.matlab_backend import MatlabBackend
 from foctwin.project_store import ProjectStore
-from foctwin.protocol import CommanderProtocol, parse_monitor_line
+from foctwin.protocol import (
+    MONITOR_FIELDS,
+    CommanderProtocol,
+    CommanderResponse,
+    parse_commander_response,
+    parse_monitor_line,
+)
 from foctwin.scenario import ScenarioCompiler, ScenarioError
 from foctwin.serial_device import SerialDevice
+from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics
 
 try:
     import pyqtgraph as pg
@@ -53,7 +62,7 @@ except ImportError:  # pragma: no cover
 
 
 class DeviceSignals(QObject):
-    line = Signal(str)
+    line = Signal(float, str)
     state = Signal(bool, str)
     matlab_state = Signal(bool, str)
 
@@ -104,7 +113,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("FOCTwin — Identify. Simulate. Tune.")
+        self.setWindowTitle(f"FOCTwin {__version__} — Identify. Simulate. Tune.")
         self.resize(1480, 900)
         self.profile = MotorProfile()
         self.protocol = CommanderProtocol(self.profile.command_id)
@@ -118,13 +127,27 @@ class MainWindow(QMainWindow):
         self.signals.matlab_state.connect(self._on_matlab_state)
         self.device.on_line = self.signals.line.emit
         self.device.on_state = self.signals.state.emit
-        self._telemetry_time: list[float] = []
-        self._telemetry_angle: list[float] = []
-        self._telemetry_velocity: list[float] = []
+        self.monitor_mask = "1111111"
+        self.telemetry_statistics = TelemetryStatistics()
+        self.telemetry_recorder = TelemetryRecorder()
+        self._telemetry_sequence = 0
+        self._telemetry_series: dict[str, tuple[list[float], list[float]]] = {
+            name: ([], []) for name in MONITOR_FIELDS
+        }
+        self._last_plot_refresh = 0.0
+        self._last_sample: TelemetrySample | None = None
+        self._connection_requested = False
+        self._connecting = False
+        self._pwm_requested = False
+        self._safety_latched = False
         self._started_at = time.monotonic()
         self._build_actions()
         self._build_shell()
         self._build_pages()
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(1000)
+        self._reconnect_timer.timeout.connect(self._reconnect_if_needed)
+        self._reconnect_timer.start()
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -244,29 +267,45 @@ class MainWindow(QMainWindow):
     def _manual_page(self) -> QWidget:
         page, layout = titled_page(
             "Ручное управление",
-            "Полный доступ к соединению, режимам SimpleFOC, ограничениям, PID/LPF и цели.",
+            "Полный доступ к Commander, подтверждаемым параметрам платы, телеметрии и записи.",
         )
         splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
         left_layout = QVBoxLayout(left)
+
         connection = QGroupBox("Serial / Commander")
         connection_form = QFormLayout(connection)
-        self.port_edit = QLineEdit("COM3")
+        self.port_combo = QComboBox()
+        self.port_combo.setEditable(True)
+        self.port_combo.addItem("COM3")
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(("115200", "230400", "460800", "921600"))
         self.device_id_edit = QLineEdit("A")
         self.device_id_edit.setMaxLength(1)
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
+        connection_buttons = QWidget()
+        connection_buttons_layout = QHBoxLayout(connection_buttons)
+        connection_buttons_layout.setContentsMargins(0, 0, 0, 0)
         self.connect_button = QPushButton("Подключить")
         self.connect_button.clicked.connect(self._toggle_connection)
-        row_layout.addWidget(self.connect_button)
-        connection_form.addRow("COM-порт", self.port_edit)
+        refresh_ports = QPushButton("Обновить порты")
+        refresh_ports.clicked.connect(self._refresh_ports)
+        connection_buttons_layout.addWidget(self.connect_button)
+        connection_buttons_layout.addWidget(refresh_ports)
+        self.safe_connect_checkbox = QCheckBox("При подключении сначала отправлять AE0")
+        self.safe_connect_checkbox.setChecked(True)
+        self.auto_reconnect_checkbox = QCheckBox("Автопереподключение")
+        self.auto_reconnect_checkbox.setChecked(True)
+        self.connection_details = QLabel("Не подключено")
+        self.connection_details.setWordWrap(True)
+        connection_form.addRow("COM-порт", self.port_combo)
         connection_form.addRow("Скорость", self.baud_combo)
         connection_form.addRow("ID мотора", self.device_id_edit)
-        connection_form.addRow(row)
+        connection_form.addRow(self.safe_connect_checkbox)
+        connection_form.addRow(self.auto_reconnect_checkbox)
+        connection_form.addRow(connection_buttons)
+        connection_form.addRow(self.connection_details)
         left_layout.addWidget(connection)
+
         control = QGroupBox("Режим и цель")
         control_form = QFormLayout(control)
         self.motion_combo = QComboBox()
@@ -283,46 +322,102 @@ class MainWindow(QMainWindow):
         apply_modes = QPushButton("Применить режимы")
         apply_modes.clicked.connect(self._apply_modes)
         send_target = QPushButton("Отправить цель")
-        send_target.clicked.connect(lambda: self._send(self.protocol.target(self.target_spin.value())))
+        send_target.clicked.connect(self._send_target)
         enable = QPushButton("Включить PWM")
-        enable.clicked.connect(lambda: self._send(self.protocol.enable()))
+        enable.clicked.connect(self._enable_pwm)
         disable = QPushButton("Отключить PWM")
         disable.setObjectName("dangerButton")
         disable.clicked.connect(self._emergency_stop)
+        self.pwm_state_label = QLabel("PWM: неизвестно")
+        self.allow_live_changes_checkbox = QCheckBox(
+            "Разрешить изменение режимов, PID и лимитов при включённом PWM"
+        )
+        self.allow_live_changes_checkbox.setChecked(False)
         control_form.addRow("Контур движения", self.motion_combo)
         control_form.addRow("Контур момента", self.torque_combo)
         control_form.addRow("Цель", self.target_spin)
         control_form.addRow(apply_modes)
         control_form.addRow(send_target)
         control_form.addRow(enable, disable)
+        control_form.addRow(self.pwm_state_label)
+        control_form.addRow(self.allow_live_changes_checkbox)
         left_layout.addWidget(control)
-        limits = QGroupBox("Жёсткие ограничения приложения")
+
+        device_limits = QGroupBox("Ограничения внутри SimpleFOC")
+        device_limits_layout = QGridLayout(device_limits)
+        device_limits_layout.addWidget(QLabel("Отпр."), 0, 0)
+        device_limits_layout.addWidget(QLabel("Параметр"), 0, 1)
+        device_limits_layout.addWidget(QLabel("Значение"), 0, 2)
+        device_limits_layout.addWidget(QLabel("Ответ платы"), 0, 3)
+        self.device_limit_checks: dict[str, QCheckBox] = {}
+        self.device_limit_spins: dict[str, QDoubleSpinBox] = {}
+        self.device_limit_confirmed: dict[str, QLabel] = {}
+        device_limit_rows = (
+            ("current_a", "Ток, А", 10.0, 0.001, 100.0),
+            ("voltage_v", "Напряжение, В", 20.0, 0.001, 100.0),
+            ("velocity_rad_s", "Скорость, рад/с", 0.7, 0.000001, 1000.0),
+        )
+        for row_index, (key, label, value, minimum, maximum) in enumerate(device_limit_rows, start=1):
+            selected = QCheckBox()
+            value_widget = spin(value, minimum, maximum)
+            confirmed = QLabel("не считано")
+            self.device_limit_checks[key] = selected
+            self.device_limit_spins[key] = value_widget
+            self.device_limit_confirmed[key] = confirmed
+            device_limits_layout.addWidget(selected, row_index, 0)
+            device_limits_layout.addWidget(QLabel(label), row_index, 1)
+            device_limits_layout.addWidget(value_widget, row_index, 2)
+            device_limits_layout.addWidget(confirmed, row_index, 3)
+        device_limit_buttons = QHBoxLayout()
+        read_limits = QPushButton("Считать с платы")
+        read_limits.clicked.connect(self._read_device_limits)
+        apply_device_limits = QPushButton("Отправить выбранные")
+        apply_device_limits.clicked.connect(self._apply_device_limits)
+        device_limit_buttons.addWidget(read_limits)
+        device_limit_buttons.addWidget(apply_device_limits)
+        device_limits_layout.addLayout(device_limit_buttons, 4, 0, 1, 4)
+        current_note = QLabel(
+            "Важно: ALC1 действительно оставляет плате предел 1 А. В Voltage-режиме с известным "
+            "сопротивлением это также предел выхода скоростного PI и его может не хватить для страгивания."
+        )
+        current_note.setObjectName("danger")
+        current_note.setWordWrap(True)
+        device_limits_layout.addWidget(current_note, 5, 0, 1, 4)
+        left_layout.addWidget(device_limits)
+
+        limits = QGroupBox("Программные аварийные пороги FOCTwin")
         limits_form = QFormLayout(limits)
         self.current_limit = spin(self.profile.safety.current_a, 0.001, 100.0)
         self.voltage_limit = spin(self.profile.safety.voltage_v, 0.001, 100.0)
         self.velocity_limit = spin(self.profile.safety.velocity_rad_s, 0.000001, 1000.0)
         self.angle_min = spin(self.profile.safety.angle_min_rad)
         self.angle_max = spin(self.profile.safety.angle_max_rad)
-        apply_limits = QPushButton("Проверить и отправить ограничения")
-        apply_limits.clicked.connect(self._apply_limits)
+        self.software_guard_enabled = QCheckBox("Останавливать PWM при нарушении телеметрии")
+        self.software_guard_enabled.setChecked(True)
+        apply_limits = QPushButton("Применить только программные пороги")
+        apply_limits.clicked.connect(self._apply_software_limits)
         limits_form.addRow("Ток, А", self.current_limit)
         limits_form.addRow("Напряжение, В", self.voltage_limit)
         limits_form.addRow("Скорость, рад/с", self.velocity_limit)
         limits_form.addRow("Координата min, рад", self.angle_min)
         limits_form.addRow("Координата max, рад", self.angle_max)
+        limits_form.addRow(self.software_guard_enabled)
         limits_form.addRow(apply_limits)
         left_layout.addWidget(limits)
         left_layout.addStretch(1)
+
         right = QWidget()
         right_layout = QVBoxLayout(right)
         pid_group = QGroupBox("PID / LPF / anti-windup")
         pid_layout = QVBoxLayout(pid_group)
         self.pid_tabs = QTabWidget()
-        for loop, params in (
-            ("Положение", self.profile.angle),
-            ("Скорость", self.profile.velocity),
-            ("Ток Q", self.profile.current_q),
-            ("Ток D", self.profile.current_d),
+        self.pid_tables: dict[str, QTableWidget] = {}
+        self.pid_tab_loops: list[str] = []
+        for loop, title, params in (
+            ("angle", "Положение", self.profile.angle),
+            ("velocity", "Скорость", self.profile.velocity),
+            ("current_q", "Ток Q", self.profile.current_q),
+            ("current_d", "Ток D", self.profile.current_d),
         ):
             pid_table = table(("Параметр", "Значение"), 7)
             values = (
@@ -332,34 +427,96 @@ class MainWindow(QMainWindow):
                 ("Output ramp", params.output_ramp),
                 ("Output limit", params.output_limit),
                 ("LPF Tf", params.lpf_tf),
-                ("Kc (только модель)", params.anti_windup_kc),
+                ("Kc (только Simulink)", params.anti_windup_kc),
             )
             for row_index, (name, value) in enumerate(values):
                 pid_table.setItem(row_index, 0, QTableWidgetItem(name))
-                pid_table.setItem(row_index, 1, QTableWidgetItem(f"{value:g}"))
-            self.pid_tabs.addTab(pid_table, loop)
+                value_item = QTableWidgetItem(f"{value:g}")
+                if row_index == 6:
+                    value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    value_item.setToolTip("Kc отсутствует в установленной версии SimpleFOC и меняется только в модели")
+                pid_table.setItem(row_index, 1, value_item)
+            self.pid_tables[loop] = pid_table
+            self.pid_tab_loops.append(loop)
+            self.pid_tabs.addTab(pid_table, title)
         pid_layout.addWidget(self.pid_tabs)
         pid_buttons = QHBoxLayout()
-        pid_buttons.addWidget(QPushButton("Считать из мотора"))
-        pid_buttons.addWidget(QPushButton("Применить выбранный контур"))
+        read_pid = QPushButton("Считать выбранный контур")
+        read_pid.clicked.connect(self._read_selected_pid)
+        apply_pid = QPushButton("Применить выбранный контур")
+        apply_pid.clicked.connect(self._apply_selected_pid)
+        pid_buttons.addWidget(read_pid)
+        pid_buttons.addWidget(apply_pid)
         pid_layout.addLayout(pid_buttons)
         right_layout.addWidget(pid_group)
+
+        monitor = QGroupBox("Поток телеметрии")
+        monitor_layout = QGridLayout(monitor)
+        monitor_labels = (
+            ("target", "Цель"),
+            ("voltage_q_v", "Uq"),
+            ("voltage_d_v", "Ud"),
+            ("current_q_a", "Iq"),
+            ("current_d_a", "Id"),
+            ("velocity_rad_s", "Скорость"),
+            ("angle_rad", "Угол"),
+        )
+        self.monitor_checks: dict[str, QCheckBox] = {}
+        self.telemetry_values: dict[str, QLabel] = {}
+        for index, (key, label) in enumerate(monitor_labels):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            value_label = QLabel("—")
+            self.monitor_checks[key] = checkbox
+            self.telemetry_values[key] = value_label
+            monitor_layout.addWidget(checkbox, index // 4, (index % 4) * 2)
+            monitor_layout.addWidget(value_label, index // 4, (index % 4) * 2 + 1)
+        self.monitor_downsample_spin = QSpinBox()
+        self.monitor_downsample_spin.setRange(1, 100000)
+        self.monitor_downsample_spin.setValue(20)
+        apply_monitor = QPushButton("Применить мониторинг")
+        apply_monitor.clicked.connect(self._apply_monitoring)
+        self.monitor_stats_label = QLabel("0 отсчётов · 0 Гц · jitter 0 мс")
+        self.record_button = QPushButton("Начать запись CSV")
+        self.record_button.clicked.connect(self._toggle_recording)
+        monitor_layout.addWidget(QLabel("Downsample"), 2, 0)
+        monitor_layout.addWidget(self.monitor_downsample_spin, 2, 1)
+        monitor_layout.addWidget(apply_monitor, 2, 2, 1, 2)
+        monitor_layout.addWidget(self.monitor_stats_label, 3, 0, 1, 4)
+        monitor_layout.addWidget(self.record_button, 3, 4, 1, 4)
+        right_layout.addWidget(monitor)
+
         telemetry = QGroupBox("Живая телеметрия")
         telemetry_layout = QVBoxLayout(telemetry)
+        plot_controls = QHBoxLayout()
+        self.plot_checks: dict[str, QCheckBox] = {}
+        for key, label in monitor_labels:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(key in {"angle_rad", "velocity_rad_s"})
+            self.plot_checks[key] = checkbox
+            plot_controls.addWidget(checkbox)
+        plot_controls.addStretch(1)
+        telemetry_layout.addLayout(plot_controls)
         if pg is not None:
             self.live_plot = pg.PlotWidget()
             self.live_plot.showGrid(x=True, y=True, alpha=0.25)
-            self.angle_curve = self.live_plot.plot(pen=pg.mkPen("#00bfff", width=2), name="angle")
-            self.velocity_curve = self.live_plot.plot(pen=pg.mkPen("#40e0d0", width=2), name="velocity")
+            self.live_plot.addLegend()
+            colors = ("#f1f5f9", "#00bfff", "#875cff", "#40e0d0", "#ffb74d", "#ff5b79", "#3ddc97")
+            self.telemetry_curves = {
+                key: self.live_plot.plot(pen=pg.mkPen(color, width=2), name=label)
+                for (key, label), color in zip(monitor_labels, colors, strict=True)
+            }
             telemetry_layout.addWidget(self.live_plot)
         else:
             self.live_plot = None
+            self.telemetry_curves = {}
             telemetry_layout.addWidget(QLabel("Установите pyqtgraph для живых графиков"))
         right_layout.addWidget(telemetry, 1)
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setSizes((480, 900))
         layout.addWidget(splitter, 1)
+        self._refresh_ports()
         return page
 
     def _identification_page(self) -> QWidget:
@@ -572,6 +729,7 @@ class MainWindow(QMainWindow):
         raw_layout.addLayout(raw_row)
         self.raw_output = QPlainTextEdit()
         self.raw_output.setReadOnly(True)
+        self.raw_output.document().setMaximumBlockCount(5000)
         raw_layout.addWidget(self.raw_output, 1)
         scenario_tab = QWidget()
         scenario_layout = QVBoxLayout(scenario_tab)
@@ -634,6 +792,7 @@ class MainWindow(QMainWindow):
         )
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(10000)
         layout.addWidget(self.log_view, 1)
         buttons = QHBoxLayout()
         buttons.addWidget(QPushButton("Открыть папку логов"))
@@ -680,25 +839,159 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Проект открыт: {root}", 5000)
         self._log("INFO", f"Проект открыт: {root}")
 
+    def _refresh_ports(self) -> None:
+        current = self.port_combo.currentText().strip() or "COM3"
+        ports = self.device.available_ports()
+        self.port_combo.clear()
+        for device, description in ports:
+            self.port_combo.addItem(device, description)
+        if self.port_combo.findText(current) < 0:
+            self.port_combo.addItem(current)
+        self.port_combo.setCurrentText(current)
+        if ports:
+            details = "; ".join(f"{device}: {description}" for device, description in ports)
+            self.connection_details.setText(details)
+
     def _toggle_connection(self) -> None:
-        if self.device.connected:
+        if self.device.connected or self._connection_requested:
+            self._connection_requested = False
+            self._connecting = False
             self.device.disconnect()
+            self.connect_button.setText("Подключить")
             return
+        self._connection_requested = True
+        self._attempt_connect(show_error=True)
+
+    def _attempt_connect(self, show_error: bool) -> None:
+        if self.device.connected or self._connecting:
+            return
+        self._connecting = True
         self.protocol = CommanderProtocol(self.device_id_edit.text().strip() or "A")
         self.device.protocol = self.protocol
         try:
-            self.device.connect(self.port_edit.text().strip(), int(self.baud_combo.currentText()))
+            self.device.connect(self.port_combo.currentText().strip(), int(self.baud_combo.currentText()))
         except Exception as exc:
-            QMessageBox.critical(self, "Serial", str(exc))
+            self._connecting = False
             self._log("ERROR", f"Не удалось подключиться: {exc}")
+            self.connection_details.setText(f"Ошибка подключения: {exc}")
+            if show_error:
+                QMessageBox.critical(self, "Serial", str(exc))
+
+    def _reconnect_if_needed(self) -> None:
+        if (
+            self._connection_requested
+            and self.auto_reconnect_checkbox.isChecked()
+            and not self.device.connected
+            and not self._connecting
+        ):
+            self._attempt_connect(show_error=False)
+
+    def _initialize_connection(self) -> None:
+        if not self.device.connected:
+            return
+        if self.safe_connect_checkbox.isChecked():
+            self._send(self.protocol.disable())
+        self._apply_monitoring()
+        self._read_device_configuration()
 
     def _apply_modes(self) -> None:
+        if not self._allow_parameter_change("изменение режимов"):
+            return
         motion = self.motion_combo.currentData()
         torque = self.torque_combo.currentData()
-        self._send(self.protocol.motion_mode(motion))
         self._send(self.protocol.torque_mode(torque))
+        self._send(self.protocol.motion_mode(motion))
+        QTimer.singleShot(100, self._read_device_modes)
 
-    def _apply_limits(self) -> None:
+    def _read_device_modes(self) -> None:
+        self._send(self.protocol.motion_mode())
+        self._send(self.protocol.torque_mode())
+        self._send(self.protocol.enable(None))
+
+    def _read_device_configuration(self) -> None:
+        self._read_device_modes()
+        self._read_device_limits()
+        self._read_selected_pid()
+
+    def _send_target(self) -> None:
+        target = self.target_spin.value()
+        motion = self.motion_combo.currentData()
+        limits = self.guard.limits
+        error: str | None = None
+        if motion in {MotionMode.ANGLE, MotionMode.ANGLE_OPEN_LOOP}:
+            if not limits.angle_min_rad <= target <= limits.angle_max_rad:
+                error = "Цель положения выходит за программный диапазон"
+        elif motion in {MotionMode.VELOCITY, MotionMode.VELOCITY_OPEN_LOOP}:
+            if abs(target) > limits.velocity_rad_s:
+                error = "Цель скорости превышает программный порог"
+        elif motion is MotionMode.TORQUE:
+            torque_mode = self.torque_combo.currentData()
+            limit = limits.voltage_v if torque_mode is TorqueMode.VOLTAGE else limits.current_a
+            if abs(target) > limit:
+                error = "Цель момента превышает программный порог выбранного режима"
+        if error:
+            QMessageBox.warning(self, "Цель отклонена", error)
+            return
+        self._send(self.protocol.target(target))
+
+    def _enable_pwm(self) -> None:
+        if not self.device.connected:
+            QMessageBox.warning(self, "PWM", "Сначала подключите мотор")
+            return
+        if self.software_guard_enabled.isChecked():
+            if self._last_sample is None:
+                QMessageBox.warning(self, "PWM", "Нет распознанной телеметрии; сначала настройте мониторинг")
+                return
+            age = time.monotonic() - self._started_at - self._last_sample.timestamp_s
+            if age > self.guard.limits.telemetry_timeout_s:
+                QMessageBox.warning(self, "PWM", "Телеметрия устарела; включение отклонено")
+                return
+            violations = self.guard.check(self._last_sample)
+            if violations:
+                message = "; ".join(violation.message for violation in violations)
+                QMessageBox.warning(self, "PWM", f"Текущее состояние нарушает пороги: {message}")
+                return
+        self._safety_latched = False
+        self._send(self.protocol.enable())
+        QTimer.singleShot(100, lambda: self._send(self.protocol.enable(None)))
+
+    def _read_device_limits(self) -> None:
+        for command in (
+            self.protocol.current_limit(),
+            self.protocol.voltage_limit(),
+            self.protocol.velocity_limit(),
+        ):
+            self._send(command)
+
+    def _apply_device_limits(self) -> None:
+        if not self._allow_parameter_change("изменение ограничений SimpleFOC"):
+            return
+        selected = [key for key, checkbox in self.device_limit_checks.items() if checkbox.isChecked()]
+        if not selected:
+            QMessageBox.information(self, "Ограничения", "Отметьте параметры в колонке «Отпр.»")
+            return
+        if "current_a" in selected and self.device_limit_spins["current_a"].value() <= 1.0:
+            answer = QMessageBox.warning(
+                self,
+                "Низкий предел тока",
+                "Предел 1 А или ниже может не позволить установке начать движение. "
+                "Он останется в плате до следующего изменения или перезапуска. Отправить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        command_builders = {
+            "current_a": self.protocol.current_limit,
+            "voltage_v": self.protocol.voltage_limit,
+            "velocity_rad_s": self.protocol.velocity_limit,
+        }
+        for key in selected:
+            self.device_limit_confirmed[key].setText("ожидание ответа…")
+            self._send(command_builders[key](self.device_limit_spins[key].value()))
+        QTimer.singleShot(150, self._read_device_limits)
+
+    def _apply_software_limits(self) -> None:
         limits = self.profile.safety
         limits.current_a = self.current_limit.value()
         limits.voltage_v = self.voltage_limit.value()
@@ -711,25 +1004,116 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ограничения", str(exc))
             return
         self.guard = SafetyGuard(limits)
-        for command in (
-            self.protocol.current_limit(limits.current_a),
-            self.protocol.voltage_limit(limits.voltage_v),
-            self.protocol.velocity_limit(limits.velocity_rad_s),
-        ):
-            self._send(command)
         if self.project:
             self.project.save_profile(self.profile)
+        self.statusBar().showMessage("Программные пороги применены; на плату команды не отправлялись", 6000)
 
-    def _send(self, command: str) -> None:
+    def _selected_pid_loop(self) -> str:
+        return self.pid_tab_loops[self.pid_tabs.currentIndex()]
+
+    def _read_selected_pid(self) -> None:
+        loop = self._selected_pid_loop()
+        for field in ("p", "i", "d", "ramp", "limit", "lpf"):
+            self._send(self.protocol.pid(loop, field))
+
+    def _apply_selected_pid(self) -> None:
+        if not self._allow_parameter_change("изменение PID/LPF"):
+            return
+        loop = self._selected_pid_loop()
+        table_widget = self.pid_tables[loop]
+        fields = ("p", "i", "d", "ramp", "limit", "lpf")
+        values: dict[str, float] = {}
+        try:
+            for row, field in enumerate(fields):
+                values[field] = float(table_widget.item(row, 1).text().replace(",", "."))
+        except (AttributeError, ValueError):
+            QMessageBox.warning(self, "PID", "Все отправляемые значения должны быть числами")
+            return
+        if any(value < 0 for value in values.values()):
+            QMessageBox.warning(self, "PID", "Отрицательные PID/LPF/limit значения отклонены")
+            return
+        for field, value in values.items():
+            self._send(self.protocol.pid(loop, field, value))
+        profile_params = getattr(self.profile, loop)
+        profile_params.p = values["p"]
+        profile_params.i = values["i"]
+        profile_params.d = values["d"]
+        profile_params.output_ramp = values["ramp"]
+        profile_params.output_limit = values["limit"]
+        profile_params.lpf_tf = values["lpf"]
+        if self.project:
+            self.project.save_profile(self.profile)
+        if loop == "angle":
+            effective = min(values["limit"], self.device_limit_spins["velocity_rad_s"].value())
+            self._log(
+                "INFO",
+                f"Лимит выхода position PID отправлен; фактический предел скорости не выше {effective:g} рад/с",
+            )
+        QTimer.singleShot(150, self._read_selected_pid)
+
+    def _allow_parameter_change(self, operation: str) -> bool:
+        if not self._pwm_requested:
+            return True
+        if not self.allow_live_changes_checkbox.isChecked():
+            QMessageBox.warning(
+                self,
+                "Изменение отклонено",
+                f"PWM сейчас включён. Сначала отключите его или явно разрешите {operation} при работающем моторе.",
+            )
+            return False
+        answer = QMessageBox.warning(
+            self,
+            "Live-tuning",
+            f"{operation.capitalize()} при включённом PWM может вызвать рывок. Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _apply_monitoring(self) -> None:
+        mask = "".join("1" if self.monitor_checks[name].isChecked() else "0" for name in MONITOR_FIELDS)
+        if "1" not in mask:
+            QMessageBox.warning(self, "Мониторинг", "Выберите хотя бы один сигнал")
+            return
+        self.monitor_mask = mask
+        self.telemetry_statistics.reset()
+        self._send(self.protocol.monitor_downsample(self.monitor_downsample_spin.value()))
+        self._send(self.protocol.monitor_variables(mask))
+        self._log("INFO", f"Мониторинг настроен: mask={mask}; токи потока переводятся из мА в А")
+
+    def _toggle_recording(self) -> None:
+        if self.telemetry_recorder.active:
+            path = self.telemetry_recorder.stop()
+            self.record_button.setText("Начать запись CSV")
+            self._log("RECORD", f"Запись остановлена: {path}")
+            return
+        if self.project is None:
+            QMessageBox.warning(self, "Запись", "Сначала создайте или откройте проект FOCTwin")
+            return
+        path = self.telemetry_recorder.start(self.project.new_telemetry_path("manual"))
+        self.record_button.setText("Остановить запись")
+        self._log("RECORD", f"Запись начата: {path}")
+
+    def _send(self, command: str) -> bool:
         self._log("TX", command)
         try:
             self.device.send(command)
         except Exception as exc:
             self._log("ERROR", str(exc))
             self.statusBar().showMessage(str(exc), 5000)
+            return False
+        if command == self.protocol.enable():
+            self._pwm_requested = True
+            self.pwm_state_label.setText("PWM: включение запрошено")
+        elif command == self.protocol.disable():
+            self._pwm_requested = False
+            self.pwm_state_label.setText("PWM: отключение запрошено")
+        return True
 
     def _emergency_stop(self) -> None:
         sent = self.device.emergency_stop()
+        self._pwm_requested = False
+        self.pwm_state_label.setText("PWM: отключён (best-effort)")
         self._log("EMERGENCY", f"Best-effort stop; sent: {sent or 'nothing (not connected)'}")
         self.statusBar().showMessage("Аварийный стоп отправлен; при сомнениях отключите питание", 10000)
 
@@ -768,35 +1152,122 @@ class MainWindow(QMainWindow):
         self._log("MATLAB", message)
 
     def _on_device_state(self, connected: bool, message: str) -> None:
-        self.connect_button.setText("Отключить" if connected else "Подключить")
+        self._connecting = False
+        if connected:
+            self._connection_requested = True
+            self.connect_button.setText("Отключить")
+            self.connection_details.setText(message)
+            QTimer.singleShot(100, self._initialize_connection)
+        else:
+            self._pwm_requested = False
+            self.pwm_state_label.setText("PWM: состояние неизвестно после разрыва")
+            reconnecting = self._connection_requested and self.auto_reconnect_checkbox.isChecked()
+            self.connect_button.setText("Отменить переподключение" if reconnecting else "Подключить")
+            self.connection_details.setText(
+                f"{message}. Ожидание переподключения…" if reconnecting else message
+            )
         self.side_connection.setText("● Мотор подключён" if connected else "● Мотор отключён")
         self.dashboard_motor.setText("Подключён" if connected else "Отключён")
         self._log("SERIAL", message)
 
-    def _on_device_line(self, line: str) -> None:
+    def _on_device_line(self, received_at: float, line: str) -> None:
         self.raw_output.appendPlainText(f"RX  {line}")
-        self._log("RX", line)
-        parsed = parse_monitor_line(line)
-        if not parsed:
+        response = parse_commander_response(line)
+        if response is not None:
+            self._log("RX", line)
+            self._apply_commander_response(response)
             return
-        from foctwin.domain import TelemetrySample
+        parsed = parse_monitor_line(line, self.monitor_mask)
+        if not parsed:
+            self._log("RX", line)
+            return
+        self._telemetry_sequence += 1
+        timestamp_s = received_at - self._started_at
+        sample = TelemetrySample(
+            timestamp_s=timestamp_s,
+            sequence=self._telemetry_sequence,
+            received_at_utc=datetime.now(timezone.utc).isoformat(),
+            raw=line,
+            **parsed,
+        )
+        self._last_sample = sample
+        self.telemetry_statistics.add(timestamp_s)
+        self.telemetry_recorder.append(sample)
+        for name in MONITOR_FIELDS:
+            value = getattr(sample, name)
+            if value is None:
+                continue
+            times, values = self._telemetry_series[name]
+            times.append(timestamp_s)
+            values.append(value)
+            if len(times) > 5000:
+                del times[:-5000]
+                del values[:-5000]
+            self.telemetry_values[name].setText(f"{value:.6g}")
+        self.monitor_stats_label.setText(
+            f"{self.telemetry_statistics.sample_count} отсчётов · "
+            f"{self.telemetry_statistics.frequency_hz:.1f} Гц · "
+            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс"
+        )
+        self._refresh_live_plot(received_at)
 
-        sample = TelemetrySample(timestamp_s=time.monotonic() - self._started_at, raw=line, **parsed)
-        violations = self.guard.check(sample)
-        if violations:
+        violations = self.guard.check(sample) if self.software_guard_enabled.isChecked() else []
+        if self._pwm_requested and violations and not self._safety_latched:
+            self._safety_latched = True
             self._log("SAFETY", "; ".join(violation.message for violation in violations))
             self._emergency_stop()
-        if sample.angle_rad is not None and sample.velocity_rad_s is not None:
-            self._telemetry_time.append(sample.timestamp_s)
-            self._telemetry_angle.append(sample.angle_rad)
-            self._telemetry_velocity.append(sample.velocity_rad_s)
-            if len(self._telemetry_time) > 5000:
-                self._telemetry_time = self._telemetry_time[-5000:]
-                self._telemetry_angle = self._telemetry_angle[-5000:]
-                self._telemetry_velocity = self._telemetry_velocity[-5000:]
-            if self.live_plot is not None:
-                self.angle_curve.setData(self._telemetry_time, self._telemetry_angle)
-                self.velocity_curve.setData(self._telemetry_time, self._telemetry_velocity)
+
+    def _refresh_live_plot(self, received_at: float) -> None:
+        if self.live_plot is None or received_at - self._last_plot_refresh < 0.05:
+            return
+        self._last_plot_refresh = received_at
+        for name, curve in self.telemetry_curves.items():
+            visible = self.plot_checks[name].isChecked()
+            curve.setVisible(visible)
+            if visible:
+                times, values = self._telemetry_series[name]
+                curve.setData(times, values)
+
+    def _apply_commander_response(self, response: CommanderResponse) -> None:
+        if response.key.startswith("limit."):
+            key = response.key.removeprefix("limit.")
+            if key in self.device_limit_spins:
+                self.device_limit_spins[key].setValue(float(response.value))
+                self.device_limit_confirmed[key].setText(f"{float(response.value):g}")
+            return
+        if response.key == "enabled":
+            self._pwm_requested = bool(response.value)
+            self.pwm_state_label.setText("PWM: включён" if response.value else "PWM: отключён")
+            return
+        if response.key == "motion_mode":
+            modes = {
+                "torque": MotionMode.TORQUE,
+                "vel": MotionMode.VELOCITY,
+                "angle": MotionMode.ANGLE,
+                "vel open": MotionMode.VELOCITY_OPEN_LOOP,
+                "angle open": MotionMode.ANGLE_OPEN_LOOP,
+            }
+            mode = modes.get(str(response.value).lower())
+            if mode is not None:
+                index = self.motion_combo.findData(mode)
+                self.motion_combo.setCurrentIndex(index)
+            return
+        if response.key == "torque_mode":
+            modes = {
+                "volt": TorqueMode.VOLTAGE,
+                "dc curr": TorqueMode.DC_CURRENT,
+                "foc curr": TorqueMode.FOC_CURRENT,
+            }
+            mode = modes.get(str(response.value).lower())
+            if mode is not None:
+                index = self.torque_combo.findData(mode)
+                self.torque_combo.setCurrentIndex(index)
+            return
+        if response.key.startswith("pid."):
+            _, loop, field = response.key.split(".")
+            row_by_field = {"p": 0, "i": 1, "d": 2, "ramp": 3, "limit": 4, "lpf": 5}
+            if loop in self.pid_tables and field in row_by_field:
+                self.pid_tables[loop].item(row_by_field[field], 1).setText(f"{float(response.value):g}")
 
     def _log(self, level: str, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -813,6 +1284,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Готово. Реальный мотор по умолчанию отключён.")
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._connection_requested = False
+        self.telemetry_recorder.stop()
         self.device.emergency_stop()
         self.device.disconnect()
         if self.matlab.connected:

@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - permits core tests without hardware de
     serial = None
 
 
-LineCallback = Callable[[str], None]
+LineCallback = Callable[[float, str], None]
 StateCallback = Callable[[bool, str], None]
 
 
@@ -25,8 +25,16 @@ class SerialDevice:
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
         self._write_lock = threading.Lock()
-        self.on_line: LineCallback = lambda _line: None
+        self.on_line: LineCallback = lambda _timestamp, _line: None
         self.on_state: StateCallback = lambda _connected, _message: None
+
+    @staticmethod
+    def available_ports() -> list[tuple[str, str]]:
+        if serial is None:
+            return []
+        from serial.tools import list_ports
+
+        return [(port.device, port.description) for port in list_ports.comports()]
 
     @property
     def connected(self) -> bool:
@@ -79,10 +87,11 @@ class SerialDevice:
             while not self._stop.is_set() and self.connected:
                 raw = self._port.readline()
                 if raw:
-                    self.on_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+                    received_at = time.monotonic()
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    self.on_line(received_at, line)
         except Exception as exc:
             self.on_state(False, f"Ошибка Serial: {exc}")
         finally:
             if not self._stop.is_set():
                 self.disconnect()
-

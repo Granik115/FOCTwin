@@ -26,6 +26,9 @@ This first foundation contains:
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
 - a serial transport with a best-effort emergency stop;
+- verified read/apply controls for device limits and every firmware PID/LPF loop;
+- configurable monitoring with correct mA-to-A conversion, live rate/jitter and durable CSV recording;
+- safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - editable safety limits and a Russian FOCTwin scenario language;
 - durable project folders with SQLite events, atomic checkpoints and raw telemetry files;
 - the supplied voltage/current Simulink models and MATLAB tuning sources;
@@ -34,6 +37,17 @@ This first foundation contains:
 
 Hardware execution and MATLAB simulations are deliberately not started automatically.
 They become active only after a user opens a project and explicitly connects/enables them.
+
+## Download for Windows
+
+Open [GitHub Releases](https://github.com/Granik115/FOCTwin/releases), expand **Assets** for
+the newest version and download `FOCTwin-<version>-windows-x64.zip`. Extract the whole
+archive and run `FOCTwin.exe`; installation and a separate Python environment are not
+required for manual motor control.
+
+Preview builds are intentionally marked as pre-releases while real-hardware testing is in
+progress. They are not code-signed yet, so Windows SmartScreen can display a warning. MATLAB
+R2022b and its Python Engine are still required for the simulation and tuning workspaces.
 
 ## Development setup
 
@@ -71,5 +85,8 @@ profiles/           versioned motor/profile defaults
 docs/               requirements, architecture and safety notes
 tests/              core tests that do not require MATLAB or hardware
 ```
+
+The manual-control behaviour and the distinction between firmware and host-side limits are
+documented in [`docs/manual-control.md`](docs/manual-control.md).
 
 No software license has been selected yet.

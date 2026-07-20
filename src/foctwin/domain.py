@@ -94,6 +94,8 @@ class MotorProfile:
 @dataclass(slots=True)
 class TelemetrySample:
     timestamp_s: float
+    sequence: int = 0
+    received_at_utc: str = ""
     target: float | None = None
     voltage_q_v: float | None = None
     voltage_d_v: float | None = None
@@ -149,4 +151,3 @@ class SafetyGuard:
                     )
                 )
         return violations
-

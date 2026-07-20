@@ -128,6 +128,11 @@ class ProjectStore:
         self.atomic_json(path, envelope)
         return path
 
+    def new_telemetry_path(self, label: str = "manual") -> Path:
+        safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in label)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        return self.telemetry_dir / f"{timestamp}_{safe_label or 'manual'}.csv"
+
     @staticmethod
     def atomic_json(path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
