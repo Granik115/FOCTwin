@@ -45,6 +45,12 @@ def stylesheet() -> str:
         background: {BG_TRACK}; color: {TEXT_PRIMARY}; border: 1px solid {ACCENT_FRAME};
         border-radius: 3px; padding: 4px;
     }}
+    QTableWidget {{
+        alternate-background-color: {BG_PANEL}; gridline-color: {DEPTH_BLUE};
+        selection-background-color: {BG_SELECTED}; selection-color: {TEXT_PRIMARY};
+    }}
+    QTableWidget::item {{ color: {TEXT_PRIMARY}; padding: 4px; }}
+    QTableWidget::item:selected {{ background: {BG_SELECTED}; color: {TEXT_PRIMARY}; }}
     QListWidget::item {{ padding: 9px 8px; border-radius: 4px; }}
     QListWidget::item:selected {{ background: {BG_SELECTED}; border-left: 3px solid {ACCENT_GLOW}; }}
     QHeaderView::section {{
@@ -56,4 +62,3 @@ def stylesheet() -> str:
     QStatusBar {{ background: {BG_SIDEBAR}; color: {TEXT_SECONDARY}; }}
     QToolTip {{ background: {BG_PANEL}; color: {TEXT_PRIMARY}; border: 1px solid {ACCENT_GLOW}; }}
     """
-

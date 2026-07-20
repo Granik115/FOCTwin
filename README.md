@@ -26,8 +26,9 @@ This first foundation contains:
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
 - a serial transport with a best-effort emergency stop;
-- verified read/apply controls for device limits and every firmware PID/LPF loop;
-- configurable monitoring with correct mA-to-A conversion, live rate/jitter and durable CSV recording;
+- verified read/apply controls for the linked device limits and every firmware PID/LPF loop;
+- fragmentation-safe monitoring with stream recovery, stable live plots, correct mA-to-A conversion,
+  live rate/jitter and non-blocking durable CSV recording;
 - safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - editable safety limits and a Russian FOCTwin scenario language;
 - durable project folders with SQLite events, atomic checkpoints and raw telemetry files;

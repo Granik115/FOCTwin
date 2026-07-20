@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from bisect import bisect_left
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,7 +55,7 @@ from foctwin.protocol import (
 )
 from foctwin.scenario import ScenarioCompiler, ScenarioError
 from foctwin.serial_device import SerialDevice
-from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics
+from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics, monitor_stale_timeout
 
 try:
     import pyqtgraph as pg
@@ -100,6 +101,14 @@ def table(headers: list[str], rows: int = 0) -> QTableWidget:
 
 
 class MainWindow(QMainWindow):
+    PID_FIELDS = ("p", "i", "d", "ramp", "lpf")
+    PID_ROW_BY_FIELD = {field: row for row, field in enumerate(PID_FIELDS)}
+    PID_LIMIT_BINDINGS = {
+        "angle": "velocity_rad_s",
+        "velocity": "current_a",
+        "current_q": "voltage_v",
+        "current_d": "voltage_v",
+    }
     NAVIGATION = (
         "Обзор",
         "Ручное управление",
@@ -136,8 +145,14 @@ class MainWindow(QMainWindow):
         self._telemetry_series: dict[str, tuple[list[float], list[float]]] = {
             name: ([], []) for name in MONITOR_FIELDS
         }
-        self._last_plot_refresh = 0.0
         self._last_sample: TelemetrySample | None = None
+        self._last_telemetry_received_at: float | None = None
+        self._monitor_configured_at: float | None = None
+        self._last_monitor_restart_at = 0.0
+        self._monitor_restart_count = 0
+        self._monitoring_requested = False
+        self._displayed_telemetry_sequence = 0
+        self._reported_recorder_error: str | None = None
         self._connection_requested = False
         self._connecting = False
         self._pwm_requested = False
@@ -150,6 +165,14 @@ class MainWindow(QMainWindow):
         self._reconnect_timer.setInterval(1000)
         self._reconnect_timer.timeout.connect(self._reconnect_if_needed)
         self._reconnect_timer.start()
+        self._telemetry_ui_timer = QTimer(self)
+        self._telemetry_ui_timer.setInterval(100)
+        self._telemetry_ui_timer.timeout.connect(self._refresh_telemetry_ui)
+        self._telemetry_ui_timer.start()
+        self._telemetry_watchdog_timer = QTimer(self)
+        self._telemetry_watchdog_timer.setInterval(500)
+        self._telemetry_watchdog_timer.timeout.connect(self._check_telemetry_health)
+        self._telemetry_watchdog_timer.start()
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -422,7 +445,7 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right.setMinimumWidth(600)
         right_layout = QVBoxLayout(right)
-        pid_group = QGroupBox("PID / LPF / anti-windup")
+        pid_group = QGroupBox("Контуры SimpleFOC: PID / LPF")
         pid_layout = QVBoxLayout(pid_group)
         self.pid_tabs = QTabWidget()
         self.pid_tables: dict[str, QTableWidget] = {}
@@ -433,27 +456,30 @@ class MainWindow(QMainWindow):
             ("current_q", "Ток Q", self.profile.current_q),
             ("current_d", "Ток D", self.profile.current_d),
         ):
-            pid_table = table(("Параметр", "Значение"), 7)
+            pid_table = table(("Параметр", "Значение"), 5)
             values = (
                 ("P", params.p),
                 ("I", params.i),
                 ("D", params.d),
                 ("Output ramp", params.output_ramp),
-                ("Output limit", params.output_limit),
                 ("LPF Tf", params.lpf_tf),
-                ("Kc (только Simulink)", params.anti_windup_kc),
             )
             for row_index, (name, value) in enumerate(values):
                 pid_table.setItem(row_index, 0, QTableWidgetItem(name))
                 value_item = QTableWidgetItem(f"{value:g}")
-                if row_index == 6:
-                    value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    value_item.setToolTip("Kc отсутствует в установленной версии SimpleFOC и меняется только в модели")
                 pid_table.setItem(row_index, 1, value_item)
             self.pid_tables[loop] = pid_table
             self.pid_tab_loops.append(loop)
             self.pid_tabs.addTab(pid_table, title)
         pid_layout.addWidget(self.pid_tabs)
+        pid_limit_note = QLabel(
+            "Output limit задаётся только в блоке «Ограничения внутри SimpleFOC»: "
+            "Положение → Скорость (ALV), Скорость → Ток (ALC), Ток Q/D → Напряжение (ALU). "
+            "Kc отсутствует в прошивке и остаётся параметром модели Simulink."
+        )
+        pid_limit_note.setObjectName("hint")
+        pid_limit_note.setWordWrap(True)
+        pid_layout.addWidget(pid_limit_note)
         pid_buttons = QGridLayout()
         read_pid = QPushButton("Считать выбранный контур")
         read_pid.clicked.connect(self._read_selected_pid)
@@ -497,6 +523,15 @@ class MainWindow(QMainWindow):
         apply_monitor.clicked.connect(self._apply_monitoring)
         self.monitor_stats_label = QLabel("0 отсчётов · 0 Гц · jitter 0 мс")
         self.monitor_stats_label.setWordWrap(True)
+        self.monitor_health_label = QLabel("Поток: ещё не настроен")
+        self.monitor_health_label.setWordWrap(True)
+        self.restart_monitor_button = QPushButton("Перезапустить поток")
+        self.restart_monitor_button.clicked.connect(self._restart_monitoring)
+        self.raw_telemetry_checkbox = QCheckBox("Показывать строки телеметрии в сырой консоли")
+        self.raw_telemetry_checkbox.setChecked(False)
+        self.raw_telemetry_checkbox.setToolTip(
+            "Отключено по умолчанию, чтобы частые строки монитора не перегружали интерфейс."
+        )
         self.record_button = QPushButton("Начать запись CSV")
         self.record_button.clicked.connect(self._toggle_recording)
         monitor_control_row = (len(monitor_labels) + signal_columns - 1) // signal_columns
@@ -504,7 +539,10 @@ class MainWindow(QMainWindow):
         monitor_layout.addWidget(self.monitor_downsample_spin, monitor_control_row, 1)
         monitor_layout.addWidget(apply_monitor, monitor_control_row, 2, 1, 2)
         monitor_layout.addWidget(self.monitor_stats_label, monitor_control_row + 1, 0, 1, 4)
-        monitor_layout.addWidget(self.record_button, monitor_control_row + 2, 0, 1, 4)
+        monitor_layout.addWidget(self.monitor_health_label, monitor_control_row + 2, 0, 1, 2)
+        monitor_layout.addWidget(self.restart_monitor_button, monitor_control_row + 2, 2, 1, 2)
+        monitor_layout.addWidget(self.raw_telemetry_checkbox, monitor_control_row + 3, 0, 1, 4)
+        monitor_layout.addWidget(self.record_button, monitor_control_row + 4, 0, 1, 4)
         monitor_layout.setColumnStretch(1, 1)
         monitor_layout.setColumnStretch(3, 1)
         right_layout.addWidget(monitor)
@@ -516,8 +554,23 @@ class MainWindow(QMainWindow):
         for index, (key, label) in enumerate(monitor_labels):
             checkbox = QCheckBox(label)
             checkbox.setChecked(key in {"angle_rad", "velocity_rad_s"})
+            checkbox.toggled.connect(
+                lambda checked, signal_name=key: self._on_plot_signal_toggled(signal_name, checked)
+            )
             self.plot_checks[key] = checkbox
             plot_controls.addWidget(checkbox, index // 4, index % 4)
+        self.plot_window_spin = QSpinBox()
+        self.plot_window_spin.setRange(5, 600)
+        self.plot_window_spin.setValue(30)
+        self.plot_window_spin.setSuffix(" с")
+        self.plot_follow_checkbox = QCheckBox("Следовать за временем")
+        self.plot_follow_checkbox.setChecked(True)
+        clear_plot = QPushButton("Очистить график")
+        clear_plot.clicked.connect(self._clear_live_plot)
+        plot_controls.addWidget(QLabel("Окно"), 2, 0)
+        plot_controls.addWidget(self.plot_window_spin, 2, 1)
+        plot_controls.addWidget(self.plot_follow_checkbox, 2, 2)
+        plot_controls.addWidget(clear_plot, 2, 3)
         for column in range(4):
             plot_controls.setColumnStretch(column, 1)
         telemetry_layout.addLayout(plot_controls)
@@ -973,10 +1026,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "PWM", "Сначала подключите мотор")
             return
         if self.software_guard_enabled.isChecked():
-            if self._last_sample is None:
+            if self._last_sample is None or self._last_telemetry_received_at is None:
                 QMessageBox.warning(self, "PWM", "Нет распознанной телеметрии; сначала настройте мониторинг")
                 return
-            age = time.monotonic() - self._started_at - self._last_sample.timestamp_s
+            age = time.monotonic() - self._last_telemetry_received_at
             if age > self.guard.limits.telemetry_timeout_s:
                 QMessageBox.warning(self, "PWM", "Телеметрия устарела; включение отклонено")
                 return
@@ -1047,24 +1100,29 @@ class MainWindow(QMainWindow):
 
     def _read_selected_pid(self) -> None:
         loop = self._selected_pid_loop()
-        for field in ("p", "i", "d", "ramp", "limit", "lpf"):
+        for field in self.PID_FIELDS:
             self._send(self.protocol.pid(loop, field))
+        limit_readers = {
+            "current_a": self.protocol.current_limit,
+            "voltage_v": self.protocol.voltage_limit,
+            "velocity_rad_s": self.protocol.velocity_limit,
+        }
+        self._send(limit_readers[self.PID_LIMIT_BINDINGS[loop]]())
 
     def _apply_selected_pid(self) -> None:
         if not self._allow_parameter_change("изменение PID/LPF"):
             return
         loop = self._selected_pid_loop()
         table_widget = self.pid_tables[loop]
-        fields = ("p", "i", "d", "ramp", "limit", "lpf")
         values: dict[str, float] = {}
         try:
-            for row, field in enumerate(fields):
+            for row, field in enumerate(self.PID_FIELDS):
                 values[field] = float(table_widget.item(row, 1).text().replace(",", "."))
         except (AttributeError, ValueError):
             QMessageBox.warning(self, "PID", "Все отправляемые значения должны быть числами")
             return
         if any(value < 0 for value in values.values()):
-            QMessageBox.warning(self, "PID", "Отрицательные PID/LPF/limit значения отклонены")
+            QMessageBox.warning(self, "PID", "Отрицательные PID/LPF значения отклонены")
             return
         for field, value in values.items():
             self._send(self.protocol.pid(loop, field, value))
@@ -1073,16 +1131,9 @@ class MainWindow(QMainWindow):
         profile_params.i = values["i"]
         profile_params.d = values["d"]
         profile_params.output_ramp = values["ramp"]
-        profile_params.output_limit = values["limit"]
         profile_params.lpf_tf = values["lpf"]
         if self.project:
             self.project.save_profile(self.profile)
-        if loop == "angle":
-            effective = min(values["limit"], self.device_limit_spins["velocity_rad_s"].value())
-            self._log(
-                "INFO",
-                f"Лимит выхода position PID отправлен; фактический предел скорости не выше {effective:g} рад/с",
-            )
         QTimer.singleShot(150, self._read_selected_pid)
 
     def _allow_parameter_change(self, operation: str) -> bool:
@@ -1105,15 +1156,53 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def _apply_monitoring(self) -> None:
+        for name, checkbox in self.plot_checks.items():
+            if checkbox.isChecked():
+                self.monitor_checks[name].setChecked(True)
         mask = "".join("1" if self.monitor_checks[name].isChecked() else "0" for name in MONITOR_FIELDS)
         if "1" not in mask:
             QMessageBox.warning(self, "Мониторинг", "Выберите хотя бы один сигнал")
             return
         self.monitor_mask = mask
         self.telemetry_statistics.reset()
+        self._monitoring_requested = True
+        self._monitor_restart_count = 0
+        self._send_monitor_configuration("настроен пользователем")
+
+    def _send_monitor_configuration(self, reason: str) -> None:
+        now = time.monotonic()
+        self._monitor_configured_at = now
+        self._last_monitor_restart_at = now
+        self._last_telemetry_received_at = None
+        self.monitor_health_label.setText("Поток: ожидание первого отсчёта…")
         self._send(self.protocol.monitor_downsample(self.monitor_downsample_spin.value()))
-        self._send(self.protocol.monitor_variables(mask))
-        self._log("INFO", f"Мониторинг настроен: mask={mask}; токи потока переводятся из мА в А")
+        self._send(self.protocol.monitor_variables(self.monitor_mask))
+        self._log(
+            "INFO",
+            f"Мониторинг {reason}: mask={self.monitor_mask}; токи потока переводятся из мА в А",
+        )
+
+    def _restart_monitoring(self) -> None:
+        if not self.device.connected:
+            QMessageBox.information(self, "Мониторинг", "Сначала подключите мотор")
+            return
+        self._monitoring_requested = True
+        self._monitor_restart_count += 1
+        self._send_monitor_configuration("перезапущен вручную")
+
+    def _on_plot_signal_toggled(self, name: str, checked: bool) -> None:
+        if not checked or self.monitor_checks[name].isChecked():
+            return
+        self.monitor_checks[name].setChecked(True)
+        if self.device.connected:
+            self._apply_monitoring()
+
+    def _clear_live_plot(self) -> None:
+        for times, values in self._telemetry_series.values():
+            times.clear()
+            values.clear()
+        for curve in self.telemetry_curves.values():
+            curve.setData([], [])
 
     def _toggle_recording(self) -> None:
         if self.telemetry_recorder.active:
@@ -1125,6 +1214,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Запись", "Сначала создайте или откройте проект FOCTwin")
             return
         path = self.telemetry_recorder.start(self.project.new_telemetry_path("manual"))
+        self._reported_recorder_error = None
         self.record_button.setText("Остановить запись")
         self._log("RECORD", f"Запись начата: {path}")
 
@@ -1194,6 +1284,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._initialize_connection)
         else:
             self._pwm_requested = False
+            self._last_sample = None
+            self._last_telemetry_received_at = None
+            self._monitor_configured_at = None
+            self.monitor_health_label.setText("Поток: устройство отключено")
             self.pwm_state_label.setText("PWM: состояние неизвестно после разрыва")
             reconnecting = self._connection_requested and self.auto_reconnect_checkbox.isChecked()
             self.connect_button.setText("Отменить переподключение" if reconnecting else "Подключить")
@@ -1205,16 +1299,19 @@ class MainWindow(QMainWindow):
         self._log("SERIAL", message)
 
     def _on_device_line(self, received_at: float, line: str) -> None:
-        self.raw_output.appendPlainText(f"RX  {line}")
         response = parse_commander_response(line)
         if response is not None:
+            self.raw_output.appendPlainText(f"RX  {line}")
             self._log("RX", line)
             self._apply_commander_response(response)
             return
         parsed = parse_monitor_line(line, self.monitor_mask)
         if not parsed:
+            self.raw_output.appendPlainText(f"RX  {line}")
             self._log("RX", line)
             return
+        if self.raw_telemetry_checkbox.isChecked():
+            self.raw_output.appendPlainText(f"RX  {line}")
         self._telemetry_sequence += 1
         timestamp_s = received_at - self._started_at
         sample = TelemetrySample(
@@ -1225,6 +1322,7 @@ class MainWindow(QMainWindow):
             **parsed,
         )
         self._last_sample = sample
+        self._last_telemetry_received_at = received_at
         self.telemetry_statistics.add(timestamp_s)
         self.telemetry_recorder.append(sample)
         for name in MONITOR_FIELDS:
@@ -1234,16 +1332,9 @@ class MainWindow(QMainWindow):
             times, values = self._telemetry_series[name]
             times.append(timestamp_s)
             values.append(value)
-            if len(times) > 5000:
-                del times[:-5000]
-                del values[:-5000]
-            self.telemetry_values[name].setText(f"{value:.6g}")
-        self.monitor_stats_label.setText(
-            f"{self.telemetry_statistics.sample_count} отсчётов · "
-            f"{self.telemetry_statistics.frequency_hz:.1f} Гц · "
-            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс"
-        )
-        self._refresh_live_plot(received_at)
+            if len(times) > 60000:
+                del times[:-60000]
+                del values[:-60000]
 
         violations = self.guard.check(sample) if self.software_guard_enabled.isChecked() else []
         if self._pwm_requested and violations and not self._safety_latched:
@@ -1251,23 +1342,91 @@ class MainWindow(QMainWindow):
             self._log("SAFETY", "; ".join(violation.message for violation in violations))
             self._emergency_stop()
 
-    def _refresh_live_plot(self, received_at: float) -> None:
-        if self.live_plot is None or received_at - self._last_plot_refresh < 0.05:
+    def _refresh_telemetry_ui(self) -> None:
+        sample = self._last_sample
+        if sample is not None and sample.sequence != self._displayed_telemetry_sequence:
+            self._displayed_telemetry_sequence = sample.sequence
+            for name in MONITOR_FIELDS:
+                value = getattr(sample, name)
+                if value is not None:
+                    self.telemetry_values[name].setText(f"{value:.6g}")
+        self.monitor_stats_label.setText(
+            f"{self.telemetry_statistics.sample_count} отсчётов · "
+            f"{self.telemetry_statistics.frequency_hz:.1f} Гц · "
+            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс"
+        )
+        self._refresh_live_plot()
+        recorder_error = self.telemetry_recorder.last_error
+        if recorder_error and recorder_error != self._reported_recorder_error:
+            self._reported_recorder_error = recorder_error
+            self.record_button.setText("Начать запись CSV")
+            self._log("ERROR", f"Запись телеметрии остановлена: {recorder_error}")
+
+    def _refresh_live_plot(self) -> None:
+        if self.live_plot is None:
             return
-        self._last_plot_refresh = received_at
+        window_s = float(self.plot_window_spin.value())
+        last_timestamp: float | None = None
         for name, curve in self.telemetry_curves.items():
             visible = self.plot_checks[name].isChecked()
             curve.setVisible(visible)
             if visible:
                 times, values = self._telemetry_series[name]
-                curve.setData(times, values)
+                if times:
+                    start = bisect_left(times, times[-1] - window_s)
+                    curve.setData(times[start:], values[start:])
+                    last_timestamp = max(last_timestamp or times[-1], times[-1])
+                else:
+                    curve.setData([], [])
+        if self.plot_follow_checkbox.isChecked() and last_timestamp is not None:
+            self.live_plot.setXRange(max(0.0, last_timestamp - window_s), last_timestamp, padding=0.0)
+
+    def _check_telemetry_health(self) -> None:
+        if not self.device.connected:
+            self.monitor_health_label.setText("Поток: устройство отключено")
+            return
+        if not self._monitoring_requested:
+            self.monitor_health_label.setText("Поток: ещё не настроен")
+            return
+        now = time.monotonic()
+        reference = self._last_telemetry_received_at or self._monitor_configured_at
+        if reference is None:
+            self.monitor_health_label.setText("Поток: ожидание первого отсчёта…")
+            return
+        age = max(0.0, now - reference)
+        timeout = monitor_stale_timeout(self.monitor_downsample_spin.value())
+        if age <= timeout:
+            if self._last_telemetry_received_at is None:
+                self.monitor_health_label.setText("Поток: ожидание первого отсчёта…")
+            else:
+                recovery = (
+                    f" · восстановлений: {self._monitor_restart_count}"
+                    if self._monitor_restart_count
+                    else ""
+                )
+                self.monitor_health_label.setText(f"Поток: работает · возраст {age:.1f} с{recovery}")
+            return
+        self.monitor_health_label.setText(
+            f"Поток: нет отсчётов {age:.1f} с — автоматический перезапуск"
+        )
+        if now - self._last_monitor_restart_at >= timeout:
+            self._monitor_restart_count += 1
+            self._send_monitor_configuration("перезапущен автоматически")
 
     def _apply_commander_response(self, response: CommanderResponse) -> None:
         if response.key.startswith("limit."):
             key = response.key.removeprefix("limit.")
             if key in self.device_limit_spins:
-                self.device_limit_spins[key].setValue(float(response.value))
-                self.device_limit_confirmed[key].setText(f"{float(response.value):g}")
+                value = float(response.value)
+                self.device_limit_spins[key].setValue(value)
+                self.device_limit_confirmed[key].setText(f"{value:g}")
+                if key == "velocity_rad_s":
+                    self.profile.angle.output_limit = value
+                elif key == "current_a":
+                    self.profile.velocity.output_limit = value
+                elif key == "voltage_v":
+                    self.profile.current_q.output_limit = value
+                    self.profile.current_d.output_limit = value
             return
         if response.key == "enabled":
             self._pwm_requested = bool(response.value)
@@ -1299,9 +1458,9 @@ class MainWindow(QMainWindow):
             return
         if response.key.startswith("pid."):
             _, loop, field = response.key.split(".")
-            row_by_field = {"p": 0, "i": 1, "d": 2, "ramp": 3, "limit": 4, "lpf": 5}
-            if loop in self.pid_tables and field in row_by_field:
-                self.pid_tables[loop].item(row_by_field[field], 1).setText(f"{float(response.value):g}")
+            if loop in self.pid_tables and field in self.PID_ROW_BY_FIELD:
+                row = self.PID_ROW_BY_FIELD[field]
+                self.pid_tables[loop].item(row, 1).setText(f"{float(response.value):g}")
 
     def _log(self, level: str, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -1319,6 +1478,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._connection_requested = False
+        self._reconnect_timer.stop()
+        self._telemetry_ui_timer.stop()
+        self._telemetry_watchdog_timer.stop()
         self.telemetry_recorder.stop()
         self.device.emergency_stop()
         self.device.disconnect()

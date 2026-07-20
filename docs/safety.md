@@ -41,3 +41,8 @@ motor object to 1 A until another command or a controller reset. Because phase r
 configured, SimpleFOC also uses that current limit as the velocity PID output limit in Voltage
 torque mode. A motor that no longer starts after `ALC1` is therefore current-limited rather
 than necessarily frozen.
+
+The same linking applies to the other nested controllers: `ALV` synchronizes the angle PID
+output limit (velocity), while `ALU` synchronizes both current PID output limits (voltage).
+FOCTwin therefore exposes these three authoritative limits only in the SimpleFOC limit panel
+instead of offering conflicting editable copies in the PID tables.
