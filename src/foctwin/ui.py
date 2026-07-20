@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -114,7 +115,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"FOCTwin {__version__} — Identify. Simulate. Tune.")
-        self.resize(1480, 900)
+        self.resize(1200, 800)
+        self.setMinimumSize(900, 600)
         self.profile = MotorProfile()
         self.protocol = CommanderProtocol(self.profile.command_id)
         self.device = SerialDevice(self.protocol)
@@ -270,7 +272,10 @@ class MainWindow(QMainWindow):
             "Полный доступ к Commander, подтверждаемым параметрам платы, телеметрии и записи.",
         )
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setMinimumWidth(1040)
         left = QWidget()
+        left.setMinimumWidth(410)
         left_layout = QVBoxLayout(left)
 
         connection = QGroupBox("Serial / Commander")
@@ -329,16 +334,24 @@ class MainWindow(QMainWindow):
         disable.setObjectName("dangerButton")
         disable.clicked.connect(self._emergency_stop)
         self.pwm_state_label = QLabel("PWM: неизвестно")
-        self.allow_live_changes_checkbox = QCheckBox(
-            "Разрешить изменение режимов, PID и лимитов при включённом PWM"
+        control_buttons = QWidget()
+        control_buttons_layout = QGridLayout(control_buttons)
+        control_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        control_buttons_layout.addWidget(apply_modes, 0, 0)
+        control_buttons_layout.addWidget(send_target, 0, 1)
+        control_buttons_layout.addWidget(enable, 1, 0)
+        control_buttons_layout.addWidget(disable, 1, 1)
+        control_buttons_layout.setColumnStretch(0, 1)
+        control_buttons_layout.setColumnStretch(1, 1)
+        self.allow_live_changes_checkbox = QCheckBox("Разрешить изменения при включённом PWM")
+        self.allow_live_changes_checkbox.setToolTip(
+            "Разрешает изменять режимы, PID/LPF и лимиты устройства при активном PWM."
         )
         self.allow_live_changes_checkbox.setChecked(False)
         control_form.addRow("Контур движения", self.motion_combo)
         control_form.addRow("Контур момента", self.torque_combo)
         control_form.addRow("Цель", self.target_spin)
-        control_form.addRow(apply_modes)
-        control_form.addRow(send_target)
-        control_form.addRow(enable, disable)
+        control_form.addRow(control_buttons)
         control_form.addRow(self.pwm_state_label)
         control_form.addRow(self.allow_live_changes_checkbox)
         left_layout.addWidget(control)
@@ -407,6 +420,7 @@ class MainWindow(QMainWindow):
         left_layout.addStretch(1)
 
         right = QWidget()
+        right.setMinimumWidth(600)
         right_layout = QVBoxLayout(right)
         pid_group = QGroupBox("PID / LPF / anti-windup")
         pid_layout = QVBoxLayout(pid_group)
@@ -440,13 +454,15 @@ class MainWindow(QMainWindow):
             self.pid_tab_loops.append(loop)
             self.pid_tabs.addTab(pid_table, title)
         pid_layout.addWidget(self.pid_tabs)
-        pid_buttons = QHBoxLayout()
+        pid_buttons = QGridLayout()
         read_pid = QPushButton("Считать выбранный контур")
         read_pid.clicked.connect(self._read_selected_pid)
         apply_pid = QPushButton("Применить выбранный контур")
         apply_pid.clicked.connect(self._apply_selected_pid)
-        pid_buttons.addWidget(read_pid)
-        pid_buttons.addWidget(apply_pid)
+        pid_buttons.addWidget(read_pid, 0, 0)
+        pid_buttons.addWidget(apply_pid, 0, 1)
+        pid_buttons.setColumnStretch(0, 1)
+        pid_buttons.setColumnStretch(1, 1)
         pid_layout.addLayout(pid_buttons)
         right_layout.addWidget(pid_group)
 
@@ -463,39 +479,47 @@ class MainWindow(QMainWindow):
         )
         self.monitor_checks: dict[str, QCheckBox] = {}
         self.telemetry_values: dict[str, QLabel] = {}
+        signal_columns = 2
         for index, (key, label) in enumerate(monitor_labels):
             checkbox = QCheckBox(label)
             checkbox.setChecked(True)
             value_label = QLabel("—")
             self.monitor_checks[key] = checkbox
             self.telemetry_values[key] = value_label
-            monitor_layout.addWidget(checkbox, index // 4, (index % 4) * 2)
-            monitor_layout.addWidget(value_label, index // 4, (index % 4) * 2 + 1)
+            row = index // signal_columns
+            column = (index % signal_columns) * 2
+            monitor_layout.addWidget(checkbox, row, column)
+            monitor_layout.addWidget(value_label, row, column + 1)
         self.monitor_downsample_spin = QSpinBox()
         self.monitor_downsample_spin.setRange(1, 100000)
         self.monitor_downsample_spin.setValue(20)
         apply_monitor = QPushButton("Применить мониторинг")
         apply_monitor.clicked.connect(self._apply_monitoring)
         self.monitor_stats_label = QLabel("0 отсчётов · 0 Гц · jitter 0 мс")
+        self.monitor_stats_label.setWordWrap(True)
         self.record_button = QPushButton("Начать запись CSV")
         self.record_button.clicked.connect(self._toggle_recording)
-        monitor_layout.addWidget(QLabel("Downsample"), 2, 0)
-        monitor_layout.addWidget(self.monitor_downsample_spin, 2, 1)
-        monitor_layout.addWidget(apply_monitor, 2, 2, 1, 2)
-        monitor_layout.addWidget(self.monitor_stats_label, 3, 0, 1, 4)
-        monitor_layout.addWidget(self.record_button, 3, 4, 1, 4)
+        monitor_control_row = (len(monitor_labels) + signal_columns - 1) // signal_columns
+        monitor_layout.addWidget(QLabel("Downsample"), monitor_control_row, 0)
+        monitor_layout.addWidget(self.monitor_downsample_spin, monitor_control_row, 1)
+        monitor_layout.addWidget(apply_monitor, monitor_control_row, 2, 1, 2)
+        monitor_layout.addWidget(self.monitor_stats_label, monitor_control_row + 1, 0, 1, 4)
+        monitor_layout.addWidget(self.record_button, monitor_control_row + 2, 0, 1, 4)
+        monitor_layout.setColumnStretch(1, 1)
+        monitor_layout.setColumnStretch(3, 1)
         right_layout.addWidget(monitor)
 
         telemetry = QGroupBox("Живая телеметрия")
         telemetry_layout = QVBoxLayout(telemetry)
-        plot_controls = QHBoxLayout()
+        plot_controls = QGridLayout()
         self.plot_checks: dict[str, QCheckBox] = {}
-        for key, label in monitor_labels:
+        for index, (key, label) in enumerate(monitor_labels):
             checkbox = QCheckBox(label)
             checkbox.setChecked(key in {"angle_rad", "velocity_rad_s"})
             self.plot_checks[key] = checkbox
-            plot_controls.addWidget(checkbox)
-        plot_controls.addStretch(1)
+            plot_controls.addWidget(checkbox, index // 4, index % 4)
+        for column in range(4):
+            plot_controls.setColumnStretch(column, 1)
         telemetry_layout.addLayout(plot_controls)
         if pg is not None:
             self.live_plot = pg.PlotWidget()
@@ -514,8 +538,18 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(telemetry, 1)
         splitter.addWidget(left)
         splitter.addWidget(right)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 7)
         splitter.setSizes((480, 900))
-        layout.addWidget(splitter, 1)
+        self.manual_splitter = splitter
+        self.manual_scroll = QScrollArea()
+        self.manual_scroll.setObjectName("manualScroll")
+        self.manual_scroll.setWidgetResizable(True)
+        self.manual_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.manual_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.manual_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.manual_scroll.setWidget(splitter)
+        layout.addWidget(self.manual_scroll, 1)
         self._refresh_ports()
         return page
 

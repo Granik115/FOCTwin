@@ -2,7 +2,10 @@
 
 Windows test builds are produced by `.github/workflows/windows-release.yml`.
 
-To publish a new build:
+Every pull request to `main` produces or refreshes the pre-release for the version declared
+in `pyproject.toml`. A release branch can run the same workflow without a pull request.
+
+To publish through a release branch:
 
 1. update the project version in `pyproject.toml`;
 2. commit and validate the update;

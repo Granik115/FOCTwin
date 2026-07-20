@@ -49,6 +49,22 @@ Preview builds are intentionally marked as pre-releases while real-hardware test
 progress. They are not code-signed yet, so Windows SmartScreen can display a warning. MATLAB
 R2022b and its Python Engine are still required for the simulation and tuning workspaces.
 
+## Update a source checkout
+
+`git pull` is supported for the development/project form of FOCTwin. Clone and update the
+stable project branch with:
+
+```powershell
+git clone https://github.com/Granik115/FOCTwin.git
+cd FOCTwin
+git switch main
+git pull --ff-only origin main
+```
+
+An existing editable Python installation uses the updated sources immediately. Run
+`python -m pip install -e ".[dev]"` again only when dependencies change. A portable ZIP from
+GitHub Releases has no Git metadata and is updated by downloading the next ZIP instead.
+
 ## Development setup
 
 MATLAB R2022b supports Python 3.10, so FOCTwin pins that interpreter family.
