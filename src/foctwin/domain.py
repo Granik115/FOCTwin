@@ -124,7 +124,15 @@ class SafetyGuard:
         self.limits = limits
         self._soft_limit_counts: dict[str, int] = {}
 
-    def check(self, sample: TelemetrySample) -> list[SafetyViolation]:
+    def reset(self) -> None:
+        self._soft_limit_counts.clear()
+
+    def check(
+        self,
+        sample: TelemetrySample,
+        *,
+        ignored_signals: frozenset[str] = frozenset(),
+    ) -> list[SafetyViolation]:
         violations: list[SafetyViolation] = []
         for signal, value, limit in (
             ("current_q_a", sample.current_q_a, self.limits.current_a),
@@ -133,6 +141,9 @@ class SafetyGuard:
             ("voltage_d_v", sample.voltage_d_v, self.limits.voltage_v),
             ("velocity_rad_s", sample.velocity_rad_s, self.limits.velocity_rad_s),
         ):
+            if signal in ignored_signals:
+                self._soft_limit_counts[signal] = 0
+                continue
             if value is None:
                 continue
             absolute = abs(value)

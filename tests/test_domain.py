@@ -35,3 +35,19 @@ class DomainTests(unittest.TestCase):
 
         self.assertEqual([violation.signal for violation in violations], ["current_q_a"])
         self.assertIn("резкий выброс", violations[0].message)
+
+    def test_safety_guard_can_ignore_untrusted_velocity_and_reset_history(self):
+        guard = SafetyGuard(SafetyLimits())
+        sample = TelemetrySample(timestamp_s=0, current_q_a=1.2, velocity_rad_s=43.0)
+
+        self.assertEqual(
+            guard.check(sample, ignored_signals=frozenset({"velocity_rad_s"})),
+            [],
+        )
+        guard.check(sample, ignored_signals=frozenset({"velocity_rad_s"}))
+        guard.reset()
+
+        self.assertEqual(
+            guard.check(sample, ignored_signals=frozenset({"velocity_rad_s"})),
+            [],
+        )

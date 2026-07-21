@@ -22,11 +22,11 @@ checkpoint or accepted parameter set.
 
 ### Experiment orchestrator
 
-The first real state machine is the low-speed friction experiment. It uses explicit zero,
-settling, measuring, pause, recovering, complete and aborted phases. A telemetry/Serial
-interruption commands a best-effort stop and repeats the interrupted point after the stream is
-fresh again. Durable resume starts at a point boundary from the last checkpoint; it never tries
-to continue the middle of a physical motion.
+The first real state machine is the two-stage actuator/friction experiment. It has explicit
+baseline, direct-Uq pulse, pulse pause, velocity reconfiguration, zero, settling, measuring,
+recovery, complete and aborted phases. A telemetry/Serial interruption commands a best-effort
+stop and repeats the interrupted pulse or point after the stream is fresh again. Durable resume
+starts at a checkpoint boundary; it never tries to continue the middle of a physical motion.
 
 ### Serial device service
 

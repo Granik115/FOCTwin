@@ -54,14 +54,16 @@ from foctwin.domain import (
     TorqueMode,
 )
 from foctwin.friction import (
-    FRICTION_MAX_CURRENT_LIMIT_A,
+    FRICTION_DIRECT_VOLTAGE_SENTINEL,
+    FRICTION_MAX_CURRENT_TRIP_A,
     FRICTION_MAX_TARGET_VELOCITY_RAD_S,
     FRICTION_MAX_VELOCITY_LIMIT_RAD_S,
     FRICTION_MAX_VOLTAGE_LIMIT_V,
-    FRICTION_MIN_CURRENT_LIMIT_A,
+    FRICTION_MIN_CURRENT_TRIP_A,
     FRICTION_MIN_TARGET_VELOCITY_RAD_S,
     FRICTION_MIN_VOLTAGE_LIMIT_V,
     FRICTION_MONITOR_MASK,
+    ActuatorPulseResult,
     FrictionAction,
     FrictionEstimate,
     FrictionExperiment,
@@ -686,13 +688,13 @@ class MainWindow(QMainWindow):
     def _identification_page(self) -> QWidget:
         page, layout = titled_page(
             "Идентификация цифрового двойника",
-            "Первый автоматический опыт: оценка сухого, вязкого и страгивающего трения на малых скоростях.",
+            "Двухэтапный опыт: проверка исполнительной части, затем трение на малых скоростях.",
         )
         warning = QLabel(
-            "Опыт запускает мотор автоматически в режиме Voltage torque: ток задаётся внешним "
-            "контуром скорости через известное сопротивление фазы, без ещё не проверенного FOC "
-            "Current. Прошивка не имеет heartbeat — держите питание доступным. При потере "
-            "телеметрии FOCTwin отправит цель 0 и AE0, восстановит поток и повторит точку."
+            "Сначала FOCTwin короткими импульсами повышает непосредственно Uq и немедленно "
+            "обнуляет его при первом движении. Отправленная команда, фактический Uq и измеренный "
+            "Iq сохраняются раздельно. Скоростной тест начнётся только после подтверждённого "
+            "страгивания и настоящего Iq в обе стороны. Держите питание доступным."
         )
         warning.setObjectName("danger")
         warning.setWordWrap(True)
@@ -700,7 +702,7 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        config_group = QGroupBox("Безопасный план низкоскоростного опыта")
+        config_group = QGroupBox("Безопасный двухэтапный план")
         config_grid = QGridLayout(config_group)
         self.friction_low_speed = spin(
             0.02,
@@ -716,12 +718,12 @@ class MainWindow(QMainWindow):
             4,
             0.005,
         )
-        self.friction_current_limit = spin(
-            0.05,
-            FRICTION_MIN_CURRENT_LIMIT_A,
-            FRICTION_MAX_CURRENT_LIMIT_A,
+        self.friction_current_trip = spin(
+            1.0,
+            FRICTION_MIN_CURRENT_TRIP_A,
+            FRICTION_MAX_CURRENT_TRIP_A,
             3,
-            0.01,
+            0.1,
         )
         self.friction_voltage_limit = spin(
             12.0,
@@ -739,6 +741,15 @@ class MainWindow(QMainWindow):
         )
         self.friction_angle_min = spin(-3.0, -1e9, 1e9, 3, 0.1)
         self.friction_angle_max = spin(3.0, -1e9, 1e9, 3, 0.1)
+        self.friction_pulse_start = spin(0.1, 0.001, 100.0, 3, 0.05)
+        self.friction_pulse_step = spin(0.1, 0.001, 100.0, 3, 0.05)
+        self.friction_pulse_max = spin(0.5, 0.001, 100.0, 3, 0.1)
+        self.friction_pulse_duration = spin(0.5, 0.1, 5.0, 2, 0.1)
+        self.friction_actuator_pause = spin(0.7, 0.2, 10.0, 2, 0.1)
+        self.friction_baseline = spin(1.0, 0.5, 10.0, 2, 0.1)
+        self.friction_movement_threshold = spin(0.002, 0.0001, 0.5, 4, 0.001)
+        self.friction_current_floor = spin(0.01, 0.001, 10.0, 3, 0.005)
+        self.friction_breakaway_margin = spin(1.2, 1.01, 2.0, 2, 0.05)
         self.friction_settle = spin(2.0, 1.0, 30.0, 1, 0.5)
         self.friction_measure = spin(4.0, 2.0, 120.0, 1, 0.5)
         self.friction_pause = spin(1.0, 0.5, 30.0, 1, 0.5)
@@ -749,9 +760,18 @@ class MainWindow(QMainWindow):
         self.friction_recoveries.setRange(0, 10)
         self.friction_recoveries.setValue(3)
         fields = (
+            ("Начальный Uq, В", self.friction_pulse_start),
+            ("Шаг Uq, В", self.friction_pulse_step),
+            ("Максимальный Uq, В", self.friction_pulse_max),
+            ("Импульс Uq, с", self.friction_pulse_duration),
+            ("Пауза после импульса, с", self.friction_actuator_pause),
+            ("Исходный спокойный ноль, с", self.friction_baseline),
+            ("Порог движения, рад", self.friction_movement_threshold),
+            ("Порог подтверждения Iq, А", self.friction_current_floor),
+            ("Запас над страгиванием", self.friction_breakaway_margin),
             ("Малая скорость, рад/с", self.friction_low_speed),
             ("Большая скорость, рад/с", self.friction_high_speed),
-            ("Предел тока, А", self.friction_current_limit),
+            ("Аварийный измеренный ток, А", self.friction_current_trip),
             ("Предел напряжения, В", self.friction_voltage_limit),
             ("Предел скорости, рад/с", self.friction_velocity_limit),
             ("Координата min, рад", self.friction_angle_min),
@@ -762,15 +782,16 @@ class MainWindow(QMainWindow):
             ("Downsample телеметрии", self.friction_downsample),
             ("Автовосстановлений", self.friction_recoveries),
         )
+        rows_per_column = (len(fields) + 1) // 2
         for index, (label, widget) in enumerate(fields):
-            column = 0 if index < 6 else 2
-            row = index if index < 6 else index - 6
+            column = 0 if index < rows_per_column else 2
+            row = index if index < rows_per_column else index - rows_per_column
             config_grid.addWidget(QLabel(label), row, column)
             config_grid.addWidget(widget, row, column + 1)
         self.friction_duration_label = QLabel()
         self.friction_duration_label.setObjectName("hint")
         self.friction_duration_label.setWordWrap(True)
-        config_grid.addWidget(self.friction_duration_label, 6, 0, 1, 4)
+        config_grid.addWidget(self.friction_duration_label, rows_per_column, 0, 1, 4)
         content_layout.addWidget(config_group)
 
         controls = QGridLayout()
@@ -792,11 +813,25 @@ class MainWindow(QMainWindow):
         self.friction_status_label.setWordWrap(True)
         content_layout.addWidget(self.friction_status_label)
 
+        actuator_group = QGroupBox("Проверка исполнительной части")
+        actuator_layout = QVBoxLayout(actuator_group)
+        self.friction_actuator_note = QLabel(
+            "Здесь отдельно появятся команда Uq, фактический Uq, измеренный Iq и движение."
+        )
+        self.friction_actuator_note.setWordWrap(True)
+        actuator_layout.addWidget(self.friction_actuator_note)
+        self.friction_actuator_table = table(
+            ["Напр.", "Команда Uq, В", "Факт. Uq, В", "Iq сред., А", "Iq пик, А", "Δугол, рад", "Статус"],
+            0,
+        )
+        actuator_layout.addWidget(self.friction_actuator_table)
+        content_layout.addWidget(actuator_group)
+
         self.friction_points_table = table(
             [
                 "Цель, рад/с",
                 "Скорость по углу",
-                "Iэкв, А",
+                "Iq измеренный, А",
                 "Момент, Н·м",
                 "Отсчёты",
                 "Статус",
@@ -850,6 +885,12 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
         for widget in (
+            self.friction_pulse_start,
+            self.friction_pulse_step,
+            self.friction_pulse_max,
+            self.friction_pulse_duration,
+            self.friction_actuator_pause,
+            self.friction_baseline,
             self.friction_low_speed,
             self.friction_high_speed,
             self.friction_settle,
@@ -864,11 +905,20 @@ class MainWindow(QMainWindow):
         return FrictionTestConfig(
             low_velocity_rad_s=self.friction_low_speed.value(),
             high_velocity_rad_s=self.friction_high_speed.value(),
-            current_limit_a=self.friction_current_limit.value(),
+            current_trip_limit_a=self.friction_current_trip.value(),
             voltage_limit_v=self.friction_voltage_limit.value(),
             velocity_limit_rad_s=self.friction_velocity_limit.value(),
             angle_min_rad=self.friction_angle_min.value(),
             angle_max_rad=self.friction_angle_max.value(),
+            pulse_start_voltage_v=self.friction_pulse_start.value(),
+            pulse_step_voltage_v=self.friction_pulse_step.value(),
+            pulse_max_voltage_v=self.friction_pulse_max.value(),
+            pulse_duration_s=self.friction_pulse_duration.value(),
+            actuator_pause_s=self.friction_actuator_pause.value(),
+            baseline_s=self.friction_baseline.value(),
+            movement_threshold_rad=self.friction_movement_threshold.value(),
+            measured_current_floor_a=self.friction_current_floor.value(),
+            breakaway_margin=self.friction_breakaway_margin.value(),
             settle_s=self.friction_settle.value(),
             measure_s=self.friction_measure.value(),
             pause_s=self.friction_pause.value(),
@@ -879,11 +929,20 @@ class MainWindow(QMainWindow):
     def _set_friction_config_widgets(self, config: FrictionTestConfig) -> None:
         self.friction_low_speed.setValue(config.low_velocity_rad_s)
         self.friction_high_speed.setValue(config.high_velocity_rad_s)
-        self.friction_current_limit.setValue(config.current_limit_a)
+        self.friction_current_trip.setValue(config.current_trip_limit_a)
         self.friction_voltage_limit.setValue(config.voltage_limit_v)
         self.friction_velocity_limit.setValue(config.velocity_limit_rad_s)
         self.friction_angle_min.setValue(config.angle_min_rad)
         self.friction_angle_max.setValue(config.angle_max_rad)
+        self.friction_pulse_start.setValue(config.pulse_start_voltage_v)
+        self.friction_pulse_step.setValue(config.pulse_step_voltage_v)
+        self.friction_pulse_max.setValue(config.pulse_max_voltage_v)
+        self.friction_pulse_duration.setValue(config.pulse_duration_s)
+        self.friction_actuator_pause.setValue(config.actuator_pause_s)
+        self.friction_baseline.setValue(config.baseline_s)
+        self.friction_movement_threshold.setValue(config.movement_threshold_rad)
+        self.friction_current_floor.setValue(config.measured_current_floor_a)
+        self.friction_breakaway_margin.setValue(config.breakaway_margin)
         self.friction_settle.setValue(config.settle_s)
         self.friction_measure.setValue(config.measure_s)
         self.friction_pause.setValue(config.pause_s)
@@ -894,10 +953,11 @@ class MainWindow(QMainWindow):
     def _refresh_friction_duration(self, *_args: object) -> None:
         config = self._friction_config_from_widgets()
         self.friction_duration_label.setText(
-            "Последовательность: "
+            f"Сначала Uq ±{config.pulse_start_voltage_v:g}…±{config.pulse_max_voltage_v:g} В "
+            f"с шагом {config.pulse_step_voltage_v:g} В; затем скорости: "
             f"+{config.low_velocity_rad_s:g}, −{config.low_velocity_rad_s:g}, "
             f"+{config.high_velocity_rad_s:g}, −{config.high_velocity_rad_s:g} рад/с. "
-            f"Минимальное время без восстановлений: около {config.estimated_duration_s:.0f} с."
+            f"Худший случай без восстановлений: около {config.estimated_duration_s:.0f} с."
         )
         for row, target in enumerate(config.targets):
             self.friction_points_table.setItem(row, 0, QTableWidgetItem(f"{target:g}"))
@@ -920,14 +980,18 @@ class MainWindow(QMainWindow):
             payload = self.project.load_checkpoint("friction")
             if payload is None:
                 raise ValueError("В проекте нет checkpoint теста трения")
-            if int(payload.get("schema", 0)) < 2:
+            if int(payload.get("schema", 0)) != 3:
                 raise ValueError(
-                    "Checkpoint создан старым опытом FOC Current и несовместим с 0.3.2; "
-                    "запустите новый тест"
+                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.3; "
+                    "начните новый двухэтапный тест"
                 )
             points = [
                 FrictionPointResult.from_dict(point)
                 for point in payload.get("completed_points", [])
+            ]
+            actuator_attempts = [
+                ActuatorPulseResult.from_dict(attempt)
+                for attempt in payload.get("actuator_attempts", [])
             ]
             if len(points) >= 4 or payload.get("phase") == FrictionPhase.COMPLETE.value:
                 raise ValueError("Тест из checkpoint уже завершён")
@@ -940,6 +1004,7 @@ class MainWindow(QMainWindow):
         self._set_friction_config_widgets(config)
         self._prepare_friction_experiment(
             completed_points=points,
+            actuator_attempts=actuator_attempts,
             experiment_id=int(experiment_id) if experiment_id is not None else None,
             telemetry_paths=telemetry_paths,
             resumed=True,
@@ -949,6 +1014,7 @@ class MainWindow(QMainWindow):
         self,
         *,
         completed_points: list[FrictionPointResult] | None = None,
+        actuator_attempts: list[ActuatorPulseResult] | None = None,
         experiment_id: int | None = None,
         telemetry_paths: list[str] | None = None,
         resumed: bool = False,
@@ -975,18 +1041,19 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Тест трения", str(exc))
             return
-        if self.profile.phase_resistance_ohm <= 0 or self.profile.back_emf_v_per_krpm <= 0:
+        if self.profile.phase_resistance_ohm <= 0:
             QMessageBox.warning(
                 self,
                 "Тест трения",
-                "Для безопасного опыта Voltage torque в профиле нужны положительные "
-                "сопротивление фазы и коэффициент противо-ЭДС",
+                "Для безопасного двухэтапного опыта в профиле нужно положительное "
+                "сопротивление фазы",
             )
             return
         host_limits = self.guard.limits
         if (
-            config.current_limit_a > host_limits.current_a
+            config.current_trip_limit_a > host_limits.current_a
             or config.voltage_limit_v > host_limits.voltage_v
+            or config.pulse_max_voltage_v > host_limits.voltage_v
             or config.velocity_limit_rad_s > host_limits.velocity_rad_s
             or config.angle_min_rad < host_limits.angle_min_rad
             or config.angle_max_rad > host_limits.angle_max_rad
@@ -995,6 +1062,16 @@ class MainWindow(QMainWindow):
                 self,
                 "Тест трения",
                 "Лимиты опыта не должны быть шире программных аварийных порогов FOCTwin",
+            )
+            return
+        estimated_pulse_current = config.pulse_max_voltage_v / self.profile.phase_resistance_ohm
+        if estimated_pulse_current > config.current_trip_limit_a:
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Максимальный Uq соответствует примерно "
+                f"{estimated_pulse_current:.3g} А по сопротивлению фазы, что выше аварийного "
+                "предела измеренного тока. Уменьшите Uq max или увеличьте оба токовых порога.",
             )
             return
         sample = self._last_sample
@@ -1006,11 +1083,11 @@ class MainWindow(QMainWindow):
         ):
             QMessageBox.warning(self, "Тест трения", "Телеметрия устарела; дождитесь восстановления")
             return
-        if sample.angle_rad is None or sample.velocity_rad_s is None or sample.current_q_a is None:
+        if sample.angle_rad is None or sample.current_q_a is None or sample.voltage_q_v is None:
             QMessageBox.warning(
                 self,
                 "Тест трения",
-                "Для preflight нужны угол, скорость и Iq; включите их в мониторинге",
+                "Для preflight нужны угол, Uq и Iq; включите их в мониторинге",
             )
             return
         if not config.angle_min_rad + config.position_margin_rad <= sample.angle_rad <= (
@@ -1025,9 +1102,12 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Запуск автоматического теста",
-            "FOCTwin включит PWM в режиме Voltage torque и сам выполнит четыре движения. "
-            "Эквивалентный ток будет рассчитан из Uq, сопротивления фазы и противо-ЭДС. "
-            f"Пределы: {config.current_limit_a:g} А, {config.voltage_limit_v:g} В, "
+            "FOCTwin временно отключит компенсацию сопротивления фазы, включит torque + Voltage "
+            "и подаст короткие прямые импульсы Uq. После первого движения Uq сразу станет нулём. "
+            "Четыре скоростные точки начнутся только после подтверждённого измеренного Iq. "
+            f"Диапазон импульсов: {config.pulse_start_voltage_v:g}…"
+            f"{config.pulse_max_voltage_v:g} В; аварийный Iq {config.current_trip_limit_a:g} А. "
+            f"Общие пределы: {config.voltage_limit_v:g} В, "
             f"{config.velocity_limit_rad_s:g} рад/с, координата "
             f"[{config.angle_min_rad:g}; {config.angle_max_rad:g}].\n\n"
             "Держите питание доступным для ручного отключения. Запустить?",
@@ -1040,7 +1120,10 @@ class MainWindow(QMainWindow):
         self._save_user_settings()
         manual_mask = self.monitor_mask
         self._friction_restore_mask = manual_mask
-        self._friction_restore_commands = [self.protocol.disable()]
+        self._friction_restore_commands = [
+            self.protocol.disable(),
+            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
+        ]
         self._friction_restore_commands.extend(
             self._full_configuration_commands(pid_values, manual_mask)
         )
@@ -1049,23 +1132,20 @@ class MainWindow(QMainWindow):
         self.friction_accept_button.setEnabled(False)
         self._clear_friction_results()
         completed = list(completed_points or [])
+        attempts = list(actuator_attempts or [])
+        self._render_actuator_attempts(attempts)
         self._render_friction_points(completed)
         self._friction_experiment = FrictionExperiment(
             config,
             self.profile.torque_constant_nm_per_a,
             completed,
             phase_resistance_ohm=self.profile.phase_resistance_ohm,
-            kv_rpm_per_v=(
-                1000.0 / self.profile.back_emf_v_per_krpm
-                if self.profile.back_emf_v_per_krpm > 0
-                else None
-            ),
-            infer_current_from_voltage=True,
+            actuator_attempts=attempts,
         )
         self._friction_experiment_id = experiment_id
         if self._friction_experiment_id is None:
             self._friction_experiment_id = self.project.create_experiment(
-                "friction_velocity",
+                "friction_two_stage",
                 config.to_dict(),
             )
         self.project.update_experiment(
@@ -1089,7 +1169,12 @@ class MainWindow(QMainWindow):
             reset_recovery=True,
         )
         self._mark_monitor_configuration_started()
-        commands = self._friction_configuration_commands(config, pid_values)
+        commands = self._friction_configuration_commands(
+            config,
+            pid_values,
+            mode=self._friction_experiment.configuration_mode,
+            working_current_limit_a=self._friction_experiment.working_current_limit_a,
+        )
         self.friction_start_button.setEnabled(False)
         self.friction_resume_button.setEnabled(False)
         self.friction_stop_button.setEnabled(True)
@@ -1097,7 +1182,7 @@ class MainWindow(QMainWindow):
         self._log(
             "FRICTION",
             f"{'Продолжение' if resumed else 'Запуск'} опыта #{self._friction_experiment_id}: "
-            f"{config.targets}",
+            f"Uq={config.pulse_levels}; скорости={config.targets}",
         )
         self._save_friction_checkpoint()
         self._queue_commands(commands, self._begin_friction_motion)
@@ -1106,11 +1191,28 @@ class MainWindow(QMainWindow):
         self,
         config: FrictionTestConfig,
         pid_values: dict[str, dict[str, float]] | None = None,
+        *,
+        mode: str = "actuator",
+        working_current_limit_a: float | None = None,
     ) -> list[str]:
         values = pid_values or {loop: self._pid_values(loop) for loop in self.pid_tables}
+        if mode not in {"actuator", "velocity"}:
+            raise ValueError(f"Неизвестный этап опыта: {mode}")
+        current_limit = (
+            config.current_trip_limit_a
+            if mode == "actuator"
+            else working_current_limit_a
+        )
+        if current_limit is None:
+            raise ValueError("Для скоростного этапа не найден рабочий предел тока")
         commands = [
             self.protocol.disable(),
-            self.protocol.current_limit(config.current_limit_a),
+            self.protocol.phase_resistance(
+                FRICTION_DIRECT_VOLTAGE_SENTINEL
+                if mode == "actuator"
+                else self.profile.phase_resistance_ohm
+            ),
+            self.protocol.current_limit(current_limit),
             self.protocol.voltage_limit(config.voltage_limit_v),
             self.protocol.velocity_limit(config.velocity_limit_rad_s),
         ]
@@ -1121,7 +1223,9 @@ class MainWindow(QMainWindow):
         commands.extend(
             (
                 self.protocol.torque_mode(TorqueMode.VOLTAGE),
-                self.protocol.motion_mode(MotionMode.VELOCITY),
+                self.protocol.motion_mode(
+                    MotionMode.TORQUE if mode == "actuator" else MotionMode.VELOCITY
+                ),
                 self.protocol.target(0.0),
                 self.protocol.monitor_clear(),
                 self.protocol.monitor_downsample(config.monitor_downsample),
@@ -1137,10 +1241,17 @@ class MainWindow(QMainWindow):
             return
         self._pwm_requested = True
         self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
         self._process_friction_actions(experiment.start(time.monotonic()))
-        self.friction_status_label.setText(
-            "PWM включён в Voltage torque; выдержка на нулевой скорости…"
-        )
+        if experiment.configuration_mode == "actuator":
+            self.friction_status_label.setText(
+                "PWM включён: проверяется спокойный ноль перед первым прямым импульсом Uq…"
+            )
+        else:
+            self.friction_status_label.setText(
+                "Исполнительная часть уже подтверждена; выдержка перед скоростными точками…"
+            )
 
     def _advance_friction_experiment(self) -> None:
         experiment = self._friction_experiment
@@ -1148,6 +1259,9 @@ class MainWindow(QMainWindow):
             return
         now = time.monotonic()
         if experiment.phase == FrictionPhase.IDLE:
+            return
+        if experiment.phase == FrictionPhase.CONFIGURING_VELOCITY:
+            self._update_friction_status(now)
             return
         if experiment.phase == FrictionPhase.RECOVERING:
             self._advance_friction_recovery(now)
@@ -1191,7 +1305,11 @@ class MainWindow(QMainWindow):
             reset_recovery=False,
         )
         self._mark_monitor_configuration_started()
-        commands = self._friction_configuration_commands(experiment.config)
+        commands = self._friction_configuration_commands(
+            experiment.config,
+            mode=experiment.configuration_mode,
+            working_current_limit_a=experiment.working_current_limit_a,
+        )
         self.friction_status_label.setText("Поток восстановлен; повторяется прерванная точка…")
         self._queue_commands(commands, self._resume_friction_motion)
 
@@ -1203,6 +1321,8 @@ class MainWindow(QMainWindow):
             return
         self._pwm_requested = True
         self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
         self._process_friction_actions(experiment.resume_after_recovery(time.monotonic()))
         self._save_friction_checkpoint()
 
@@ -1213,9 +1333,24 @@ class MainWindow(QMainWindow):
                 self._send(self.protocol.target(action.value))
             elif action.kind == "checkpoint":
                 if experiment is not None:
+                    self._render_actuator_attempts(experiment.actuator_attempts)
                     self._render_friction_points(experiment.points)
                 self._save_friction_checkpoint()
+            elif action.kind == "configure_velocity":
+                if experiment is None:
+                    continue
+                self.friction_status_label.setText(
+                    "Страгивание и Iq подтверждены; PWM отключается и настраивается скоростной этап…"
+                )
+                commands = self._friction_configuration_commands(
+                    experiment.config,
+                    mode="velocity",
+                    working_current_limit_a=experiment.working_current_limit_a,
+                )
+                self._queue_commands(commands, self._finish_friction_velocity_configuration)
             elif action.kind == "safe_stop":
+                if experiment is not None and experiment.phase == FrictionPhase.ABORTED:
+                    self._cancel_queued_commands()
                 sent = self.device.emergency_stop()
                 self._pwm_requested = False
                 self.pwm_state_label.setText("PWM: отключён тестом трения")
@@ -1227,16 +1362,51 @@ class MainWindow(QMainWindow):
                 self._pwm_requested = False
                 self._finalize_friction_experiment("completed")
 
+    def _finish_friction_velocity_configuration(self) -> None:
+        experiment = self._friction_experiment
+        if experiment is None:
+            return
+        self._pwm_requested = True
+        self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
+        self._process_friction_actions(
+            experiment.velocity_configuration_applied(time.monotonic())
+        )
+        self.friction_status_label.setText(
+            "Исполнительная часть подтверждена; выдержка перед четырьмя скоростными точками…"
+        )
+
     def _update_friction_status(self, now: float) -> None:
         experiment = self._friction_experiment
         if experiment is None:
             return
         phase_names = {
+            FrictionPhase.ACTUATOR_BASELINE: "проверка спокойного нуля",
+            FrictionPhase.ACTUATOR_PULSE: "импульс прямого Uq",
+            FrictionPhase.ACTUATOR_PAUSE: "Uq=0, ожидание остановки",
+            FrictionPhase.CONFIGURING_VELOCITY: "переключение на скоростной этап",
             FrictionPhase.ZERO: "выдержка на нуле",
             FrictionPhase.SETTLING: "стабилизация",
             FrictionPhase.MEASURING: "полезное измерение",
             FrictionPhase.PAUSE: "пауза на нулевой скорости",
         }
+        if experiment.phase in {
+            FrictionPhase.ACTUATOR_BASELINE,
+            FrictionPhase.ACTUATOR_PULSE,
+            FrictionPhase.ACTUATOR_PAUSE,
+            FrictionPhase.CONFIGURING_VELOCITY,
+        }:
+            pulse = experiment.current_pulse_voltage_v
+            pulse_text = f" · команда {pulse:g} В" if pulse is not None else ""
+            self.friction_status_label.setText(
+                f"Исполнительная часть · {phase_names.get(experiment.phase, experiment.phase.value)}"
+                f"{pulse_text} · {max(0.0, now - experiment.phase_started_s):.1f} с · "
+                f"импульсов {len(experiment.actuator_attempts)} · "
+                f"восстановлений {experiment.recovery_attempts}/"
+                f"{experiment.config.max_recovery_attempts}"
+            )
+            return
         target = experiment.current_target
         point = min(experiment.point_index + 1, len(experiment.config.targets))
         phase = phase_names.get(experiment.phase, experiment.phase.value)
@@ -1252,6 +1422,7 @@ class MainWindow(QMainWindow):
         if experiment is None or not self._friction_running():
             return
         experiment.abort("Остановлено пользователем")
+        self._cancel_queued_commands()
         self.device.emergency_stop()
         self._pwm_requested = False
         self._finalize_friction_experiment("interrupted", experiment.abort_reason)
@@ -1261,6 +1432,7 @@ class MainWindow(QMainWindow):
         if experiment is None:
             return
         experiment.abort(reason)
+        self._cancel_queued_commands()
         self.device.emergency_stop()
         self._pwm_requested = False
         self._finalize_friction_experiment("failed", reason)
@@ -1274,7 +1446,7 @@ class MainWindow(QMainWindow):
             self._friction_telemetry_paths.append(str(recorder_path))
         estimate = experiment.estimate()
         result = {
-            "schema": 2,
+            "schema": 3,
             "status": status,
             "config": experiment.config.to_dict(),
             "motor_parameters": {
@@ -1283,11 +1455,18 @@ class MainWindow(QMainWindow):
                 "back_emf_v_per_krpm": self.profile.back_emf_v_per_krpm,
             },
             "estimate": estimate.to_dict(),
+            "actuator_preflight": {
+                "attempts": [attempt.to_dict() for attempt in experiment.actuator_attempts],
+                "current_detection_threshold_a": experiment.current_detection_threshold_a,
+                "working_current_limit_a": experiment.working_current_limit_a,
+                "complete": experiment.actuator_complete,
+            },
             "telemetry_paths": self._friction_telemetry_paths,
             "interruption_count": experiment.interruption_count,
             "error": error or None,
         }
         self._friction_last_estimate = estimate
+        self._render_actuator_attempts(experiment.actuator_attempts)
         self._render_friction_points(experiment.points)
         self._render_friction_estimate(estimate)
         if self.project is not None and self._friction_experiment_id is not None:
@@ -1340,12 +1519,48 @@ class MainWindow(QMainWindow):
         self.project.save_checkpoint("friction", payload)
 
     def _clear_friction_results(self) -> None:
+        self.friction_actuator_table.setRowCount(0)
+        self.friction_actuator_note.setText(
+            "Идёт проверка исполнительной части: команда Uq, фактический Uq и измеренный Iq "
+            "не смешиваются."
+        )
         for row in range(self.friction_points_table.rowCount()):
             for column in range(1, self.friction_points_table.columnCount()):
                 self.friction_points_table.setItem(row, column, QTableWidgetItem("—"))
         for row in range(self.friction_summary_table.rowCount()):
             self.friction_summary_table.setItem(row, 1, QTableWidgetItem("—"))
-        self.friction_result_note.setText("Опыт выполняется; итог появится после четырёх точек.")
+        self.friction_result_note.setText(
+            "Скоростной этап начнётся только после подтверждения исполнительной части."
+        )
+
+    def _render_actuator_attempts(self, attempts: list[ActuatorPulseResult]) -> None:
+        self.friction_actuator_table.setRowCount(len(attempts))
+        for row, attempt in enumerate(attempts):
+            values = (
+                "+" if attempt.direction > 0 else "−",
+                f"{attempt.command_voltage_v:.6g}",
+                f"{attempt.mean_voltage_q_v:.6g}",
+                f"{attempt.mean_measured_current_q_a:.6g}",
+                f"{attempt.peak_measured_current_q_a:.6g}",
+                f"{attempt.angle_delta_rad:.6g}",
+                attempt.note,
+            )
+            for column, value in enumerate(values):
+                self.friction_actuator_table.setItem(row, column, QTableWidgetItem(value))
+        found = {
+            attempt.direction: attempt
+            for attempt in attempts
+            if attempt.movement_detected
+        }
+        if all(direction in found for direction in (1, -1)):
+            self.friction_actuator_note.setText(
+                "Страгивание: "
+                f"Uq+={abs(found[1].command_voltage_v):g} В, "
+                f"Uq−={abs(found[-1].command_voltage_v):g} В. "
+                "Iq подтверждён в обе стороны."
+                if all(found[direction].current_detected for direction in (1, -1))
+                else "Страгивание найдено, но измеренный Iq подтверждён не в обе стороны."
+            )
 
     def _render_friction_points(self, points: list[FrictionPointResult]) -> None:
         for row, point in enumerate(points[: self.friction_points_table.rowCount()]):
@@ -1399,7 +1614,7 @@ class MainWindow(QMainWindow):
         self.project.save_profile(self.profile)
         self.project.accept_parameters(
             self.profile.name,
-            "friction_velocity",
+            "friction_two_stage",
             parameters,
             score=estimate.r_squared,
             note="Принято пользователем как грубая начальная оценка",
@@ -1702,11 +1917,20 @@ class MainWindow(QMainWindow):
             self.plot_window_spin,
             self.friction_low_speed,
             self.friction_high_speed,
-            self.friction_current_limit,
+            self.friction_current_trip,
             self.friction_voltage_limit,
             self.friction_velocity_limit,
             self.friction_angle_min,
             self.friction_angle_max,
+            self.friction_pulse_start,
+            self.friction_pulse_step,
+            self.friction_pulse_max,
+            self.friction_pulse_duration,
+            self.friction_actuator_pause,
+            self.friction_baseline,
+            self.friction_movement_threshold,
+            self.friction_current_floor,
+            self.friction_breakaway_margin,
             self.friction_settle,
             self.friction_measure,
             self.friction_pause,
@@ -2009,6 +2233,7 @@ class MainWindow(QMainWindow):
             return
         if self.safe_connect_checkbox.isChecked():
             self._send(self.protocol.disable())
+            self._send(self.protocol.phase_resistance(self.profile.phase_resistance_ohm))
         experiment = self._friction_experiment
         if experiment is not None and experiment.phase == FrictionPhase.RECOVERING:
             self.monitor_mask = FRICTION_MONITOR_MASK
@@ -2072,6 +2297,7 @@ class MainWindow(QMainWindow):
         monitor_mask: str,
     ) -> list[str]:
         commands = [
+            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
             self.protocol.current_limit(self.device_limit_spins["current_a"].value()),
             self.protocol.voltage_limit(self.device_limit_spins["voltage_v"].value()),
             self.protocol.velocity_limit(self.device_limit_spins["velocity_rad_s"].value()),
@@ -2605,12 +2831,22 @@ class MainWindow(QMainWindow):
 
         experiment = self._friction_experiment
         if experiment is not None and self._friction_running():
-            violation = experiment.add_sample(sample)
+            violation, actions = experiment.add_sample(sample, received_at)
+            self._process_friction_actions(actions)
             if violation:
                 self._abort_friction_experiment(violation)
                 return
 
-        violations = self.guard.check(sample) if self.software_guard_enabled.isChecked() else []
+        ignored = (
+            frozenset({"velocity_rad_s"})
+            if experiment is not None and self._friction_running()
+            else frozenset()
+        )
+        violations = (
+            self.guard.check(sample, ignored_signals=ignored)
+            if self._pwm_requested and self.software_guard_enabled.isChecked()
+            else []
+        )
         if self._pwm_requested and violations and not self._safety_latched:
             self._safety_latched = True
             self._log("SAFETY", "; ".join(violation.message for violation in violations))
@@ -2791,6 +3027,13 @@ class MainWindow(QMainWindow):
         self.telemetry_recorder.stop()
         self.friction_recorder.stop()
         self.device.emergency_stop()
+        if self.device.connected:
+            try:
+                self.device.send(
+                    self.protocol.phase_resistance(self.profile.phase_resistance_ohm)
+                )
+            except Exception:
+                pass
         self.device.disconnect()
         if self.matlab.connected:
             self.matlab.stop()
