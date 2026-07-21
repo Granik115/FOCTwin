@@ -5,6 +5,11 @@ from enum import Enum
 from typing import Any
 
 
+SAFETY_SOFT_LIMIT_SAMPLES = 3
+SAFETY_SOFT_LIMIT_TOLERANCE = 0.05
+SAFETY_HARD_LIMIT_MULTIPLIER = 2.0
+
+
 class MotionMode(str, Enum):
     TORQUE = "torque"
     VELOCITY = "velocity"
@@ -117,6 +122,7 @@ class SafetyViolation:
 class SafetyGuard:
     def __init__(self, limits: SafetyLimits):
         self.limits = limits
+        self._soft_limit_counts: dict[str, int] = {}
 
     def check(self, sample: TelemetrySample) -> list[SafetyViolation]:
         violations: list[SafetyViolation] = []
@@ -127,10 +133,35 @@ class SafetyGuard:
             ("voltage_d_v", sample.voltage_d_v, self.limits.voltage_v),
             ("velocity_rad_s", sample.velocity_rad_s, self.limits.velocity_rad_s),
         ):
-            if value is not None and abs(value) > limit:
+            if value is None:
+                continue
+            absolute = abs(value)
+            if absolute > limit * SAFETY_HARD_LIMIT_MULTIPLIER:
+                self._soft_limit_counts[signal] = 0
                 violations.append(
-                    SafetyViolation(signal, value, limit, f"{signal}: {value:g} > ±{limit:g}")
+                    SafetyViolation(
+                        signal,
+                        value,
+                        limit * SAFETY_HARD_LIMIT_MULTIPLIER,
+                        f"{signal}: резкий выброс {value:g} > "
+                        f"±{limit * SAFETY_HARD_LIMIT_MULTIPLIER:g}",
+                    )
                 )
+            elif absolute > limit * (1.0 + SAFETY_SOFT_LIMIT_TOLERANCE):
+                count = self._soft_limit_counts.get(signal, 0) + 1
+                self._soft_limit_counts[signal] = count
+                if count >= SAFETY_SOFT_LIMIT_SAMPLES:
+                    violations.append(
+                        SafetyViolation(
+                            signal,
+                            value,
+                            limit,
+                            f"{signal}: {value:g} устойчиво выше ±{limit:g} "
+                            f"({count} отсчёта подряд)",
+                        )
+                    )
+            else:
+                self._soft_limit_counts[signal] = 0
         if sample.angle_rad is not None:
             if sample.angle_rad < self.limits.angle_min_rad:
                 violations.append(
