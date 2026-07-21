@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.2 contains:
+Version 0.3.3 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -34,16 +34,21 @@ Version 0.3.2 contains:
 - safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - persistent manual-control values and one paced action for limits, PID/LPF, modes, target and
   monitoring before PWM is enabled;
-- a bounded four-point velocity experiment (`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`) that
-  records raw data, checkpoints every completed point and estimates directional Coulomb,
-  viscous and rough breakaway friction;
+- an actuator preflight that alternates short direct-Uq pulses, zeros Uq on the first detected
+  movement and finds breakaway independently in both directions;
+- separate recording of commanded Uq, actual Uq and measured Iq, with measured-current
+  confirmation required before any friction result is calculated;
+- a gated four-point velocity experiment (`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`) that uses
+  measured Iq for directional Coulomb, viscous and breakaway estimates;
 - automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
   Serial link reconnects, without silently raising the configured test envelope;
 - explicit review before identified friction values are accepted into the active profile;
 - editable friction-test targets and safety limits above their conservative default values, with
   dedicated arrow steps and the active FOCTwin safety envelope still enforced at preflight;
-- a Voltage-torque first-pass friction test that does not depend on the unidentified FOC-current
-  loop, reconstructs equivalent current from Uq and estimates speed from rolling angle slope;
+- temporary direct-voltage operation for actuator preflight followed by automatic restoration of
+  phase resistance and the user's manual configuration with PWM left disabled;
+- rolling angle-slope speed for experiment decisions, while impossible instantaneous firmware
+  velocity values remain diagnostic only;
 - debounced working limits for isolated telemetry/control spikes, while twofold excursions,
   travel violations and telemetry loss still stop immediately;
 - editable safety limits and a Russian FOCTwin scenario language;

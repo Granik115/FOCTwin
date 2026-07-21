@@ -2,16 +2,17 @@
 
 ## What FOCTwin can enforce
 
-- Refuse a scenario whose declared target/limit is outside the active profile.
-- Write stricter current, voltage and velocity limits before a test.
-- Observe available monitor data and stop when a working limit stays exceeded for three samples.
-- Stop immediately on a twofold current/voltage/speed excursion or a travel-bound violation.
-- On stop: command target zero and transmit `AE0` three times.
-- Start every trial from a recorded state and reject incomplete trials.
-- Keep the last accepted parameter set for rollback.
+- Refuse a test whose declared envelope is outside the active host safety limits.
+- Disable PWM before changing control modes or phase-resistance compensation.
+- Stop a direct-Uq pulse as soon as angle movement crosses the configured threshold.
+- Require measured Iq in multiple samples before starting friction identification.
+- Derive experiment speed from angle instead of trusting impossible firmware velocity spikes.
+- Stop immediately on travel violation or a twofold current, voltage or angle-speed excursion.
+- Require three consecutive samples for a smaller working-limit excess.
+- On stop: command target zero, send `AE0` repeatedly and restore phase resistance.
 
 Streamed SimpleFOC current values are expressed in mA by the bundled firmware. FOCTwin
-normalizes them to A before applying the configured host-side thresholds.
+normalizes them to A before applying thresholds or calculating torque.
 
 ## What FOCTwin cannot guarantee with the current firmware
 
@@ -19,58 +20,37 @@ normalizes them to A before applying the configured host-side thresholds.
 - PWM shutdown after Windows or the application freezes.
 - A deterministic stop latency over a 115200-baud text protocol.
 - Detection of temperature, supply faults or mechanical contact without sensors.
-- Detection of a violation that happens between received telemetry samples.
+- Detection of a violation between received telemetry samples.
 
-Consequently, automated real-motor tuning must not be marketed or treated as unattended
-operation. A human must remain able to remove motor power.
+Automated real-motor tests therefore remain attended operations. A human must be able to remove
+motor power immediately.
 
-## Preflight policy for real tests
+## Two-stage friction experiment (0.3.3)
 
-1. Open a project and select a known profile.
-2. Verify position is within the allowed travel and the cable is free.
-3. Connect while PWM remains disabled.
-4. Check the saved desired configuration and the separate actual-limit readback.
-5. Apply the full saved configuration with paced writes.
-6. Verify that monitoring produces fresh samples.
-7. Only then enable PWM and begin the bounded trial.
-8. Disable PWM between trials unless continuous hold is explicitly required.
+The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
+With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from
+±0.1 V to ±0.5 V and last 0.5 s at most. The user-approved maximum Uq and measured-current trip
+limit must fit inside the active host envelope, and the resistance-based current estimate for the
+largest pulse must not exceed the current trip.
 
-## Low-speed friction experiment (0.3.2)
+The first movement in each direction immediately commands Uq=0. Wrong-direction motion aborts
+the experiment. The velocity stage is blocked unless both directions moved and measured Iq was
+above its noise-derived threshold in at least three samples. No voltage-derived current is
+accepted as a substitute.
 
-The first automatic experiment starts deliberately narrow. Its default sequence alternates
-direction at `+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`, with a 0.05 A current limit, 12 V voltage
-limit, 0.3 rad/s velocity limit and travel inside [-3, 3] rad. From 0.3.1 these are editable
-starting values rather than UI maxima. A user may raise them after an insufficient-torque stop,
-but preflight still rejects every test envelope wider than the active host-side safety limits.
+Before velocity control starts, PWM is disabled and the configured phase resistance is restored.
+The velocity-controller current limit is set slightly above the larger breakaway-equivalent
+current but remains below the experiment trip limit. Final torque and friction coefficients use
+measured Iq only.
 
-FOCTwin forces `velocity + Voltage torque` for the initial friction experiment so an unidentified
-FOC Current loop cannot turn its voltage saturation into a misleading friction result. With the
-known phase resistance, `ALC` remains the velocity-controller current-command limit. The reported
-friction current is reconstructed from Uq, phase resistance and back EMF; measured Iq remains a
-diagnostic signal.
+During this experiment, the firmware velocity field is diagnostic. Safety speed comes from the
+rolling angle slope. This keeps impossible isolated values such as +43 rad/s from stopping a
+stationary shaft while preserving actual speed and travel protection.
 
-FOCTwin forces all seven monitor fields for the test. If telemetry becomes stale, it sends
-target zero and repeated `AE0`, lets the normal monitor/DTR recovery restore the stream, reapplies
-the bounded experiment configuration and repeats the interrupted point. It never increases a
-limit automatically when the motor fails to move. A 5% working-limit excess must persist for
-three consecutive samples in both the experiment and the global FOCTwin guard. A twofold excess
-or position-bound violation ends the experiment immediately and leaves PWM disabled.
+## Failure and restoration policy
 
-The result is a rough initial estimate. Mean speed and stability come from a 0.5-second rolling
-angle slope rather than the noisy instantaneous firmware velocity. A point is rejected when the
-measured direction, tracking error or angle-slope stability is unsuitable. Identified coefficients
-are written to the active motor profile only after the user explicitly accepts a valid four-point
-result.
-
-## Device-limit interaction
-
-The bundled firmware initializes `current_limit` to 10 A. Sending `ALC1` changes the live
-motor object to 1 A until another command or a controller reset. Because phase resistance is
-configured, SimpleFOC also uses that current limit as the velocity PID output limit in Voltage
-torque mode. A motor that no longer starts after `ALC1` is therefore current-limited rather
-than necessarily frozen.
-
-The same linking applies to the other nested controllers: `ALV` synchronizes the angle PID
-output limit (velocity), while `ALU` synchronizes both current PID output limits (voltage).
-FOCTwin therefore exposes these three authoritative limits only in the SimpleFOC limit panel
-instead of offering conflicting editable copies in the PID tables.
+Queued configuration writes are cancelled before an abort so a stale `AE1` cannot re-enable PWM.
+Normal completion, a user stop, a safety stop and application close all send the emergency
+sequence. Normal finalization then restores phase resistance, device limits, PID/LPF settings,
+modes and monitoring without enabling PWM. Safe reconnect also restores phase resistance before
+manual operation.

@@ -96,6 +96,12 @@ class CommanderProtocol:
         encoded = "" if value is None else self._number(value)
         return self.raw(f"LC{encoded}")
 
+    def phase_resistance(self, value: float | None = None) -> str:
+        """Read or write the resistance used by SimpleFOC Voltage torque mode."""
+
+        encoded = "" if value is None else self._number(value)
+        return self.raw(f"R{encoded}")
+
     def pid(self, loop: str, field: str, value: float | None = None) -> str:
         suffixes = {"p": "P", "i": "I", "d": "D", "ramp": "R", "limit": "L", "lpf": "F"}
         try:

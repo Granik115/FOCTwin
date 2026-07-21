@@ -19,6 +19,18 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.3
+
+- Replaced the invalid immediate velocity test with a two-stage actuator/friction workflow.
+- Actuator preflight alternates bounded direct-Uq pulses and zeros output on first movement.
+- Commanded Uq, actual Uq and measured Iq are stored separately; voltage-derived current cannot
+  unlock the velocity stage.
+- Breakaway and current must be confirmed in both directions before four speed points run.
+- Experiment speed protection uses angle slope; the untrusted firmware velocity field is logged
+  but ignored for experiment stop decisions.
+- Phase resistance is restored on transition, finalization, safe reconnect and application close.
+- Aborts cancel pending command queues so a stale enable command cannot run after a stop.
+
 ## 0.3.2
 
 - Initial friction identification now uses `velocity + Voltage torque`, isolating it from the
