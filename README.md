@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-This first foundation contains:
+Version 0.3.0 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -34,6 +34,12 @@ This first foundation contains:
 - safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - persistent manual-control values and one paced action for limits, PID/LPF, modes, target and
   monitoring before PWM is enabled;
+- a bounded four-point velocity experiment (`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`) that
+  records raw data, checkpoints every completed point and estimates directional Coulomb,
+  viscous and rough breakaway friction;
+- automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
+  Serial link reconnects, without silently raising the configured test envelope;
+- explicit review before identified friction values are accepted into the active profile;
 - editable safety limits and a Russian FOCTwin scenario language;
 - durable project folders with SQLite events, atomic checkpoints and raw telemetry files;
 - the supplied voltage/current Simulink models and MATLAB tuning sources;

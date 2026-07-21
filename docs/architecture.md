@@ -22,9 +22,11 @@ checkpoint or accepted parameter set.
 
 ### Experiment orchestrator
 
-Future state machine with explicit states such as `queued`, `preflight`, `running`,
-`validating`, `accepted`, `rejected`, `interrupted` and `failed`. Resume operates at a trial
-boundary, not in the middle of physical motion.
+The first real state machine is the low-speed friction experiment. It uses explicit zero,
+settling, measuring, pause, recovering, complete and aborted phases. A telemetry/Serial
+interruption commands a best-effort stop and repeats the interrupted point after the stream is
+fresh again. Durable resume starts at a point boundary from the last checkpoint; it never tries
+to continue the middle of a physical motion.
 
 ### Serial device service
 
@@ -50,4 +52,3 @@ shares gains.
 
 The user's chosen project folder is portable; the application installation contains no
 irreplaceable experiment state.
-

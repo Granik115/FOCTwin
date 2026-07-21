@@ -34,6 +34,23 @@ operation. A human must remain able to remove motor power.
 7. Only then enable PWM and begin the bounded trial.
 8. Disable PWM between trials unless continuous hold is explicitly required.
 
+## Low-speed friction experiment (0.3.0)
+
+The first automatic experiment is deliberately narrow: velocity targets are limited to
+0.005–0.05 rad/s, the SimpleFOC current limit to 0.03–0.05 A, the velocity limit to 0.3 rad/s
+and travel to a user-selected subset of [-3, 3] rad. The default sequence alternates direction:
+`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`.
+
+FOCTwin forces all seven monitor fields for the test. If telemetry becomes stale, it sends
+target zero and repeated `AE0`, lets the normal monitor/DTR recovery restore the stream, reapplies
+the bounded experiment configuration and repeats the interrupted point. It never increases a
+limit automatically when the motor fails to move. Exceeding a current, voltage, velocity or
+position bound ends the experiment and leaves PWM disabled.
+
+The result is a rough initial estimate. A point is rejected when the measured direction,
+tracking error or speed stability is unsuitable. Identified coefficients are written to the
+active motor profile only after the user explicitly accepts a valid four-point result.
+
 ## Device-limit interaction
 
 The bundled firmware initializes `current_limit` to 10 A. Sending `ALC1` changes the live

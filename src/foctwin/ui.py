@@ -53,6 +53,15 @@ from foctwin.domain import (
     TorqueMode,
 )
 from foctwin import __version__
+from foctwin.friction import (
+    FRICTION_MONITOR_MASK,
+    FrictionAction,
+    FrictionEstimate,
+    FrictionExperiment,
+    FrictionPhase,
+    FrictionPointResult,
+    FrictionTestConfig,
+)
 from foctwin.matlab_backend import MatlabBackend
 from foctwin.project_store import ProjectStore
 from foctwin.protocol import (
@@ -160,6 +169,16 @@ class MainWindow(QMainWindow):
         self.monitor_mask = "1111111"
         self.telemetry_statistics = TelemetryStatistics()
         self.telemetry_recorder = TelemetryRecorder()
+        self.friction_recorder = TelemetryRecorder()
+        self._friction_experiment: FrictionExperiment | None = None
+        self._friction_experiment_id: int | None = None
+        self._friction_telemetry_paths: list[str] = []
+        self._friction_restore_commands: list[str] = []
+        self._friction_restore_mask = self.monitor_mask
+        self._friction_last_estimate: FrictionEstimate | None = None
+        self._friction_last_sample_sequence = 0
+        self._friction_recovery_started_at: float | None = None
+        self._friction_resume_pending = False
         self._telemetry_sequence = 0
         self._rejected_telemetry_count = 0
         self._telemetry_series: dict[str, tuple[list[float], list[float]]] = {
@@ -209,6 +228,10 @@ class MainWindow(QMainWindow):
         self._telemetry_watchdog_timer.setInterval(500)
         self._telemetry_watchdog_timer.timeout.connect(self._check_telemetry_health)
         self._telemetry_watchdog_timer.start()
+        self._friction_timer = QTimer(self)
+        self._friction_timer.setInterval(50)
+        self._friction_timer.timeout.connect(self._advance_friction_experiment)
+        self._friction_timer.start()
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -648,60 +671,676 @@ class MainWindow(QMainWindow):
     def _identification_page(self) -> QWidget:
         page, layout = titled_page(
             "Идентификация цифрового двойника",
-            "Планирование безопасных опытов и подбор механических/электрических параметров.",
+            "Первый автоматический опыт: оценка сухого, вязкого и страгивающего трения на малых скоростях.",
         )
-        config = QSplitter(Qt.Orientation.Horizontal)
-        parameters = QGroupBox("Подбираемые параметры")
-        parameters_layout = QVBoxLayout(parameters)
-        self.ident_table = table(("Вкл.", "Параметр", "Начало", "Min", "Max", "Ед."), 9)
-        rows = (
-            (True, "J", 0.07, 1e-4, 2.0, "кг·м²"),
-            (True, "Viscous friction", 1e-5, 0.0, 10.0, "Н·м·с/рад"),
-            (True, "Coulomb friction", 0.0, 0.0, 10.0, "Н·м"),
-            (True, "Breakaway friction", 0.0, 0.0, 15.0, "Н·м"),
-            (True, "Breakaway velocity", 0.01, 1e-5, 0.5, "рад/с"),
-            (False, "Rs", 0.675, 0.1, 2.0, "Ом"),
-            (False, "Ld", 0.0013, 1e-5, 0.02, "Гн"),
-            (False, "Lq", 0.0013, 1e-5, 0.02, "Гн"),
-            (False, "Flux linkage", 0.05897, 0.001, 0.2, "Вб"),
+        warning = QLabel(
+            "Опыт запускает мотор автоматически, но прошивка не имеет heartbeat. Держите питание "
+            "доступным. При потере телеметрии FOCTwin отправит цель 0 и AE0, восстановит поток и "
+            "сам повторит прерванную точку."
         )
-        for row_index, values in enumerate(rows):
-            check = QCheckBox()
-            check.setChecked(values[0])
-            self.ident_table.setCellWidget(row_index, 0, check)
-            for column, value in enumerate(values[1:], start=1):
-                self.ident_table.setItem(row_index, column, QTableWidgetItem(str(value)))
-        parameters_layout.addWidget(self.ident_table)
-        excitation = QGroupBox("План возбуждений")
-        excitation_form = QFormLayout(excitation)
-        self.excitation_combo = QComboBox()
-        self.excitation_combo.addItems(("Ступень", "Ramp", "Синус", "Chirp", "PRBS", "Свой сценарий"))
-        self.excitation_amplitude = spin(0.1, 0.0, 1000.0)
-        self.excitation_duration = spin(3.0, 0.01, 3600.0)
-        repeats = QSpinBox()
-        repeats.setRange(1, 1000)
-        repeats.setValue(5)
-        positions = QLineEdit("-1.0; -0.5; 0; 0.5; 1.0")
-        queue_button = QPushButton("Добавить серию опытов")
-        excitation_form.addRow("Сигнал", self.excitation_combo)
-        excitation_form.addRow("Амплитуда", self.excitation_amplitude)
-        excitation_form.addRow("Длительность, с", self.excitation_duration)
-        excitation_form.addRow("Повторы", repeats)
-        excitation_form.addRow("Начальные положения", positions)
-        excitation_form.addRow(queue_button)
-        config.addWidget(parameters)
-        config.addWidget(excitation)
-        config.setSizes((900, 430))
-        layout.addWidget(config)
-        self.ident_queue = table(("№", "Сигнал", "Положение", "Статус", "Ошибка модели"), 0)
-        layout.addWidget(self.ident_queue, 1)
-        controls = QHBoxLayout()
-        controls.addWidget(QPushButton("Только записать реальные данные"))
-        controls.addWidget(QPushButton("Запустить идентификацию"))
-        controls.addWidget(QPushButton("Продолжить из checkpoint"))
-        controls.addWidget(QPushButton("Остановить"))
-        layout.addLayout(controls)
+        warning.setObjectName("danger")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        config_group = QGroupBox("Безопасный план низкоскоростного опыта")
+        config_grid = QGridLayout(config_group)
+        self.friction_low_speed = spin(0.02, 0.005, 0.049, 4)
+        self.friction_high_speed = spin(0.05, 0.006, 0.05, 4)
+        self.friction_current_limit = spin(0.05, 0.03, 0.05, 3)
+        self.friction_voltage_limit = spin(12.0, 0.1, 12.0, 2)
+        self.friction_velocity_limit = spin(0.3, 0.05, 0.3, 3)
+        self.friction_angle_min = spin(-3.0, -3.0, 2.9, 3)
+        self.friction_angle_max = spin(3.0, -2.9, 3.0, 3)
+        self.friction_settle = spin(2.0, 1.0, 30.0, 1)
+        self.friction_measure = spin(4.0, 2.0, 120.0, 1)
+        self.friction_pause = spin(1.0, 0.5, 30.0, 1)
+        self.friction_downsample = QSpinBox()
+        self.friction_downsample.setRange(5, 100)
+        self.friction_downsample.setValue(20)
+        self.friction_recoveries = QSpinBox()
+        self.friction_recoveries.setRange(0, 10)
+        self.friction_recoveries.setValue(3)
+        fields = (
+            ("Малая скорость, рад/с", self.friction_low_speed),
+            ("Большая скорость, рад/с", self.friction_high_speed),
+            ("Предел тока, А", self.friction_current_limit),
+            ("Предел напряжения, В", self.friction_voltage_limit),
+            ("Предел скорости, рад/с", self.friction_velocity_limit),
+            ("Координата min, рад", self.friction_angle_min),
+            ("Координата max, рад", self.friction_angle_max),
+            ("Стабилизация точки, с", self.friction_settle),
+            ("Полезное измерение, с", self.friction_measure),
+            ("Пауза на нуле, с", self.friction_pause),
+            ("Downsample телеметрии", self.friction_downsample),
+            ("Автовосстановлений", self.friction_recoveries),
+        )
+        for index, (label, widget) in enumerate(fields):
+            column = 0 if index < 6 else 2
+            row = index if index < 6 else index - 6
+            config_grid.addWidget(QLabel(label), row, column)
+            config_grid.addWidget(widget, row, column + 1)
+        self.friction_duration_label = QLabel()
+        self.friction_duration_label.setObjectName("hint")
+        self.friction_duration_label.setWordWrap(True)
+        config_grid.addWidget(self.friction_duration_label, 6, 0, 1, 4)
+        content_layout.addWidget(config_group)
+
+        controls = QGridLayout()
+        self.friction_start_button = QPushButton("Запустить полный тест трения")
+        self.friction_start_button.clicked.connect(self._start_friction_test)
+        self.friction_resume_button = QPushButton("Продолжить из checkpoint")
+        self.friction_resume_button.clicked.connect(self._resume_friction_checkpoint)
+        self.friction_stop_button = QPushButton("СТОП И ОТКЛЮЧИТЬ PWM")
+        self.friction_stop_button.setObjectName("dangerButton")
+        self.friction_stop_button.clicked.connect(self._stop_friction_test_by_user)
+        self.friction_stop_button.setEnabled(False)
+        controls.addWidget(self.friction_start_button, 0, 0)
+        controls.addWidget(self.friction_resume_button, 0, 1)
+        controls.addWidget(self.friction_stop_button, 0, 2)
+        for column in range(3):
+            controls.setColumnStretch(column, 1)
+        content_layout.addLayout(controls)
+        self.friction_status_label = QLabel("Тест не запущен")
+        self.friction_status_label.setWordWrap(True)
+        content_layout.addWidget(self.friction_status_label)
+
+        self.friction_points_table = table(
+            ["Цель, рад/с", "Средняя скорость", "Iq, А", "Момент, Н·м", "Отсчёты", "Статус"],
+            4,
+        )
+        for row, target in enumerate((0.02, -0.02, 0.05, -0.05)):
+            self.friction_points_table.setItem(row, 0, QTableWidgetItem(f"{target:g}"))
+            for column in range(1, self.friction_points_table.columnCount()):
+                self.friction_points_table.setItem(row, column, QTableWidgetItem("—"))
+        content_layout.addWidget(self.friction_points_table)
+
+        result_group = QGroupBox("Результат аппроксимации")
+        result_layout = QVBoxLayout(result_group)
+        self.friction_summary_table = table(["Параметр", "Значение", "Единица"], 7)
+        summary_rows = (
+            ("Coulomb, среднее", "Н·м"),
+            ("Coulomb +", "Н·м"),
+            ("Coulomb −", "Н·м"),
+            ("Вязкое трение", "Н·м·с/рад"),
+            ("Страгивание, грубо", "Н·м"),
+            ("Асимметрия", "%"),
+            ("R²", "—"),
+        )
+        for row, (name, unit) in enumerate(summary_rows):
+            self.friction_summary_table.setItem(row, 0, QTableWidgetItem(name))
+            self.friction_summary_table.setItem(row, 1, QTableWidgetItem("—"))
+            self.friction_summary_table.setItem(row, 2, QTableWidgetItem(unit))
+        result_layout.addWidget(self.friction_summary_table)
+        self.friction_result_note = QLabel("После теста здесь появится оценка и её пригодность.")
+        self.friction_result_note.setWordWrap(True)
+        result_layout.addWidget(self.friction_result_note)
+        self.friction_accept_button = QPushButton("Принять оценки трения в профиль")
+        self.friction_accept_button.setEnabled(False)
+        self.friction_accept_button.clicked.connect(self._accept_friction_estimate)
+        result_layout.addWidget(self.friction_accept_button)
+        content_layout.addWidget(result_group)
+
+        future = QLabel(
+            "Следующие этапы идентификации — инерция, позиционная неравномерность и расширенные "
+            "возбуждения — будут добавляться поверх этого же механизма опытов и checkpoint."
+        )
+        future.setObjectName("hint")
+        future.setWordWrap(True)
+        content_layout.addWidget(future)
+        content_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        for widget in (
+            self.friction_low_speed,
+            self.friction_high_speed,
+            self.friction_settle,
+            self.friction_measure,
+            self.friction_pause,
+        ):
+            widget.valueChanged.connect(self._refresh_friction_duration)
+        self._refresh_friction_duration()
         return page
+
+    def _friction_config_from_widgets(self) -> FrictionTestConfig:
+        return FrictionTestConfig(
+            low_velocity_rad_s=self.friction_low_speed.value(),
+            high_velocity_rad_s=self.friction_high_speed.value(),
+            current_limit_a=self.friction_current_limit.value(),
+            voltage_limit_v=self.friction_voltage_limit.value(),
+            velocity_limit_rad_s=self.friction_velocity_limit.value(),
+            angle_min_rad=self.friction_angle_min.value(),
+            angle_max_rad=self.friction_angle_max.value(),
+            settle_s=self.friction_settle.value(),
+            measure_s=self.friction_measure.value(),
+            pause_s=self.friction_pause.value(),
+            monitor_downsample=self.friction_downsample.value(),
+            max_recovery_attempts=self.friction_recoveries.value(),
+        )
+
+    def _set_friction_config_widgets(self, config: FrictionTestConfig) -> None:
+        self.friction_low_speed.setValue(config.low_velocity_rad_s)
+        self.friction_high_speed.setValue(config.high_velocity_rad_s)
+        self.friction_current_limit.setValue(config.current_limit_a)
+        self.friction_voltage_limit.setValue(config.voltage_limit_v)
+        self.friction_velocity_limit.setValue(config.velocity_limit_rad_s)
+        self.friction_angle_min.setValue(config.angle_min_rad)
+        self.friction_angle_max.setValue(config.angle_max_rad)
+        self.friction_settle.setValue(config.settle_s)
+        self.friction_measure.setValue(config.measure_s)
+        self.friction_pause.setValue(config.pause_s)
+        self.friction_downsample.setValue(config.monitor_downsample)
+        self.friction_recoveries.setValue(config.max_recovery_attempts)
+        self._refresh_friction_duration()
+
+    def _refresh_friction_duration(self, *_args: object) -> None:
+        config = self._friction_config_from_widgets()
+        self.friction_duration_label.setText(
+            "Последовательность: "
+            f"+{config.low_velocity_rad_s:g}, −{config.low_velocity_rad_s:g}, "
+            f"+{config.high_velocity_rad_s:g}, −{config.high_velocity_rad_s:g} рад/с. "
+            f"Минимальное время без восстановлений: около {config.estimated_duration_s:.0f} с."
+        )
+        for row, target in enumerate(config.targets):
+            self.friction_points_table.setItem(row, 0, QTableWidgetItem(f"{target:g}"))
+
+    def _friction_running(self) -> bool:
+        experiment = self._friction_experiment
+        return bool(
+            experiment
+            and experiment.phase not in {FrictionPhase.COMPLETE, FrictionPhase.ABORTED}
+        )
+
+    def _start_friction_test(self) -> None:
+        self._prepare_friction_experiment()
+
+    def _resume_friction_checkpoint(self) -> None:
+        if self.project is None:
+            QMessageBox.warning(self, "Checkpoint", "Сначала откройте проект FOCTwin")
+            return
+        try:
+            payload = self.project.load_checkpoint("friction")
+            if payload is None:
+                raise ValueError("В проекте нет checkpoint теста трения")
+            points = [
+                FrictionPointResult.from_dict(point)
+                for point in payload.get("completed_points", [])
+            ]
+            if len(points) >= 4 or payload.get("phase") == FrictionPhase.COMPLETE.value:
+                raise ValueError("Тест из checkpoint уже завершён")
+            config = FrictionTestConfig.from_dict(payload["config"])
+            experiment_id = payload.get("experiment_id")
+            telemetry_paths = [str(path) for path in payload.get("telemetry_paths", [])]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Checkpoint", str(exc))
+            return
+        self._set_friction_config_widgets(config)
+        self._prepare_friction_experiment(
+            completed_points=points,
+            experiment_id=int(experiment_id) if experiment_id is not None else None,
+            telemetry_paths=telemetry_paths,
+            resumed=True,
+        )
+
+    def _prepare_friction_experiment(
+        self,
+        *,
+        completed_points: list[FrictionPointResult] | None = None,
+        experiment_id: int | None = None,
+        telemetry_paths: list[str] | None = None,
+        resumed: bool = False,
+    ) -> None:
+        if self._friction_running():
+            QMessageBox.information(self, "Тест трения", "Тест уже выполняется")
+            return
+        if self.project is None:
+            QMessageBox.warning(self, "Тест трения", "Сначала создайте или откройте проект FOCTwin")
+            return
+        if not self.device.connected:
+            QMessageBox.warning(self, "Тест трения", "Сначала подключите мотор")
+            return
+        if self._pwm_requested:
+            QMessageBox.warning(self, "Тест трения", "Перед стартом отключите PWM")
+            return
+        if self._configuration_apply_in_progress or self._command_queue or self._command_timer.isActive():
+            QMessageBox.information(self, "Тест трения", "Дождитесь завершения текущих команд")
+            return
+        config = self._friction_config_from_widgets()
+        try:
+            config.validate()
+            pid_values = {loop: self._pid_values(loop) for loop in self.pid_tables}
+        except ValueError as exc:
+            QMessageBox.warning(self, "Тест трения", str(exc))
+            return
+        host_limits = self.guard.limits
+        if (
+            config.current_limit_a > host_limits.current_a
+            or config.voltage_limit_v > host_limits.voltage_v
+            or config.velocity_limit_rad_s > host_limits.velocity_rad_s
+            or config.angle_min_rad < host_limits.angle_min_rad
+            or config.angle_max_rad > host_limits.angle_max_rad
+        ):
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Лимиты опыта не должны быть шире программных аварийных порогов FOCTwin",
+            )
+            return
+        sample = self._last_sample
+        if sample is None or self._last_telemetry_received_at is None:
+            QMessageBox.warning(self, "Тест трения", "Нет свежей распознанной телеметрии")
+            return
+        if time.monotonic() - self._last_telemetry_received_at > monitor_stale_timeout(
+            self._active_monitor_downsample()
+        ):
+            QMessageBox.warning(self, "Тест трения", "Телеметрия устарела; дождитесь восстановления")
+            return
+        if sample.angle_rad is None or sample.velocity_rad_s is None or sample.current_q_a is None:
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Для preflight нужны угол, скорость и Iq; включите их в мониторинге",
+            )
+            return
+        if not config.angle_min_rad + config.position_margin_rad <= sample.angle_rad <= (
+            config.angle_max_rad - config.position_margin_rad
+        ):
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Текущая координата слишком близка к границе опыта; переместите вал ближе к середине",
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Запуск автоматического теста",
+            "FOCTwin включит PWM и сам выполнит четыре движения. "
+            f"Пределы: {config.current_limit_a:g} А, {config.voltage_limit_v:g} В, "
+            f"{config.velocity_limit_rad_s:g} рад/с, координата "
+            f"[{config.angle_min_rad:g}; {config.angle_max_rad:g}].\n\n"
+            "Держите питание доступным для ручного отключения. Запустить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._save_user_settings()
+        manual_mask = self.monitor_mask
+        self._friction_restore_mask = manual_mask
+        self._friction_restore_commands = [self.protocol.disable()]
+        self._friction_restore_commands.extend(
+            self._full_configuration_commands(pid_values, manual_mask)
+        )
+        self._friction_telemetry_paths = list(telemetry_paths or [])
+        self._friction_last_estimate = None
+        self.friction_accept_button.setEnabled(False)
+        self._clear_friction_results()
+        completed = list(completed_points or [])
+        self._render_friction_points(completed)
+        self._friction_experiment = FrictionExperiment(
+            config,
+            self.profile.torque_constant_nm_per_a,
+            completed,
+        )
+        self._friction_experiment_id = experiment_id
+        if self._friction_experiment_id is None:
+            self._friction_experiment_id = self.project.create_experiment(
+                "friction_velocity",
+                config.to_dict(),
+            )
+        self.project.update_experiment(
+            self._friction_experiment_id,
+            "running",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        telemetry_path = self.project.new_telemetry_path(
+            f"friction_{self._friction_experiment_id}_{len(self._friction_telemetry_paths) + 1}"
+        )
+        self.friction_recorder.start(telemetry_path)
+        self._friction_telemetry_paths.append(str(telemetry_path))
+        self._reported_recorder_error = None
+        self._friction_last_sample_sequence = self._telemetry_sequence
+        self._friction_recovery_started_at = None
+        self._friction_resume_pending = False
+        self.monitor_mask = FRICTION_MONITOR_MASK
+        self._prepare_monitor_configuration(
+            FRICTION_MONITOR_MASK,
+            reset_statistics=True,
+            reset_recovery=True,
+        )
+        self._mark_monitor_configuration_started()
+        commands = self._friction_configuration_commands(config, pid_values)
+        self.friction_start_button.setEnabled(False)
+        self.friction_resume_button.setEnabled(False)
+        self.friction_stop_button.setEnabled(True)
+        self.friction_status_label.setText("Preflight пройден; применяется конфигурация опыта…")
+        self._log(
+            "FRICTION",
+            f"{'Продолжение' if resumed else 'Запуск'} опыта #{self._friction_experiment_id}: "
+            f"{config.targets}",
+        )
+        self._save_friction_checkpoint()
+        self._queue_commands(commands, self._begin_friction_motion)
+
+    def _friction_configuration_commands(
+        self,
+        config: FrictionTestConfig,
+        pid_values: dict[str, dict[str, float]] | None = None,
+    ) -> list[str]:
+        values = pid_values or {loop: self._pid_values(loop) for loop in self.pid_tables}
+        commands = [
+            self.protocol.disable(),
+            self.protocol.current_limit(config.current_limit_a),
+            self.protocol.voltage_limit(config.voltage_limit_v),
+            self.protocol.velocity_limit(config.velocity_limit_rad_s),
+        ]
+        for loop in ("angle", "velocity", "current_q", "current_d"):
+            commands.extend(
+                self.protocol.pid(loop, field, values[loop][field]) for field in self.PID_FIELDS
+            )
+        commands.extend(
+            (
+                self.protocol.torque_mode(TorqueMode.FOC_CURRENT),
+                self.protocol.motion_mode(MotionMode.VELOCITY),
+                self.protocol.target(0.0),
+                self.protocol.monitor_clear(),
+                self.protocol.monitor_downsample(config.monitor_downsample),
+                self.protocol.monitor_variables(FRICTION_MONITOR_MASK),
+                self.protocol.enable(),
+            )
+        )
+        return commands
+
+    def _begin_friction_motion(self) -> None:
+        experiment = self._friction_experiment
+        if experiment is None or experiment.phase != FrictionPhase.IDLE:
+            return
+        self._process_friction_actions(experiment.start(time.monotonic()))
+        self.friction_status_label.setText("PWM включён; выдержка на нулевой скорости…")
+
+    def _advance_friction_experiment(self) -> None:
+        experiment = self._friction_experiment
+        if experiment is None or experiment.phase in {FrictionPhase.COMPLETE, FrictionPhase.ABORTED}:
+            return
+        now = time.monotonic()
+        if experiment.phase == FrictionPhase.IDLE:
+            return
+        if experiment.phase == FrictionPhase.RECOVERING:
+            self._advance_friction_recovery(now)
+            return
+        reference = self._last_telemetry_received_at or self._monitor_configured_at
+        stale_timeout = monitor_stale_timeout(experiment.config.monitor_downsample)
+        if reference is None or now - reference > stale_timeout:
+            self._friction_last_sample_sequence = self._telemetry_sequence
+            self._friction_recovery_started_at = now
+            self._process_friction_actions(experiment.enter_recovery())
+            self._save_friction_checkpoint()
+            return
+        self._process_friction_actions(experiment.tick(now))
+        self._update_friction_status(now)
+
+    def _advance_friction_recovery(self, now: float) -> None:
+        experiment = self._friction_experiment
+        if experiment is None or experiment.phase != FrictionPhase.RECOVERING:
+            return
+        if not self.device.connected or self._friction_resume_pending:
+            return
+        if self._command_queue or self._command_timer.isActive():
+            return
+        if self._telemetry_sequence <= self._friction_last_sample_sequence:
+            started = self._friction_recovery_started_at or now
+            self.friction_status_label.setText(
+                f"Телеметрия восстанавливается автоматически: {now - started:.1f} с…"
+            )
+            return
+        sample = self._last_sample
+        if sample is None or sample.angle_rad is None:
+            return
+        if not experiment.config.angle_min_rad <= sample.angle_rad <= experiment.config.angle_max_rad:
+            self._abort_friction_experiment("После восстановления координата вне границ опыта")
+            return
+        self._friction_resume_pending = True
+        self.monitor_mask = FRICTION_MONITOR_MASK
+        self._prepare_monitor_configuration(
+            FRICTION_MONITOR_MASK,
+            reset_statistics=False,
+            reset_recovery=False,
+        )
+        self._mark_monitor_configuration_started()
+        commands = self._friction_configuration_commands(experiment.config)
+        self.friction_status_label.setText("Поток восстановлен; повторяется прерванная точка…")
+        self._queue_commands(commands, self._resume_friction_motion)
+
+    def _resume_friction_motion(self) -> None:
+        experiment = self._friction_experiment
+        self._friction_resume_pending = False
+        self._friction_recovery_started_at = None
+        if experiment is None:
+            return
+        self._process_friction_actions(experiment.resume_after_recovery(time.monotonic()))
+        self._save_friction_checkpoint()
+
+    def _process_friction_actions(self, actions: list[FrictionAction]) -> None:
+        experiment = self._friction_experiment
+        for action in actions:
+            if action.kind == "target" and action.value is not None:
+                self._send(self.protocol.target(action.value))
+            elif action.kind == "checkpoint":
+                if experiment is not None:
+                    self._render_friction_points(experiment.points)
+                self._save_friction_checkpoint()
+            elif action.kind == "safe_stop":
+                sent = self.device.emergency_stop()
+                self._pwm_requested = False
+                self.pwm_state_label.setText("PWM: отключён тестом трения")
+                self._log("FRICTION_STOP", f"Отправлено: {sent or 'нет связи'}")
+                if experiment is not None and experiment.phase == FrictionPhase.ABORTED:
+                    self._finalize_friction_experiment("failed", experiment.abort_reason)
+            elif action.kind == "finish":
+                self.device.emergency_stop()
+                self._pwm_requested = False
+                self._finalize_friction_experiment("completed")
+
+    def _update_friction_status(self, now: float) -> None:
+        experiment = self._friction_experiment
+        if experiment is None:
+            return
+        phase_names = {
+            FrictionPhase.ZERO: "выдержка на нуле",
+            FrictionPhase.SETTLING: "стабилизация",
+            FrictionPhase.MEASURING: "полезное измерение",
+            FrictionPhase.PAUSE: "пауза на нулевой скорости",
+        }
+        target = experiment.current_target
+        point = min(experiment.point_index + 1, len(experiment.config.targets))
+        phase = phase_names.get(experiment.phase, experiment.phase.value)
+        target_text = f" · цель {target:g} рад/с" if target is not None else ""
+        self.friction_status_label.setText(
+            f"Точка {point}/{len(experiment.config.targets)} · {phase}{target_text} · "
+            f"{max(0.0, now - experiment.phase_started_s):.1f} с · "
+            f"восстановлений {experiment.recovery_attempts}/{experiment.config.max_recovery_attempts}"
+        )
+
+    def _stop_friction_test_by_user(self) -> None:
+        experiment = self._friction_experiment
+        if experiment is None or not self._friction_running():
+            return
+        experiment.abort("Остановлено пользователем")
+        self.device.emergency_stop()
+        self._pwm_requested = False
+        self._finalize_friction_experiment("interrupted", experiment.abort_reason)
+
+    def _abort_friction_experiment(self, reason: str) -> None:
+        experiment = self._friction_experiment
+        if experiment is None:
+            return
+        experiment.abort(reason)
+        self.device.emergency_stop()
+        self._pwm_requested = False
+        self._finalize_friction_experiment("failed", reason)
+
+    def _finalize_friction_experiment(self, status: str, error: str = "") -> None:
+        experiment = self._friction_experiment
+        if experiment is None:
+            return
+        recorder_path = self.friction_recorder.stop()
+        if recorder_path is not None and str(recorder_path) not in self._friction_telemetry_paths:
+            self._friction_telemetry_paths.append(str(recorder_path))
+        estimate = experiment.estimate()
+        result = {
+            "schema": 1,
+            "status": status,
+            "config": experiment.config.to_dict(),
+            "estimate": estimate.to_dict(),
+            "telemetry_paths": self._friction_telemetry_paths,
+            "interruption_count": experiment.interruption_count,
+            "error": error or None,
+        }
+        self._friction_last_estimate = estimate
+        self._render_friction_points(experiment.points)
+        self._render_friction_estimate(estimate)
+        if self.project is not None and self._friction_experiment_id is not None:
+            fields: dict[str, object] = {
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result_json": json.dumps(result, ensure_ascii=False),
+            }
+            if error:
+                fields["error"] = error
+            self.project.update_experiment(self._friction_experiment_id, status, **fields)
+            export_path = self.project.save_export(
+                f"friction_{self._friction_experiment_id}",
+                result,
+            )
+            self._log("FRICTION", f"Результат сохранён: {export_path}")
+        self._save_friction_checkpoint()
+        self.friction_start_button.setEnabled(True)
+        self.friction_resume_button.setEnabled(True)
+        self.friction_stop_button.setEnabled(False)
+        self.friction_accept_button.setEnabled(status == "completed" and estimate.valid)
+        if status == "completed":
+            self.friction_status_label.setText(
+                "Тест завершён; PWM отключён, ручная конфигурация восстанавливается. " + estimate.note
+            )
+        else:
+            self.friction_status_label.setText(
+                f"Тест остановлен: {error or status}. PWM отключён; checkpoint сохранён."
+            )
+        self._log("FRICTION", f"Опыт завершён со статусом {status}: {error or estimate.note}")
+        restore_commands = list(self._friction_restore_commands)
+        restore_mask = self._friction_restore_mask
+        self._friction_experiment = None
+        self._friction_resume_pending = False
+        self.monitor_mask = restore_mask
+        if self.device.connected and restore_commands:
+            self._prepare_monitor_configuration(
+                restore_mask,
+                reset_statistics=False,
+                reset_recovery=True,
+            )
+            self._mark_monitor_configuration_started()
+            self._queue_commands(restore_commands)
+
+    def _save_friction_checkpoint(self) -> None:
+        experiment = self._friction_experiment
+        if self.project is None or experiment is None:
+            return
+        payload = experiment.checkpoint_payload(self._friction_experiment_id)
+        payload["telemetry_paths"] = list(self._friction_telemetry_paths)
+        self.project.save_checkpoint("friction", payload)
+
+    def _clear_friction_results(self) -> None:
+        for row in range(self.friction_points_table.rowCount()):
+            for column in range(1, self.friction_points_table.columnCount()):
+                self.friction_points_table.setItem(row, column, QTableWidgetItem("—"))
+        for row in range(self.friction_summary_table.rowCount()):
+            self.friction_summary_table.setItem(row, 1, QTableWidgetItem("—"))
+        self.friction_result_note.setText("Опыт выполняется; итог появится после четырёх точек.")
+
+    def _render_friction_points(self, points: list[FrictionPointResult]) -> None:
+        for row, point in enumerate(points[: self.friction_points_table.rowCount()]):
+            values = (
+                f"{point.target_velocity_rad_s:g}",
+                f"{point.mean_velocity_rad_s:.6g}",
+                f"{point.mean_current_q_a:.6g}",
+                f"{point.friction_torque_nm:.6g}",
+                str(point.sample_count),
+                point.note,
+            )
+            for column, value in enumerate(values):
+                self.friction_points_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _render_friction_estimate(self, estimate: FrictionEstimate) -> None:
+        values = (
+            estimate.coulomb_friction_nm,
+            estimate.coulomb_positive_nm,
+            estimate.coulomb_negative_nm,
+            estimate.viscous_friction_nm_s_rad,
+            estimate.breakaway_friction_nm,
+            estimate.asymmetry_percent,
+            estimate.r_squared,
+        )
+        for row, value in enumerate(values):
+            rendered = "—" if value is None else f"{value:.8g}"
+            self.friction_summary_table.setItem(row, 1, QTableWidgetItem(rendered))
+        self.friction_result_note.setText(estimate.note)
+
+    def _accept_friction_estimate(self) -> None:
+        estimate = self._friction_last_estimate
+        if estimate is None or not estimate.valid:
+            QMessageBox.warning(self, "Профиль", "Нет пригодной оценки трения")
+            return
+        if self.project is None:
+            QMessageBox.warning(self, "Профиль", "Сначала откройте проект")
+            return
+        assert estimate.coulomb_friction_nm is not None
+        assert estimate.viscous_friction_nm_s_rad is not None
+        assert estimate.breakaway_friction_nm is not None
+        self.profile.coulomb_friction_nm = estimate.coulomb_friction_nm
+        self.profile.viscous_friction_nm_s_rad = estimate.viscous_friction_nm_s_rad
+        self.profile.breakaway_friction_nm = estimate.breakaway_friction_nm
+        parameters = {
+            "coulomb_friction_nm": estimate.coulomb_friction_nm,
+            "viscous_friction_nm_s_rad": estimate.viscous_friction_nm_s_rad,
+            "breakaway_friction_nm": estimate.breakaway_friction_nm,
+            "coulomb_positive_nm": estimate.coulomb_positive_nm,
+            "coulomb_negative_nm": estimate.coulomb_negative_nm,
+        }
+        self.project.save_profile(self.profile)
+        self.project.accept_parameters(
+            self.profile.name,
+            "friction_velocity",
+            parameters,
+            score=estimate.r_squared,
+            note="Принято пользователем как грубая начальная оценка",
+        )
+        self.friction_accept_button.setEnabled(False)
+        self.friction_result_note.setText(
+            estimate.note + " Значения приняты и сохранены новой версией профиля."
+        )
+        self._log("FRICTION_ACCEPT", json.dumps(parameters, ensure_ascii=False))
+
+    def _active_monitor_downsample(self) -> int:
+        experiment = self._friction_experiment
+        if experiment is not None and self._friction_running():
+            return experiment.config.monitor_downsample
+        return self.monitor_downsample_spin.value()
+
+    def _manual_control_blocked_by_friction(self, operation: str) -> bool:
+        if not self._friction_running():
+            return False
+        QMessageBox.warning(
+            self,
+            "Выполняется тест трения",
+            f"{operation.capitalize()} заблокировано до завершения опыта. "
+            "Для немедленной остановки используйте «СТОП И ОТКЛЮЧИТЬ PWM».",
+        )
+        return True
 
     def _virtual_tuning_page(self) -> QWidget:
         page, layout = titled_page(
@@ -976,6 +1615,18 @@ class MainWindow(QMainWindow):
             self.angle_max,
             self.monitor_downsample_spin,
             self.plot_window_spin,
+            self.friction_low_speed,
+            self.friction_high_speed,
+            self.friction_current_limit,
+            self.friction_voltage_limit,
+            self.friction_velocity_limit,
+            self.friction_angle_min,
+            self.friction_angle_max,
+            self.friction_settle,
+            self.friction_measure,
+            self.friction_pause,
+            self.friction_downsample,
+            self.friction_recoveries,
         ]
         for widget in spin_boxes:
             widget.valueChanged.connect(self._schedule_user_settings_save)
@@ -1056,6 +1707,7 @@ class MainWindow(QMainWindow):
                 "window_s": self.plot_window_spin.value(),
                 "follow": self.plot_follow_checkbox.isChecked(),
             },
+            "friction": self._friction_config_from_widgets().to_dict(),
         }
 
     def _save_user_settings(self) -> None:
@@ -1131,6 +1783,15 @@ class MainWindow(QMainWindow):
                 self.plot_checks[name].setChecked(name in plot_signals)
             self.plot_window_spin.setValue(int(plot.get("window_s", 30)))
             self.plot_follow_checkbox.setChecked(bool(plot.get("follow", True)))
+
+            friction = payload.get("friction")
+            if isinstance(friction, dict):
+                try:
+                    config = FrictionTestConfig.from_dict(friction)
+                except (TypeError, ValueError):
+                    self._log("ERROR", "Настройки теста трения не восстановлены: значения некорректны")
+                else:
+                    self._set_friction_config_widgets(config)
             self._sync_profile_from_widgets()
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._log("ERROR", f"Последние настройки не восстановлены: {exc}")
@@ -1263,10 +1924,22 @@ class MainWindow(QMainWindow):
             return
         if self.safe_connect_checkbox.isChecked():
             self._send(self.protocol.disable())
+        experiment = self._friction_experiment
+        if experiment is not None and experiment.phase == FrictionPhase.RECOVERING:
+            self.monitor_mask = FRICTION_MONITOR_MASK
+            self._prepare_monitor_configuration(
+                FRICTION_MONITOR_MASK,
+                reset_statistics=False,
+                reset_recovery=False,
+            )
+            self._send_monitor_configuration("восстанавливается для теста трения")
+            return
         self._apply_monitoring()
         self._read_device_configuration()
 
     def _apply_modes(self) -> None:
+        if self._manual_control_blocked_by_friction("применение ручной конфигурации"):
+            return
         if not self.device.connected:
             QMessageBox.warning(self, "Конфигурация", "Сначала подключите мотор")
             return
@@ -1362,6 +2035,8 @@ class MainWindow(QMainWindow):
         self._read_device_limits(copy_to_inputs=False)
 
     def _send_target(self) -> None:
+        if self._manual_control_blocked_by_friction("ручная отправка цели"):
+            return
         error = self._target_validation_error()
         if error:
             QMessageBox.warning(self, "Цель отклонена", error)
@@ -1387,6 +2062,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _enable_pwm(self) -> None:
+        if self._manual_control_blocked_by_friction("ручное включение PWM"):
+            return
         if not self.device.connected:
             QMessageBox.warning(self, "PWM", "Сначала подключите мотор")
             return
@@ -1426,6 +2103,8 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_device_limits(self) -> None:
+        if self._manual_control_blocked_by_friction("изменение ограничений SimpleFOC"):
+            return
         if not self._allow_parameter_change("изменение ограничений SimpleFOC"):
             return
         selected = [key for key, checkbox in self.device_limit_checks.items() if checkbox.isChecked()]
@@ -1458,6 +2137,8 @@ class MainWindow(QMainWindow):
         self._read_device_limits(copy_to_inputs=False)
 
     def _apply_software_limits(self, show_status: bool = True) -> bool:
+        if self._manual_control_blocked_by_friction("изменение аварийных порогов"):
+            return False
         limits = SafetyLimits(
             current_a=self.current_limit.value(),
             voltage_v=self.voltage_limit.value(),
@@ -1510,6 +2191,8 @@ class MainWindow(QMainWindow):
         self._queue_commands(commands)
 
     def _apply_selected_pid(self) -> None:
+        if self._manual_control_blocked_by_friction("изменение PID/LPF"):
+            return
         if not self._allow_parameter_change("изменение PID/LPF"):
             return
         loop = self._selected_pid_loop()
@@ -1550,6 +2233,8 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def _apply_monitoring(self) -> None:
+        if self._manual_control_blocked_by_friction("ручная настройка мониторинга"):
+            return
         mask = self._monitor_mask_from_ui()
         if mask is None:
             return
@@ -1590,7 +2275,7 @@ class MainWindow(QMainWindow):
         self._queue_commands(
             [
                 self.protocol.monitor_clear(),
-                self.protocol.monitor_downsample(self.monitor_downsample_spin.value()),
+                self.protocol.monitor_downsample(self._active_monitor_downsample()),
                 self.protocol.monitor_variables(self.monitor_mask),
             ]
         )
@@ -1705,6 +2390,10 @@ class MainWindow(QMainWindow):
         self.pwm_state_label.setText("PWM: отключён (best-effort)")
         self._log("EMERGENCY", f"Best-effort stop; sent: {sent or 'nothing (not connected)'}")
         self.statusBar().showMessage("Аварийный стоп отправлен; при сомнениях отключите питание", 10000)
+        experiment = self._friction_experiment
+        if experiment is not None and self._friction_running():
+            experiment.abort("Аварийный стоп FOCTwin")
+            self._finalize_friction_experiment("interrupted", experiment.abort_reason)
 
     def _compile_scenario(self) -> None:
         compiler = ScenarioCompiler(self.protocol, self.profile.safety)
@@ -1767,6 +2456,12 @@ class MainWindow(QMainWindow):
         self.side_connection.setText("● Мотор подключён" if connected else "● Мотор отключён")
         self.dashboard_motor.setText("Подключён" if connected else "Отключён")
         self._log("SERIAL", message)
+        experiment = self._friction_experiment
+        if not connected and experiment is not None and self._friction_running():
+            self._friction_last_sample_sequence = self._telemetry_sequence
+            self._friction_recovery_started_at = time.monotonic()
+            self._process_friction_actions(experiment.enter_recovery())
+            self._save_friction_checkpoint()
 
     def _on_device_line(self, received_at: float, line: str) -> None:
         response = parse_commander_response(line)
@@ -1811,6 +2506,7 @@ class MainWindow(QMainWindow):
             self._monitor_recovery_attempt = 0
         self.telemetry_statistics.add(timestamp_s)
         self.telemetry_recorder.append(sample)
+        self.friction_recorder.append(sample)
         for name in MONITOR_FIELDS:
             value = getattr(sample, name)
             if value is None:
@@ -1821,6 +2517,13 @@ class MainWindow(QMainWindow):
             if len(times) > 60000:
                 del times[:-60000]
                 del values[:-60000]
+
+        experiment = self._friction_experiment
+        if experiment is not None and self._friction_running():
+            violation = experiment.add_sample(sample)
+            if violation:
+                self._abort_friction_experiment(violation)
+                return
 
         violations = self.guard.check(sample) if self.software_guard_enabled.isChecked() else []
         if self._pwm_requested and violations and not self._safety_latched:
@@ -1852,6 +2555,9 @@ class MainWindow(QMainWindow):
             self._reported_recorder_error = recorder_error
             self.record_button.setText("Начать запись CSV")
             self._log("ERROR", f"Запись телеметрии остановлена: {recorder_error}")
+        friction_error = self.friction_recorder.last_error
+        if friction_error and self._friction_running():
+            self._abort_friction_experiment(f"Ошибка записи данных опыта: {friction_error}")
 
     def _refresh_live_plot(self) -> None:
         if self.live_plot is None:
@@ -1887,7 +2593,7 @@ class MainWindow(QMainWindow):
             self.monitor_health_label.setText("Поток: ожидание первого отсчёта…")
             return
         age = max(0.0, now - reference)
-        timeout = monitor_stale_timeout(self.monitor_downsample_spin.value())
+        timeout = monitor_stale_timeout(self._active_monitor_downsample())
         if age <= timeout:
             if self._last_telemetry_received_at is None:
                 self.monitor_health_label.setText("Поток: ожидание первого отсчёта…")
@@ -1978,6 +2684,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_user_settings()
+        experiment = self._friction_experiment
+        if experiment is not None and self._friction_running():
+            experiment.abort("Приложение закрыто во время опыта")
+            self._save_friction_checkpoint()
+            if self.project is not None and self._friction_experiment_id is not None:
+                self.project.update_experiment(
+                    self._friction_experiment_id,
+                    "interrupted",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    error=experiment.abort_reason,
+                )
         self._connection_requested = False
         self._settings_save_timer.stop()
         self._command_timer.stop()
@@ -1985,7 +2702,9 @@ class MainWindow(QMainWindow):
         self._reconnect_timer.stop()
         self._telemetry_ui_timer.stop()
         self._telemetry_watchdog_timer.stop()
+        self._friction_timer.stop()
         self.telemetry_recorder.stop()
+        self.friction_recorder.stop()
         self.device.emergency_stop()
         self.device.disconnect()
         if self.matlab.connected:

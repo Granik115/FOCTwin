@@ -18,3 +18,12 @@ pre-release asset. The release branch name must exactly match the project versio
 prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
+
+## 0.3.0
+
+- First executable identification workflow: bounded four-point velocity friction test.
+- Directional Coulomb, shared viscous and rough breakaway estimates with validity checks.
+- Raw CSV, SQLite experiment result, JSON export and a checkpoint after every completed point.
+- Automatic safe stop, telemetry recovery and retry of an interrupted point.
+- Explicit acceptance of valid estimates into profile history; manual settings are restored with
+  PWM left disabled after the test.
