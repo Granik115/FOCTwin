@@ -18,6 +18,12 @@ FRICTION_MAX_CURRENT_LIMIT_A = 10.0
 FRICTION_MIN_VOLTAGE_LIMIT_V = 0.1
 FRICTION_MAX_VOLTAGE_LIMIT_V = 100.0
 FRICTION_MAX_VELOCITY_LIMIT_RAD_S = 100.0
+FRICTION_TORQUE_MODE = "voltage"
+FRICTION_VELOCITY_WINDOW_S = 0.5
+FRICTION_SOFT_LIMIT_SAMPLES = 3
+FRICTION_SOFT_LIMIT_TOLERANCE = 0.05
+FRICTION_HARD_LIMIT_MULTIPLIER = 2.0
+RPM_TO_RADS = 2.0 * math.pi / 60.0
 
 
 class FrictionPhase(str, Enum):
@@ -126,6 +132,12 @@ class FrictionTestConfig:
         payload = asdict(self)
         payload["targets_rad_s"] = list(self.targets)
         payload["monitor_mask"] = FRICTION_MONITOR_MASK
+        payload["torque_mode"] = FRICTION_TORQUE_MODE
+        payload["velocity_estimator"] = {
+            "source": "angle_slope",
+            "window_s": FRICTION_VELOCITY_WINDOW_S,
+        }
+        payload["soft_limit_samples"] = FRICTION_SOFT_LIMIT_SAMPLES
         return payload
 
     @classmethod
@@ -148,13 +160,17 @@ class FrictionPointResult:
     sample_count: int
     valid: bool
     note: str
+    current_source: str = "measured_iq"
+    mean_measured_current_q_a: float | None = None
+    voltage_saturation_fraction: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> FrictionPointResult:
-        return cls(**payload)
+        field_names = cls.__dataclass_fields__.keys()
+        return cls(**{name: payload[name] for name in field_names if name in payload})
 
 
 @dataclass(slots=True)
@@ -186,12 +202,76 @@ def _trimmed(values: Iterable[float], fraction: float = 0.1) -> np.ndarray:
     return ordered[trim : ordered.size - trim] if trim else ordered
 
 
+def _angle_slope_metrics(
+    samples: Iterable[TelemetrySample],
+    window_s: float = FRICTION_VELOCITY_WINDOW_S,
+) -> tuple[float, float] | None:
+    pairs = sorted(
+        (
+            (float(sample.timestamp_s), float(sample.angle_rad))
+            for sample in samples
+            if sample.angle_rad is not None
+            and math.isfinite(sample.timestamp_s)
+            and math.isfinite(sample.angle_rad)
+        ),
+        key=lambda pair: pair[0],
+    )
+    if len(pairs) < 10:
+        return None
+    timestamps = np.asarray([pair[0] for pair in pairs], dtype=float)
+    angles = np.asarray([pair[1] for pair in pairs], dtype=float)
+    unique = np.r_[True, np.diff(timestamps) > 0]
+    timestamps = timestamps[unique]
+    angles = angles[unique]
+    if timestamps.size < 10 or timestamps[-1] - timestamps[0] < window_s:
+        return None
+
+    centered_time = timestamps - timestamps[0]
+    mean_velocity = float(np.polyfit(centered_time, angles, 1)[0])
+    local_slopes: list[float] = []
+    for start in range(timestamps.size):
+        stop = int(np.searchsorted(timestamps, timestamps[start] + window_s, side="right"))
+        if stop - start < 8:
+            continue
+        local_time = timestamps[start:stop] - timestamps[start]
+        if local_time[-1] < window_s * 0.75:
+            continue
+        local_slopes.append(float(np.polyfit(local_time, angles[start:stop], 1)[0]))
+    trimmed_slopes = _trimmed(local_slopes)
+    if trimmed_slopes.size < 3:
+        return mean_velocity, 0.0
+    return mean_velocity, float(np.std(trimmed_slopes))
+
+
+def _equivalent_voltage_mode_currents(
+    samples: Iterable[TelemetrySample],
+    mean_velocity_rad_s: float,
+    phase_resistance_ohm: float,
+    kv_rpm_per_v: float,
+) -> np.ndarray:
+    if phase_resistance_ohm <= 0 or kv_rpm_per_v <= 0:
+        return np.asarray([], dtype=float)
+    bemf_v = mean_velocity_rad_s / (kv_rpm_per_v * math.sqrt(3.0)) / RPM_TO_RADS
+    return _trimmed(
+        (sample.voltage_q_v - bemf_v) / phase_resistance_ohm
+        for sample in samples
+        if sample.voltage_q_v is not None and math.isfinite(sample.voltage_q_v)
+    )
+
+
 def summarize_friction_point(
     target_velocity_rad_s: float,
     steady_samples: Iterable[TelemetrySample],
     transient_samples: Iterable[TelemetrySample],
     torque_constant_nm_per_a: float,
+    *,
+    infer_current_from_voltage: bool = False,
+    phase_resistance_ohm: float | None = None,
+    kv_rpm_per_v: float | None = None,
+    voltage_limit_v: float | None = None,
 ) -> FrictionPointResult:
+    steady_samples = list(steady_samples)
+    transient_samples = list(transient_samples)
     usable = [
         sample
         for sample in steady_samples
@@ -200,8 +280,35 @@ def summarize_friction_point(
         and math.isfinite(sample.velocity_rad_s)
         and math.isfinite(sample.current_q_a)
     ]
-    velocities = _trimmed(sample.velocity_rad_s for sample in usable if sample.velocity_rad_s is not None)
-    currents = _trimmed(sample.current_q_a for sample in usable if sample.current_q_a is not None)
+    velocity_metrics = _angle_slope_metrics(usable)
+    velocities = _trimmed(
+        sample.velocity_rad_s for sample in usable if sample.velocity_rad_s is not None
+    )
+    if velocity_metrics is None:
+        mean_velocity = float(np.mean(velocities)) if velocities.size else 0.0
+        velocity_std = float(np.std(velocities)) if velocities.size else 0.0
+    else:
+        mean_velocity, velocity_std = velocity_metrics
+
+    measured_currents = _trimmed(
+        sample.current_q_a for sample in usable if sample.current_q_a is not None
+    )
+    current_source = "measured_iq"
+    currents = measured_currents
+    if (
+        infer_current_from_voltage
+        and phase_resistance_ohm is not None
+        and kv_rpm_per_v is not None
+    ):
+        inferred = _equivalent_voltage_mode_currents(
+            usable,
+            mean_velocity,
+            phase_resistance_ohm,
+            kv_rpm_per_v,
+        )
+        if inferred.size:
+            currents = inferred
+            current_source = "voltage_command"
     if velocities.size < 10 or currents.size < 10:
         return FrictionPointResult(
             target_velocity_rad_s,
@@ -214,11 +321,11 @@ def summarize_friction_point(
             int(min(velocities.size, currents.size)),
             False,
             "Недостаточно устойчивых отсчётов",
+            current_source,
+            float(np.mean(measured_currents)) if measured_currents.size else None,
         )
 
-    mean_velocity = float(np.mean(velocities))
     mean_current = float(np.mean(currents))
-    velocity_std = float(np.std(velocities))
     current_std = float(np.std(currents))
     direction_ok = mean_velocity * target_velocity_rad_s > 0
     tracking_tolerance = max(0.005, abs(target_velocity_rad_s) * 0.3)
@@ -230,6 +337,19 @@ def summarize_friction_point(
         for sample in transient_samples
         if sample.current_q_a is not None and math.isfinite(sample.current_q_a)
     )
+    if (
+        current_source == "voltage_command"
+        and phase_resistance_ohm is not None
+        and kv_rpm_per_v is not None
+    ):
+        inferred_transient = _equivalent_voltage_mode_currents(
+            transient_samples,
+            mean_velocity,
+            phase_resistance_ohm,
+            kv_rpm_per_v,
+        )
+        if inferred_transient.size:
+            transient_currents = np.abs(inferred_transient)
     if transient_currents.size:
         breakaway = float(np.percentile(transient_currents, 95)) * torque_constant_nm_per_a
     else:
@@ -243,6 +363,18 @@ def summarize_friction_point(
         problems.append("скорость не достигнута")
     if not stable:
         problems.append("скорость неустойчива")
+    saturation_fraction: float | None = None
+    if voltage_limit_v is not None and voltage_limit_v > 0:
+        voltages = np.asarray(
+            [
+                abs(sample.voltage_q_v)
+                for sample in usable
+                if sample.voltage_q_v is not None and math.isfinite(sample.voltage_q_v)
+            ],
+            dtype=float,
+        )
+        if voltages.size:
+            saturation_fraction = float(np.mean(voltages >= voltage_limit_v * 0.98))
     return FrictionPointResult(
         target_velocity_rad_s=target_velocity_rad_s,
         mean_velocity_rad_s=mean_velocity,
@@ -254,6 +386,11 @@ def summarize_friction_point(
         sample_count=int(min(velocities.size, currents.size)),
         valid=valid,
         note="ОК" if valid else "; ".join(problems),
+        current_source=current_source,
+        mean_measured_current_q_a=(
+            float(np.mean(measured_currents)) if measured_currents.size else None
+        ),
+        voltage_saturation_fraction=saturation_fraction,
     )
 
 
@@ -338,10 +475,17 @@ class FrictionExperiment:
         config: FrictionTestConfig,
         torque_constant_nm_per_a: float,
         completed_points: Iterable[FrictionPointResult] = (),
+        *,
+        phase_resistance_ohm: float | None = None,
+        kv_rpm_per_v: float | None = None,
+        infer_current_from_voltage: bool = False,
     ) -> None:
         config.validate()
         self.config = config
         self.torque_constant_nm_per_a = torque_constant_nm_per_a
+        self.phase_resistance_ohm = phase_resistance_ohm
+        self.kv_rpm_per_v = kv_rpm_per_v
+        self.infer_current_from_voltage = infer_current_from_voltage
         restored_points = list(completed_points)
         self.phase = FrictionPhase.IDLE
         self.phase_started_s = 0.0
@@ -352,6 +496,7 @@ class FrictionExperiment:
         self.recovery_attempts = 0
         self.interruption_count = 0
         self.abort_reason = ""
+        self.soft_limit_counts: dict[str, int] = {}
 
     @property
     def active(self) -> bool:
@@ -398,6 +543,10 @@ class FrictionExperiment:
                     self.steady_samples,
                     self.transient_samples,
                     self.torque_constant_nm_per_a,
+                    infer_current_from_voltage=self.infer_current_from_voltage,
+                    phase_resistance_ohm=self.phase_resistance_ohm,
+                    kv_rpm_per_v=self.kv_rpm_per_v,
+                    voltage_limit_v=self.config.voltage_limit_v,
                 )
             )
             self.phase = FrictionPhase.PAUSE
@@ -442,10 +591,15 @@ class FrictionExperiment:
 
     def checkpoint_payload(self, experiment_id: int | None) -> dict[str, Any]:
         return {
-            "schema": 1,
+            "schema": 2,
             "experiment_id": experiment_id,
             "phase": self.phase.value,
             "config": self.config.to_dict(),
+            "motor_parameters": {
+                "torque_constant_nm_per_a": self.torque_constant_nm_per_a,
+                "phase_resistance_ohm": self.phase_resistance_ohm,
+                "kv_rpm_per_v": self.kv_rpm_per_v,
+            },
             "completed_points": [point.to_dict() for point in self.points],
             "interruption_count": self.interruption_count,
             "abort_reason": self.abort_reason,
@@ -468,8 +622,26 @@ class FrictionExperiment:
             ("скорость", sample.velocity_rad_s, self.config.velocity_limit_rad_s),
         )
         for name, value, limit in checks:
-            if value is not None and abs(value) > limit:
-                return f"{name} вышел за предел ±{limit:g}: {value:g}"
+            if value is None or not math.isfinite(value):
+                continue
+            absolute = abs(value)
+            if absolute > limit * FRICTION_HARD_LIMIT_MULTIPLIER:
+                self.soft_limit_counts.clear()
+                return (
+                    f"резкий выброс {name}: {value:g}; жёсткий порог "
+                    f"±{limit * FRICTION_HARD_LIMIT_MULTIPLIER:g}"
+                )
+            if absolute > limit * (1.0 + FRICTION_SOFT_LIMIT_TOLERANCE):
+                count = self.soft_limit_counts.get(name, 0) + 1
+                self.soft_limit_counts[name] = count
+                if count >= FRICTION_SOFT_LIMIT_SAMPLES:
+                    self.soft_limit_counts.clear()
+                    return (
+                        f"{name} устойчиво выше рабочего предела ±{limit:g}: "
+                        f"{value:g} ({count} отсчёта подряд)"
+                    )
+            else:
+                self.soft_limit_counts[name] = 0
         if sample.angle_rad is not None:
             if sample.angle_rad < self.config.angle_min_rad:
                 return "Координата вышла ниже предела опыта"
