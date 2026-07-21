@@ -99,6 +99,21 @@ class SerialDevice:
             self._port.write(payload)
             self._port.flush()
 
+    def set_dtr(self, enabled: bool) -> None:
+        """Change only the USB CDC DTR state without reopening or resetting the board."""
+
+        if not self.connected:
+            raise RuntimeError("Serial device is not connected")
+        with self._write_lock:
+            self._port.setDTR(bool(enabled))
+
+    def discard_pending_input(self) -> None:
+        """Drop an incomplete/stale host-side USB fragment before stream recovery."""
+
+        if not self.connected:
+            raise RuntimeError("Serial device is not connected")
+        self._port.reset_input_buffer()
+
     def emergency_stop(self) -> list[str]:
         sent: list[str] = []
         for command in self.protocol.emergency_sequence():
