@@ -17,13 +17,24 @@ class ProjectStoreTests(unittest.TestCase):
             experiment_id = store.create_experiment("identification", {"signal": "step"})
             store.update_experiment(experiment_id, "running", started_at="now")
             checkpoint = store.save_checkpoint("identification", {"next_experiment": experiment_id})
+            loaded_checkpoint = store.load_checkpoint("identification")
             telemetry_path = store.new_telemetry_path("manual test")
+            export_path = store.save_export("friction", {"coulomb": 0.2})
+            accepted_id = store.accept_parameters(
+                "test profile",
+                "friction_velocity",
+                {"coulomb_friction_nm": 0.2},
+                score=0.9,
+            )
 
             payload = json.loads(checkpoint.read_text(encoding="utf-8"))
             self.assertEqual(payload["payload"]["next_experiment"], experiment_id)
+            self.assertEqual(loaded_checkpoint["next_experiment"], experiment_id)
             self.assertTrue(store.db_path.exists())
             self.assertEqual(telemetry_path.parent, store.telemetry_dir)
             self.assertTrue(telemetry_path.name.endswith("_manual_test.csv"))
+            self.assertEqual(json.loads(export_path.read_text(encoding="utf-8"))["coulomb"], 0.2)
+            self.assertGreater(accepted_id, 0)
 
             with closing(sqlite3.connect(store.db_path)) as connection:
                 result = connection.execute(

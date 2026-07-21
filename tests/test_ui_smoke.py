@@ -36,6 +36,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(window.raw_telemetry_checkbox.isChecked())
             self.assertIs(window.manual_scroll.widget(), window.manual_splitter)
             self.assertGreaterEqual(window.manual_splitter.minimumWidth(), 1040)
+            self.assertEqual(window.friction_points_table.rowCount(), 4)
+            self.assertEqual(window.friction_current_limit.maximum(), 0.05)
+            self.assertFalse(window.friction_stop_button.isEnabled())
             self.assertEqual(
                 window.manual_scroll.horizontalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded,
@@ -68,6 +71,34 @@ class UiSmokeTests(unittest.TestCase):
                 "21.5",
             )
             second.close()
+
+    def test_friction_configuration_is_persisted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = f"{temporary}/settings.ini"
+            first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+            first.friction_low_speed.setValue(0.015)
+            first.friction_measure.setValue(8.0)
+            first.friction_recoveries.setValue(5)
+            first._save_user_settings()
+            first.close()
+
+            second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+            self.assertEqual(second.friction_low_speed.value(), 0.015)
+            self.assertEqual(second.friction_measure.value(), 8.0)
+            self.assertEqual(second.friction_recoveries.value(), 5)
+            second.close()
+
+    def test_friction_configuration_forces_bounded_modes_and_monitoring(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            commands = window._friction_configuration_commands(
+                window._friction_config_from_widgets()
+            )
+
+            self.assertEqual(commands[:4], ["AE0", "ALC0.05", "ALU12", "ALV0.3"])
+            self.assertEqual(commands[-7:], ["AT2", "AC1", "A0", "AMC", "AMD20", "AMS1111111", "AE1"])
+            window.close()
 
     def test_full_configuration_contains_limits_pid_modes_target_and_monitoring(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -128,6 +128,53 @@ class ProjectStore:
         self.atomic_json(path, envelope)
         return path
 
+    def load_checkpoint(self, stage: str) -> dict[str, Any] | None:
+        path = self.checkpoint_dir / f"{stage}.json"
+        if not path.exists():
+            return None
+        with path.open(encoding="utf-8") as handle:
+            envelope = json.load(handle)
+        if not isinstance(envelope, dict) or envelope.get("stage") != stage:
+            raise ValueError(f"Некорректный checkpoint этапа {stage}")
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"Checkpoint этапа {stage} не содержит данных")
+        return payload
+
+    def save_export(self, label: str, payload: dict[str, Any]) -> Path:
+        safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in label)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        path = self.export_dir / f"{timestamp}_{safe_label or 'result'}.json"
+        self.atomic_json(path, payload)
+        return path
+
+    def accept_parameters(
+        self,
+        profile_name: str,
+        stage: str,
+        parameters: dict[str, Any],
+        *,
+        score: float | None = None,
+        note: str | None = None,
+    ) -> int:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO accepted_parameters(
+                    timestamp, profile_name, stage, parameters_json, score, note
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now(),
+                    profile_name,
+                    stage,
+                    json.dumps(parameters, ensure_ascii=False),
+                    score,
+                    note,
+                ),
+            )
+            return int(cursor.lastrowid)
+
     def new_telemetry_path(self, label: str = "manual") -> Path:
         safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in label)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
