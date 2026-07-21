@@ -19,6 +19,18 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.2
+
+- Initial friction identification now uses `velocity + Voltage torque`, isolating it from the
+  not-yet-identified FOC Current loop.
+- Equivalent torque current is reconstructed from Uq, phase resistance and back EMF; measured Iq
+  is retained as a diagnostic value.
+- Mean speed and stability are calculated from rolling angle slope, so noisy instantaneous
+  firmware velocity no longer rejects uniform motion.
+- Both experiment and host working-limit excess require three consecutive samples; twofold
+  excursions and travel violations remain immediate stops.
+- Old FOC Current checkpoints are rejected instead of mixing incompatible point estimates.
+
 ## 0.3.1
 
 - Friction-test current, voltage, velocity, target-speed and travel inputs can be increased above
