@@ -26,6 +26,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(protocol.enable(None), "AE")
         self.assertEqual(protocol.pid("current_q", "p", 3), "AQP3")
         self.assertEqual(protocol.pid("velocity", "lpf", 0.01), "AVF0.01")
+        self.assertEqual(protocol.monitor_clear(), "AMC")
 
     def test_monitor_parser_normalizes_streamed_milliamps(self):
         parsed = parse_monitor_line(
