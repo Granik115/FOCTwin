@@ -689,9 +689,10 @@ class MainWindow(QMainWindow):
             "Первый автоматический опыт: оценка сухого, вязкого и страгивающего трения на малых скоростях.",
         )
         warning = QLabel(
-            "Опыт запускает мотор автоматически, но прошивка не имеет heartbeat. Держите питание "
-            "доступным. При потере телеметрии FOCTwin отправит цель 0 и AE0, восстановит поток и "
-            "сам повторит прерванную точку."
+            "Опыт запускает мотор автоматически в режиме Voltage torque: ток задаётся внешним "
+            "контуром скорости через известное сопротивление фазы, без ещё не проверенного FOC "
+            "Current. Прошивка не имеет heartbeat — держите питание доступным. При потере "
+            "телеметрии FOCTwin отправит цель 0 и AE0, восстановит поток и повторит точку."
         )
         warning.setObjectName("danger")
         warning.setWordWrap(True)
@@ -792,7 +793,14 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.friction_status_label)
 
         self.friction_points_table = table(
-            ["Цель, рад/с", "Средняя скорость", "Iq, А", "Момент, Н·м", "Отсчёты", "Статус"],
+            [
+                "Цель, рад/с",
+                "Скорость по углу",
+                "Iэкв, А",
+                "Момент, Н·м",
+                "Отсчёты",
+                "Статус",
+            ],
             4,
         )
         for row, target in enumerate((0.02, -0.02, 0.05, -0.05)):
@@ -912,6 +920,11 @@ class MainWindow(QMainWindow):
             payload = self.project.load_checkpoint("friction")
             if payload is None:
                 raise ValueError("В проекте нет checkpoint теста трения")
+            if int(payload.get("schema", 0)) < 2:
+                raise ValueError(
+                    "Checkpoint создан старым опытом FOC Current и несовместим с 0.3.2; "
+                    "запустите новый тест"
+                )
             points = [
                 FrictionPointResult.from_dict(point)
                 for point in payload.get("completed_points", [])
@@ -962,6 +975,14 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Тест трения", str(exc))
             return
+        if self.profile.phase_resistance_ohm <= 0 or self.profile.back_emf_v_per_krpm <= 0:
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Для безопасного опыта Voltage torque в профиле нужны положительные "
+                "сопротивление фазы и коэффициент противо-ЭДС",
+            )
+            return
         host_limits = self.guard.limits
         if (
             config.current_limit_a > host_limits.current_a
@@ -1004,7 +1025,8 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Запуск автоматического теста",
-            "FOCTwin включит PWM и сам выполнит четыре движения. "
+            "FOCTwin включит PWM в режиме Voltage torque и сам выполнит четыре движения. "
+            "Эквивалентный ток будет рассчитан из Uq, сопротивления фазы и противо-ЭДС. "
             f"Пределы: {config.current_limit_a:g} А, {config.voltage_limit_v:g} В, "
             f"{config.velocity_limit_rad_s:g} рад/с, координата "
             f"[{config.angle_min_rad:g}; {config.angle_max_rad:g}].\n\n"
@@ -1032,6 +1054,13 @@ class MainWindow(QMainWindow):
             config,
             self.profile.torque_constant_nm_per_a,
             completed,
+            phase_resistance_ohm=self.profile.phase_resistance_ohm,
+            kv_rpm_per_v=(
+                1000.0 / self.profile.back_emf_v_per_krpm
+                if self.profile.back_emf_v_per_krpm > 0
+                else None
+            ),
+            infer_current_from_voltage=True,
         )
         self._friction_experiment_id = experiment_id
         if self._friction_experiment_id is None:
@@ -1091,7 +1120,7 @@ class MainWindow(QMainWindow):
             )
         commands.extend(
             (
-                self.protocol.torque_mode(TorqueMode.FOC_CURRENT),
+                self.protocol.torque_mode(TorqueMode.VOLTAGE),
                 self.protocol.motion_mode(MotionMode.VELOCITY),
                 self.protocol.target(0.0),
                 self.protocol.monitor_clear(),
@@ -1106,8 +1135,12 @@ class MainWindow(QMainWindow):
         experiment = self._friction_experiment
         if experiment is None or experiment.phase != FrictionPhase.IDLE:
             return
+        self._pwm_requested = True
+        self._safety_latched = False
         self._process_friction_actions(experiment.start(time.monotonic()))
-        self.friction_status_label.setText("PWM включён; выдержка на нулевой скорости…")
+        self.friction_status_label.setText(
+            "PWM включён в Voltage torque; выдержка на нулевой скорости…"
+        )
 
     def _advance_friction_experiment(self) -> None:
         experiment = self._friction_experiment
@@ -1168,6 +1201,8 @@ class MainWindow(QMainWindow):
         self._friction_recovery_started_at = None
         if experiment is None:
             return
+        self._pwm_requested = True
+        self._safety_latched = False
         self._process_friction_actions(experiment.resume_after_recovery(time.monotonic()))
         self._save_friction_checkpoint()
 
@@ -1239,9 +1274,14 @@ class MainWindow(QMainWindow):
             self._friction_telemetry_paths.append(str(recorder_path))
         estimate = experiment.estimate()
         result = {
-            "schema": 1,
+            "schema": 2,
             "status": status,
             "config": experiment.config.to_dict(),
+            "motor_parameters": {
+                "torque_constant_nm_per_a": self.profile.torque_constant_nm_per_a,
+                "phase_resistance_ohm": self.profile.phase_resistance_ohm,
+                "back_emf_v_per_krpm": self.profile.back_emf_v_per_krpm,
+            },
             "estimate": estimate.to_dict(),
             "telemetry_paths": self._friction_telemetry_paths,
             "interruption_count": experiment.interruption_count,

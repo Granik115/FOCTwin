@@ -4,7 +4,8 @@
 
 - Refuse a scenario whose declared target/limit is outside the active profile.
 - Write stricter current, voltage and velocity limits before a test.
-- Observe available monitor data and stop when a sample exceeds the envelope.
+- Observe available monitor data and stop when a working limit stays exceeded for three samples.
+- Stop immediately on a twofold current/voltage/speed excursion or a travel-bound violation.
 - On stop: command target zero and transmit `AE0` three times.
 - Start every trial from a recorded state and reject incomplete trials.
 - Keep the last accepted parameter set for rollback.
@@ -34,7 +35,7 @@ operation. A human must remain able to remove motor power.
 7. Only then enable PWM and begin the bounded trial.
 8. Disable PWM between trials unless continuous hold is explicitly required.
 
-## Low-speed friction experiment (0.3.1)
+## Low-speed friction experiment (0.3.2)
 
 The first automatic experiment starts deliberately narrow. Its default sequence alternates
 direction at `+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`, with a 0.05 A current limit, 12 V voltage
@@ -42,15 +43,24 @@ limit, 0.3 rad/s velocity limit and travel inside [-3, 3] rad. From 0.3.1 these 
 starting values rather than UI maxima. A user may raise them after an insufficient-torque stop,
 but preflight still rejects every test envelope wider than the active host-side safety limits.
 
+FOCTwin forces `velocity + Voltage torque` for the initial friction experiment so an unidentified
+FOC Current loop cannot turn its voltage saturation into a misleading friction result. With the
+known phase resistance, `ALC` remains the velocity-controller current-command limit. The reported
+friction current is reconstructed from Uq, phase resistance and back EMF; measured Iq remains a
+diagnostic signal.
+
 FOCTwin forces all seven monitor fields for the test. If telemetry becomes stale, it sends
 target zero and repeated `AE0`, lets the normal monitor/DTR recovery restore the stream, reapplies
 the bounded experiment configuration and repeats the interrupted point. It never increases a
-limit automatically when the motor fails to move. Exceeding a current, voltage, velocity or
-position bound ends the experiment and leaves PWM disabled.
+limit automatically when the motor fails to move. A 5% working-limit excess must persist for
+three consecutive samples in both the experiment and the global FOCTwin guard. A twofold excess
+or position-bound violation ends the experiment immediately and leaves PWM disabled.
 
-The result is a rough initial estimate. A point is rejected when the measured direction,
-tracking error or speed stability is unsuitable. Identified coefficients are written to the
-active motor profile only after the user explicitly accepts a valid four-point result.
+The result is a rough initial estimate. Mean speed and stability come from a 0.5-second rolling
+angle slope rather than the noisy instantaneous firmware velocity. A point is rejected when the
+measured direction, tracking error or angle-slope stability is unsuitable. Identified coefficients
+are written to the active motor profile only after the user explicitly accepts a valid four-point
+result.
 
 ## Device-limit interaction
 

@@ -118,7 +118,10 @@ class UiSmokeTests(unittest.TestCase):
             )
 
             self.assertEqual(commands[:4], ["AE0", "ALC0.05", "ALU12", "ALV0.3"])
-            self.assertEqual(commands[-7:], ["AT2", "AC1", "A0", "AMC", "AMD20", "AMS1111111", "AE1"])
+            self.assertEqual(
+                commands[-7:],
+                ["AT0", "AC1", "A0", "AMC", "AMD20", "AMS1111111", "AE1"],
+            )
             window.close()
 
     def test_friction_configuration_uses_raised_user_limits(self):
