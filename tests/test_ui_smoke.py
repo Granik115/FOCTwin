@@ -40,7 +40,7 @@ class UiSmokeTests(unittest.TestCase):
             self.assertGreater(window.friction_current_limit.maximum(), 0.05)
             self.assertEqual(window.friction_current_limit.singleStep(), 0.01)
             window.friction_current_limit.stepUp()
-            self.assertEqual(window.friction_current_limit.value(), 0.06)
+            self.assertAlmostEqual(window.friction_current_limit.value(), 0.06)
             window.friction_current_limit.setValue(0.15)
             self.assertEqual(window.friction_current_limit.value(), 0.15)
             self.assertGreater(window.friction_high_speed.maximum(), 0.05)
