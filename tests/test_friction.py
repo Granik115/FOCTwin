@@ -54,11 +54,58 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("направление", result.note)
 
+    def test_angle_slope_accepts_motion_despite_noisy_firmware_velocity(self):
+        samples = [
+            TelemetrySample(
+                timestamp_s=index * 0.02,
+                angle_rad=0.02 * index * 0.02,
+                velocity_rad_s=0.02 + (0.02 if index % 2 else -0.02),
+                current_q_a=0.01,
+            )
+            for index in range(200)
+        ]
+
+        result = summarize_friction_point(0.02, samples, samples, 1.3264)
+
+        self.assertTrue(result.valid)
+        self.assertAlmostEqual(result.mean_velocity_rad_s, 0.02, places=5)
+        self.assertLess(result.velocity_std_rad_s, 0.001)
+
+    def test_voltage_mode_estimates_current_command_from_uq(self):
+        samples = [
+            TelemetrySample(
+                timestamp_s=index * 0.02,
+                angle_rad=0.02 * index * 0.02,
+                velocity_rad_s=0.02,
+                voltage_q_v=0.0777,
+                current_q_a=0.0005,
+            )
+            for index in range(200)
+        ]
+
+        result = summarize_friction_point(
+            0.02,
+            samples,
+            samples,
+            1.3264,
+            infer_current_from_voltage=True,
+            phase_resistance_ohm=0.675,
+            kv_rpm_per_v=10.8,
+            voltage_limit_v=12.0,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.current_source, "voltage_command")
+        self.assertAlmostEqual(result.mean_current_q_a, 0.1, places=3)
+        self.assertAlmostEqual(result.mean_measured_current_q_a, 0.0005, places=6)
+
     def test_default_experiment_starts_narrow_but_accepts_user_increases(self):
         config = FrictionTestConfig()
         config.validate()
         self.assertEqual(config.targets, (0.02, -0.02, 0.05, -0.05))
         self.assertEqual(config.to_dict()["monitor_mask"], FRICTION_MONITOR_MASK)
+        self.assertEqual(config.to_dict()["torque_mode"], "voltage")
+        self.assertEqual(config.to_dict()["velocity_estimator"]["source"], "angle_slope")
 
         config.current_limit_a = 0.15
         config.voltage_limit_v = 24.0
@@ -91,7 +138,7 @@ class FrictionExperimentTests(unittest.TestCase):
                     timestamp_s=1.5 + index * 0.05,
                     velocity_rad_s=0.02,
                     current_q_a=0.04,
-                    angle_rad=0.1,
+                    angle_rad=0.1 + index * 0.001,
                 )
             )
         actions = experiment.tick(3.5)
@@ -114,13 +161,33 @@ class FrictionExperimentTests(unittest.TestCase):
         self.assertEqual(experiment.phase, FrictionPhase.SETTLING)
         self.assertEqual(actions[0].value, 0.02)
 
-    def test_sample_outside_test_bounds_requests_abort(self):
+    def test_soft_limit_requires_three_consecutive_samples(self):
+        experiment = FrictionExperiment(self.config(), 1.0)
+        experiment.start(0.0)
+        experiment.tick(0.5)
+
+        first = experiment.add_sample(
+            TelemetrySample(timestamp_s=1.0, current_q_a=0.06, angle_rad=0.0)
+        )
+        second = experiment.add_sample(
+            TelemetrySample(timestamp_s=1.02, current_q_a=0.06, angle_rad=0.0)
+        )
+        violation = experiment.add_sample(
+            TelemetrySample(timestamp_s=1.04, current_q_a=0.06, angle_rad=0.0)
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIn("Iq", violation)
+        self.assertIn("3 отсчёта", violation)
+
+    def test_hard_limit_aborts_on_first_extreme_sample(self):
         experiment = FrictionExperiment(self.config(), 1.0)
         experiment.start(0.0)
         experiment.tick(0.5)
 
         violation = experiment.add_sample(
-            TelemetrySample(timestamp_s=1.0, current_q_a=0.06, angle_rad=0.0)
+            TelemetrySample(timestamp_s=1.0, velocity_rad_s=0.61, angle_rad=0.0)
         )
 
-        self.assertIn("Iq", violation)
+        self.assertIn("резкий выброс скорость", violation)
