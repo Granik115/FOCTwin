@@ -47,6 +47,7 @@ class UiSmokeTests(unittest.TestCase):
             path = f"{temporary}/settings.ini"
             first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
             first.port_combo.setCurrentText("COM17")
+            first.motion_combo.setCurrentIndex(first.motion_combo.findData("velocity"))
             first.target_spin.setValue(1.25)
             first.device_limit_spins["current_a"].setValue(8.5)
             first.current_limit.setValue(7.5)
@@ -57,6 +58,7 @@ class UiSmokeTests(unittest.TestCase):
 
             second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
             self.assertEqual(second.port_combo.currentText(), "COM17")
+            self.assertEqual(second.motion_combo.currentData(), "velocity")
             self.assertEqual(second.target_spin.value(), 1.25)
             self.assertEqual(second.device_limit_spins["current_a"].value(), 8.5)
             self.assertEqual(second.current_limit.value(), 7.5)
