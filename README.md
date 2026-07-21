@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.0 contains:
+Version 0.3.1 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -40,6 +40,8 @@ Version 0.3.0 contains:
 - automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
   Serial link reconnects, without silently raising the configured test envelope;
 - explicit review before identified friction values are accepted into the active profile;
+- editable friction-test targets and safety limits above their conservative default values, with
+  dedicated arrow steps and the active FOCTwin safety envelope still enforced at preflight;
 - editable safety limits and a Russian FOCTwin scenario language;
 - durable project folders with SQLite events, atomic checkpoints and raw telemetry files;
 - the supplied voltage/current Simulink models and MATLAB tuning sources;

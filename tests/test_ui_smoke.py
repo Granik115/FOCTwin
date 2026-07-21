@@ -37,7 +37,16 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIs(window.manual_scroll.widget(), window.manual_splitter)
             self.assertGreaterEqual(window.manual_splitter.minimumWidth(), 1040)
             self.assertEqual(window.friction_points_table.rowCount(), 4)
-            self.assertEqual(window.friction_current_limit.maximum(), 0.05)
+            self.assertGreater(window.friction_current_limit.maximum(), 0.05)
+            self.assertEqual(window.friction_current_limit.singleStep(), 0.01)
+            window.friction_current_limit.stepUp()
+            self.assertAlmostEqual(window.friction_current_limit.value(), 0.06)
+            window.friction_current_limit.setValue(0.15)
+            self.assertEqual(window.friction_current_limit.value(), 0.15)
+            self.assertGreater(window.friction_high_speed.maximum(), 0.05)
+            self.assertGreater(window.friction_voltage_limit.maximum(), 12.0)
+            self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
+            self.assertGreater(window.friction_angle_max.maximum(), 3.0)
             self.assertFalse(window.friction_stop_button.isEnabled())
             self.assertEqual(
                 window.manual_scroll.horizontalScrollBarPolicy(),
@@ -77,6 +86,12 @@ class UiSmokeTests(unittest.TestCase):
             path = f"{temporary}/settings.ini"
             first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
             first.friction_low_speed.setValue(0.015)
+            first.friction_high_speed.setValue(0.1)
+            first.friction_current_limit.setValue(0.15)
+            first.friction_voltage_limit.setValue(24.0)
+            first.friction_velocity_limit.setValue(0.5)
+            first.friction_angle_min.setValue(-4.0)
+            first.friction_angle_max.setValue(4.0)
             first.friction_measure.setValue(8.0)
             first.friction_recoveries.setValue(5)
             first._save_user_settings()
@@ -84,6 +99,12 @@ class UiSmokeTests(unittest.TestCase):
 
             second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
             self.assertEqual(second.friction_low_speed.value(), 0.015)
+            self.assertEqual(second.friction_high_speed.value(), 0.1)
+            self.assertEqual(second.friction_current_limit.value(), 0.15)
+            self.assertEqual(second.friction_voltage_limit.value(), 24.0)
+            self.assertEqual(second.friction_velocity_limit.value(), 0.5)
+            self.assertEqual(second.friction_angle_min.value(), -4.0)
+            self.assertEqual(second.friction_angle_max.value(), 4.0)
             self.assertEqual(second.friction_measure.value(), 8.0)
             self.assertEqual(second.friction_recoveries.value(), 5)
             second.close()
@@ -98,6 +119,21 @@ class UiSmokeTests(unittest.TestCase):
 
             self.assertEqual(commands[:4], ["AE0", "ALC0.05", "ALU12", "ALV0.3"])
             self.assertEqual(commands[-7:], ["AT2", "AC1", "A0", "AMC", "AMD20", "AMS1111111", "AE1"])
+            window.close()
+
+    def test_friction_configuration_uses_raised_user_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window.friction_current_limit.setValue(0.15)
+            window.friction_voltage_limit.setValue(24.0)
+            window.friction_velocity_limit.setValue(0.5)
+
+            config = window._friction_config_from_widgets()
+            config.validate()
+            commands = window._friction_configuration_commands(config)
+
+            self.assertEqual(commands[:4], ["AE0", "ALC0.15", "ALU24", "ALV0.5"])
             window.close()
 
     def test_full_configuration_contains_limits_pid_modes_target_and_monitoring(self):

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from foctwin import __version__
 from foctwin.domain import (
     MotorProfile,
     MotionMode,
@@ -52,8 +53,14 @@ from foctwin.domain import (
     TelemetrySample,
     TorqueMode,
 )
-from foctwin import __version__
 from foctwin.friction import (
+    FRICTION_MAX_CURRENT_LIMIT_A,
+    FRICTION_MAX_TARGET_VELOCITY_RAD_S,
+    FRICTION_MAX_VELOCITY_LIMIT_RAD_S,
+    FRICTION_MAX_VOLTAGE_LIMIT_V,
+    FRICTION_MIN_CURRENT_LIMIT_A,
+    FRICTION_MIN_TARGET_VELOCITY_RAD_S,
+    FRICTION_MIN_VOLTAGE_LIMIT_V,
     FRICTION_MONITOR_MASK,
     FrictionAction,
     FrictionEstimate,
@@ -88,10 +95,18 @@ class DeviceSignals(QObject):
     matlab_state = Signal(bool, str)
 
 
-def spin(value: float, minimum: float = -1e9, maximum: float = 1e9, decimals: int = 6) -> QDoubleSpinBox:
+def spin(
+    value: float,
+    minimum: float = -1e9,
+    maximum: float = 1e9,
+    decimals: int = 6,
+    step: float | None = None,
+) -> QDoubleSpinBox:
     widget = QDoubleSpinBox()
     widget.setDecimals(decimals)
     widget.setRange(minimum, maximum)
+    if step is not None:
+        widget.setSingleStep(step)
     widget.setValue(value)
     widget.setKeyboardTracking(False)
     return widget
@@ -686,16 +701,46 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         config_group = QGroupBox("Безопасный план низкоскоростного опыта")
         config_grid = QGridLayout(config_group)
-        self.friction_low_speed = spin(0.02, 0.005, 0.049, 4)
-        self.friction_high_speed = spin(0.05, 0.006, 0.05, 4)
-        self.friction_current_limit = spin(0.05, 0.03, 0.05, 3)
-        self.friction_voltage_limit = spin(12.0, 0.1, 12.0, 2)
-        self.friction_velocity_limit = spin(0.3, 0.05, 0.3, 3)
-        self.friction_angle_min = spin(-3.0, -3.0, 2.9, 3)
-        self.friction_angle_max = spin(3.0, -2.9, 3.0, 3)
-        self.friction_settle = spin(2.0, 1.0, 30.0, 1)
-        self.friction_measure = spin(4.0, 2.0, 120.0, 1)
-        self.friction_pause = spin(1.0, 0.5, 30.0, 1)
+        self.friction_low_speed = spin(
+            0.02,
+            FRICTION_MIN_TARGET_VELOCITY_RAD_S,
+            FRICTION_MAX_TARGET_VELOCITY_RAD_S,
+            4,
+            0.005,
+        )
+        self.friction_high_speed = spin(
+            0.05,
+            FRICTION_MIN_TARGET_VELOCITY_RAD_S,
+            FRICTION_MAX_TARGET_VELOCITY_RAD_S,
+            4,
+            0.005,
+        )
+        self.friction_current_limit = spin(
+            0.05,
+            FRICTION_MIN_CURRENT_LIMIT_A,
+            FRICTION_MAX_CURRENT_LIMIT_A,
+            3,
+            0.01,
+        )
+        self.friction_voltage_limit = spin(
+            12.0,
+            FRICTION_MIN_VOLTAGE_LIMIT_V,
+            FRICTION_MAX_VOLTAGE_LIMIT_V,
+            2,
+            0.5,
+        )
+        self.friction_velocity_limit = spin(
+            0.3,
+            FRICTION_MIN_TARGET_VELOCITY_RAD_S,
+            FRICTION_MAX_VELOCITY_LIMIT_RAD_S,
+            3,
+            0.05,
+        )
+        self.friction_angle_min = spin(-3.0, -1e9, 1e9, 3, 0.1)
+        self.friction_angle_max = spin(3.0, -1e9, 1e9, 3, 0.1)
+        self.friction_settle = spin(2.0, 1.0, 30.0, 1, 0.5)
+        self.friction_measure = spin(4.0, 2.0, 120.0, 1, 0.5)
+        self.friction_pause = spin(1.0, 0.5, 30.0, 1, 0.5)
         self.friction_downsample = QSpinBox()
         self.friction_downsample.setRange(5, 100)
         self.friction_downsample.setValue(20)
