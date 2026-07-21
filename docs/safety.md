@@ -28,9 +28,9 @@ operation. A human must remain able to remove motor power.
 1. Open a project and select a known profile.
 2. Verify position is within the allowed travel and the cable is free.
 3. Connect while PWM remains disabled.
-4. Read back supported limits/controller values.
-5. Apply the project's stricter current, voltage and velocity limits.
-6. Configure monitoring and verify fresh samples.
+4. Check the saved desired configuration and the separate actual-limit readback.
+5. Apply the full saved configuration with paced writes.
+6. Verify that monitoring produces fresh samples.
 7. Only then enable PWM and begin the bounded trial.
 8. Disable PWM between trials unless continuous hold is explicitly required.
 
