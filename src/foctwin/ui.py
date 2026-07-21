@@ -1017,8 +1017,8 @@ class MainWindow(QMainWindow):
                 "auto_reconnect": self.auto_reconnect_checkbox.isChecked(),
             },
             "control": {
-                "motion": self.motion_combo.currentData().value,
-                "torque": self.torque_combo.currentData().value,
+                "motion": self._combo_data_value(self.motion_combo),
+                "torque": self._combo_data_value(self.torque_combo),
                 "target": self.target_spin.value(),
             },
             "device_limits": {
@@ -1136,6 +1136,11 @@ class MainWindow(QMainWindow):
             self._log("ERROR", f"Последние настройки не восстановлены: {exc}")
         finally:
             self._settings_loading = False
+
+    @staticmethod
+    def _combo_data_value(combo: QComboBox) -> str:
+        data = combo.currentData()
+        return str(getattr(data, "value", data))
 
     @staticmethod
     def _set_combo_enum(combo: QComboBox, enum_type: type[MotionMode] | type[TorqueMode], value: object) -> None:
@@ -1374,9 +1379,9 @@ class MainWindow(QMainWindow):
         elif motion in {MotionMode.VELOCITY, MotionMode.VELOCITY_OPEN_LOOP}:
             if abs(target) > limits.velocity_rad_s:
                 return "Цель скорости превышает программный порог"
-        elif motion is MotionMode.TORQUE:
+        elif motion == MotionMode.TORQUE:
             torque_mode = self.torque_combo.currentData()
-            limit = limits.voltage_v if torque_mode is TorqueMode.VOLTAGE else limits.current_a
+            limit = limits.voltage_v if torque_mode == TorqueMode.VOLTAGE else limits.current_a
             if abs(target) > limit:
                 return "Цель момента превышает программный порог выбранного режима"
         return None
