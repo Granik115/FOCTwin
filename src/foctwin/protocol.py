@@ -110,6 +110,9 @@ class CommanderProtocol:
         encoded = "" if value is None else str(int(value))
         return self.raw(f"MD{encoded}")
 
+    def monitor_clear(self) -> str:
+        return self.raw("MC")
+
     def monitor_variables(self, mask: str) -> str:
         if len(mask) != 7 or any(bit not in "01" for bit in mask):
             raise ValueError("Monitor mask must contain exactly seven 0/1 digits")
