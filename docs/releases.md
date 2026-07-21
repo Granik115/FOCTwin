@@ -19,6 +19,15 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.1
+
+- Friction-test current, voltage, velocity, target-speed and travel inputs can be increased above
+  the conservative 0.3.0 defaults after an insufficient-torque stop.
+- Spin buttons use practical increments, including 0.01 A for the test current limit.
+- Raised values persist between launches and are used by the generated Commander configuration.
+- Test preflight continues to require the whole experiment envelope to fit inside FOCTwin's active
+  software safety limits.
+
 ## 0.3.0
 
 - First executable identification workflow: bounded four-point velocity friction test.

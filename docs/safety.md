@@ -34,12 +34,13 @@ operation. A human must remain able to remove motor power.
 7. Only then enable PWM and begin the bounded trial.
 8. Disable PWM between trials unless continuous hold is explicitly required.
 
-## Low-speed friction experiment (0.3.0)
+## Low-speed friction experiment (0.3.1)
 
-The first automatic experiment is deliberately narrow: velocity targets are limited to
-0.005–0.05 rad/s, the SimpleFOC current limit to 0.03–0.05 A, the velocity limit to 0.3 rad/s
-and travel to a user-selected subset of [-3, 3] rad. The default sequence alternates direction:
-`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`.
+The first automatic experiment starts deliberately narrow. Its default sequence alternates
+direction at `+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`, with a 0.05 A current limit, 12 V voltage
+limit, 0.3 rad/s velocity limit and travel inside [-3, 3] rad. From 0.3.1 these are editable
+starting values rather than UI maxima. A user may raise them after an insufficient-torque stop,
+but preflight still rejects every test envelope wider than the active host-side safety limits.
 
 FOCTwin forces all seven monitor fields for the test. If telemetry becomes stale, it sends
 target zero and repeated `AE0`, lets the normal monitor/DTR recovery restore the stream, reapplies

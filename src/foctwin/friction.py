@@ -11,6 +11,13 @@ from foctwin.domain import TelemetrySample
 
 
 FRICTION_MONITOR_MASK = "1111111"
+FRICTION_MIN_TARGET_VELOCITY_RAD_S = 0.005
+FRICTION_MAX_TARGET_VELOCITY_RAD_S = 1.0
+FRICTION_MIN_CURRENT_LIMIT_A = 0.001
+FRICTION_MAX_CURRENT_LIMIT_A = 10.0
+FRICTION_MIN_VOLTAGE_LIMIT_V = 0.1
+FRICTION_MAX_VOLTAGE_LIMIT_V = 100.0
+FRICTION_MAX_VELOCITY_LIMIT_RAD_S = 100.0
 
 
 class FrictionPhase(str, Enum):
@@ -66,16 +73,46 @@ class FrictionTestConfig:
         return one_way_targets * (self.settle_s + self.measure_s) + 0.1
 
     def validate(self) -> None:
-        if not 0.005 <= self.low_velocity_rad_s < self.high_velocity_rad_s <= 0.05:
-            raise ValueError("Скорости опыта должны удовлетворять 0,005 ≤ малая < большая ≤ 0,05 рад/с")
-        if not 0.03 <= self.current_limit_a <= 0.05:
-            raise ValueError("Предел тока первого опыта должен быть от 0,03 до 0,05 А")
-        if not 0 < self.voltage_limit_v <= 12.0:
-            raise ValueError("Предел напряжения опыта должен быть не больше 12 В")
-        if not self.high_velocity_rad_s <= self.velocity_limit_rad_s <= 0.3:
-            raise ValueError("Предел скорости должен покрывать цель и быть не больше 0,3 рад/с")
-        if not -3.0 <= self.angle_min_rad < self.angle_max_rad <= 3.0:
-            raise ValueError("Координаты первого опыта должны оставаться внутри [-3; 3] рад")
+        if not (
+            FRICTION_MIN_TARGET_VELOCITY_RAD_S
+            <= self.low_velocity_rad_s
+            < self.high_velocity_rad_s
+            <= FRICTION_MAX_TARGET_VELOCITY_RAD_S
+        ):
+            raise ValueError(
+                "Скорости опыта должны удовлетворять "
+                f"{FRICTION_MIN_TARGET_VELOCITY_RAD_S:g} ≤ малая < большая ≤ "
+                f"{FRICTION_MAX_TARGET_VELOCITY_RAD_S:g} рад/с"
+            )
+        if not (
+            FRICTION_MIN_CURRENT_LIMIT_A
+            <= self.current_limit_a
+            <= FRICTION_MAX_CURRENT_LIMIT_A
+        ):
+            raise ValueError(
+                "Предел тока опыта должен быть от "
+                f"{FRICTION_MIN_CURRENT_LIMIT_A:g} до {FRICTION_MAX_CURRENT_LIMIT_A:g} А"
+            )
+        if not (
+            FRICTION_MIN_VOLTAGE_LIMIT_V
+            <= self.voltage_limit_v
+            <= FRICTION_MAX_VOLTAGE_LIMIT_V
+        ):
+            raise ValueError(
+                "Предел напряжения опыта должен быть от "
+                f"{FRICTION_MIN_VOLTAGE_LIMIT_V:g} до {FRICTION_MAX_VOLTAGE_LIMIT_V:g} В"
+            )
+        if not (
+            self.high_velocity_rad_s
+            <= self.velocity_limit_rad_s
+            <= FRICTION_MAX_VELOCITY_LIMIT_RAD_S
+        ):
+            raise ValueError(
+                "Предел скорости должен покрывать большую цель и быть не больше "
+                f"{FRICTION_MAX_VELOCITY_LIMIT_RAD_S:g} рад/с"
+            )
+        if not self.angle_min_rad < self.angle_max_rad:
+            raise ValueError("Минимальная координата опыта должна быть меньше максимальной")
         if self.angle_max_rad - self.angle_min_rad <= 2 * self.position_margin_rad:
             raise ValueError("Диапазон координат слишком узок для заданной длительности опыта")
         if self.settle_s < 1.0 or self.measure_s < 2.0 or self.pause_s < 0.5:

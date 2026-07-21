@@ -54,13 +54,21 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("направление", result.note)
 
-    def test_first_experiment_envelope_is_deliberately_narrow(self):
+    def test_default_experiment_starts_narrow_but_accepts_user_increases(self):
         config = FrictionTestConfig()
         config.validate()
         self.assertEqual(config.targets, (0.02, -0.02, 0.05, -0.05))
         self.assertEqual(config.to_dict()["monitor_mask"], FRICTION_MONITOR_MASK)
 
-        config.current_limit_a = 0.051
+        config.current_limit_a = 0.15
+        config.voltage_limit_v = 24.0
+        config.velocity_limit_rad_s = 0.5
+        config.angle_min_rad = -4.0
+        config.angle_max_rad = 4.0
+        config.high_velocity_rad_s = 0.1
+        config.validate()
+
+        config.current_limit_a = 10.001
         with self.assertRaises(ValueError):
             config.validate()
 
