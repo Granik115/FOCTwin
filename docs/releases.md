@@ -19,6 +19,19 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.5
+
+- Record the shaft coordinate of every direct-Uq breakaway event.
+- Divide each useful velocity sweep into configurable position bins and retain local speed, Uq,
+  measured Iq, measured torque and a separately labelled voltage-equivalent diagnostic torque.
+- Accumulate completed runs into a project-level position-map JSON with measured and diagnostic
+  min/max envelopes kept separate.
+- Show the predicted travel of every velocity leg before start; for example 0.5 rad/s over the
+  configured 2 s settling plus 4 s measurement spans about 3 rad.
+- Require measured Iq to remain above its noise floor for most of a point and predominantly match
+  the commanded torque direction; three isolated samples no longer validate friction.
+- Checkpoint and result schema 5 preserve position observations without changing motor commands.
+
 ## 0.3.4
 
 - Filtered isolated encoder zeroes and jumps without masking sustained shaft movement.

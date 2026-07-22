@@ -10,6 +10,7 @@ from foctwin.friction import (
     FrictionTestConfig,
     estimate_friction,
     summarize_friction_point,
+    summarize_position_observations,
 )
 
 
@@ -95,6 +96,29 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertFalse(result.measured_current_detected)
         self.assertIn("Iq", result.note)
 
+    def test_sparse_or_wrong_sign_current_does_not_validate_a_speed_point(self):
+        samples = [
+            TelemetrySample(
+                timestamp_s=index * 0.02,
+                angle_rad=0.02 * index * 0.02,
+                velocity_rad_s=0.02,
+                current_q_a=(0.1 if index % 4 == 0 else (-0.1 if index % 7 == 0 else 0.001)),
+            )
+            for index in range(200)
+        ]
+
+        result = summarize_friction_point(
+            0.02,
+            samples,
+            samples,
+            1.3264,
+            measured_current_floor_a=0.01,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertFalse(result.measured_current_detected)
+        self.assertIn("не подтверждён устойчиво", result.note)
+
     def test_default_experiment_starts_narrow_but_accepts_user_increases(self):
         config = FrictionTestConfig()
         config.validate()
@@ -102,9 +126,10 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertEqual(config.to_dict()["monitor_mask"], FRICTION_MONITOR_MASK)
         self.assertEqual(config.to_dict()["torque_mode"], "voltage")
         self.assertEqual(config.to_dict()["velocity_estimator"]["source"], "angle_slope")
-        self.assertEqual(config.to_dict()["algorithm_schema"], 4)
+        self.assertEqual(config.to_dict()["algorithm_schema"], 5)
         self.assertEqual(config.movement_threshold_rad, 0.001)
         self.assertEqual(config.max_recovery_attempts, 50)
+        self.assertEqual(config.position_bin_width_rad, 0.1)
 
         config.current_trip_limit_a = 1.5
         config.voltage_limit_v = 24.0
@@ -129,6 +154,38 @@ class FrictionAnalysisTests(unittest.TestCase):
 
         self.assertEqual(config.movement_threshold_rad, 0.001)
         self.assertEqual(config.max_recovery_attempts, 50)
+
+    def test_position_map_keeps_measured_and_voltage_torque_separate(self):
+        samples = [
+            TelemetrySample(
+                timestamp_s=index * 0.02,
+                angle_rad=0.02 * index * 0.02,
+                velocity_rad_s=43.0,
+                voltage_q_v=1.2,
+                current_q_a=0.001,
+            )
+            for index in range(200)
+        ]
+
+        observations = summarize_position_observations(
+            0.02,
+            samples,
+            1.3264,
+            0.675,
+            92.6,
+            bin_width_rad=0.02,
+            measured_current_floor_a=0.01,
+        )
+
+        self.assertGreaterEqual(len(observations), 3)
+        self.assertTrue(all(observation.motion_valid for observation in observations))
+        self.assertTrue(
+            all(observation.measured_torque_nm is None for observation in observations)
+        )
+        self.assertTrue(
+            all(observation.voltage_equivalent_torque_nm > 0 for observation in observations)
+        )
+        self.assertTrue(all("диагностическая" in observation.note for observation in observations))
 
 
 class FrictionExperimentTests(unittest.TestCase):
@@ -316,6 +373,11 @@ class FrictionExperimentTests(unittest.TestCase):
         self.assertEqual([action.kind for action in actions], ["target", "checkpoint"])
         self.assertEqual(len(experiment.points), 1)
         self.assertTrue(experiment.points[0].valid)
+        self.assertGreaterEqual(len(experiment.position_observations), 1)
+        checkpoint = experiment.checkpoint_payload(7)
+        self.assertEqual(checkpoint["schema"], 5)
+        self.assertEqual(checkpoint["experiment_id"], 7)
+        self.assertGreaterEqual(len(checkpoint["position_observations"]), 1)
 
     def test_telemetry_recovery_repeats_current_point(self):
         experiment = self.experiment_after_preflight()

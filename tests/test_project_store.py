@@ -16,6 +16,11 @@ class ProjectStoreTests(unittest.TestCase):
             store.initialize(MotorProfile())
             experiment_id = store.create_experiment("identification", {"signal": "step"})
             store.update_experiment(experiment_id, "running", started_at="now")
+            store.update_experiment(
+                experiment_id,
+                "completed",
+                result_json=json.dumps({"position_map": {"observations": [{"position": 1.0}]}}),
+            )
             checkpoint = store.save_checkpoint("identification", {"next_experiment": experiment_id})
             loaded_checkpoint = store.load_checkpoint("identification")
             telemetry_path = store.new_telemetry_path("manual test")
@@ -35,9 +40,15 @@ class ProjectStoreTests(unittest.TestCase):
             self.assertTrue(telemetry_path.name.endswith("_manual_test.csv"))
             self.assertEqual(json.loads(export_path.read_text(encoding="utf-8"))["coulomb"], 0.2)
             self.assertGreater(accepted_id, 0)
+            results = store.experiment_results("identification")
+            self.assertEqual(results[0][0], experiment_id)
+            self.assertEqual(
+                results[0][1]["position_map"]["observations"][0]["position"],
+                1.0,
+            )
 
             with closing(sqlite3.connect(store.db_path)) as connection:
                 result = connection.execute(
                     "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
                 ).fetchone()
-            self.assertEqual(result, ("running",))
+            self.assertEqual(result, ("completed",))
