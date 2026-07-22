@@ -42,6 +42,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.friction_pulse_start.value(), 0.1)
             self.assertEqual(window.friction_pulse_step.value(), 0.1)
             self.assertEqual(window.friction_pulse_max.value(), 0.5)
+            self.assertEqual(window.friction_movement_threshold.value(), 0.001)
+            self.assertEqual(window.friction_recoveries.value(), 50)
             self.assertGreater(window.friction_high_speed.maximum(), 0.05)
             self.assertGreater(window.friction_voltage_limit.maximum(), 12.0)
             self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
@@ -161,6 +163,34 @@ class UiSmokeTests(unittest.TestCase):
                 ["AE0", "AR0.675", "ALC0.42", "ALU24", "ALV0.5"],
             )
             self.assertEqual(velocity_commands[-7:][1], "AC1")
+            window.close()
+
+    def test_friction_limits_are_applied_automatically_and_explained(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window.friction_current_trip.setValue(1.0)
+            window.friction_voltage_limit.setValue(24.0)
+            window.friction_velocity_limit.setValue(0.5)
+            window.friction_angle_min.setValue(-4.0)
+            window.friction_angle_max.setValue(4.0)
+            window.friction_pulse_max.setValue(2.0)
+            config = window._friction_config_from_widgets()
+
+            text = window._friction_confirmation_text(config)
+            window._apply_friction_limits(config)
+
+            self.assertIn("автоматически", text)
+            self.assertIn("2.96 А", text)
+            self.assertIn("не будет искусственно повышен", text)
+            self.assertEqual(window.guard.limits.current_a, 1.0)
+            self.assertEqual(window.guard.limits.voltage_v, 24.0)
+            self.assertEqual(window.guard.limits.velocity_rad_s, 0.5)
+            self.assertEqual(window.guard.limits.angle_min_rad, -4.0)
+            self.assertEqual(window.guard.limits.angle_max_rad, 4.0)
+            self.assertEqual(window.device_limit_spins["current_a"].value(), 1.0)
+            self.assertEqual(window.device_limit_spins["voltage_v"].value(), 24.0)
+            self.assertEqual(window.device_limit_spins["velocity_rad_s"].value(), 0.5)
             window.close()
 
     def test_full_configuration_contains_limits_pid_modes_target_and_monitoring(self):

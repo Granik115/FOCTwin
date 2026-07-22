@@ -72,6 +72,29 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(result.mean_velocity_rad_s, 0.02, places=5)
         self.assertLess(result.velocity_std_rad_s, 0.001)
 
+    def test_point_is_not_accepted_when_measured_current_stays_in_noise(self):
+        samples = [
+            TelemetrySample(
+                timestamp_s=index * 0.02,
+                angle_rad=0.02 * index * 0.02,
+                velocity_rad_s=0.02,
+                current_q_a=0.001,
+            )
+            for index in range(200)
+        ]
+
+        result = summarize_friction_point(
+            0.02,
+            samples,
+            samples,
+            1.3264,
+            measured_current_floor_a=0.01,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertFalse(result.measured_current_detected)
+        self.assertIn("Iq", result.note)
+
     def test_default_experiment_starts_narrow_but_accepts_user_increases(self):
         config = FrictionTestConfig()
         config.validate()
@@ -79,6 +102,9 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertEqual(config.to_dict()["monitor_mask"], FRICTION_MONITOR_MASK)
         self.assertEqual(config.to_dict()["torque_mode"], "voltage")
         self.assertEqual(config.to_dict()["velocity_estimator"]["source"], "angle_slope")
+        self.assertEqual(config.to_dict()["algorithm_schema"], 4)
+        self.assertEqual(config.movement_threshold_rad, 0.001)
+        self.assertEqual(config.max_recovery_attempts, 50)
 
         config.current_trip_limit_a = 1.5
         config.voltage_limit_v = 24.0
@@ -91,6 +117,18 @@ class FrictionAnalysisTests(unittest.TestCase):
         config.current_trip_limit_a = 10.001
         with self.assertRaises(ValueError):
             config.validate()
+
+    def test_old_defaults_migrate_to_new_motion_and_recovery_limits(self):
+        config = FrictionTestConfig.from_dict(
+            {
+                "algorithm_schema": 3,
+                "movement_threshold_rad": 0.002,
+                "max_recovery_attempts": 3,
+            }
+        )
+
+        self.assertEqual(config.movement_threshold_rad, 0.001)
+        self.assertEqual(config.max_recovery_attempts, 50)
 
 
 class FrictionExperimentTests(unittest.TestCase):
@@ -172,7 +210,7 @@ class FrictionExperimentTests(unittest.TestCase):
         self.assertEqual((experiment.phase, actions[0].value), (FrictionPhase.ACTUATOR_PULSE, 0.1))
 
         movement_actions = []
-        for index, angle in enumerate((0.0, 0.0005, 0.001, 0.0025)):
+        for index, angle in enumerate((0.0, 0.0005, 0.001, 0.0025, 0.003)):
             violation, movement_actions = experiment.add_sample(
                 TelemetrySample(
                     timestamp_s=0.55 + index * 0.05,
@@ -193,7 +231,7 @@ class FrictionExperimentTests(unittest.TestCase):
         actions = experiment.tick(1.4)
         self.assertEqual(actions[0].value, -0.1)
 
-        for index, angle in enumerate((0.0025, 0.002, 0.0015, 0.0)):
+        for index, angle in enumerate((0.0025, 0.002, 0.0015, 0.0, -0.0005)):
             violation, movement_actions = experiment.add_sample(
                 TelemetrySample(
                     timestamp_s=1.45 + index * 0.05,
@@ -207,16 +245,16 @@ class FrictionExperimentTests(unittest.TestCase):
             )
             self.assertIsNone(violation)
         self.assertEqual(movement_actions[0].value, 0.0)
-        self.add_stationary_samples(experiment, 1.65, 0.0)
+        self.add_stationary_samples(experiment, 1.75, -0.0005)
 
-        actions = experiment.tick(2.3)
+        actions = experiment.tick(2.4)
 
         self.assertTrue(experiment.actuator_complete)
         self.assertEqual(experiment.phase, FrictionPhase.CONFIGURING_VELOCITY)
         self.assertEqual([action.kind for action in actions], ["configure_velocity", "checkpoint"])
         self.assertAlmostEqual(experiment.working_current_limit_a, 0.1 / 0.675 * 1.2)
 
-    def test_actuator_preflight_refuses_velocity_stage_without_measured_iq(self):
+    def test_actuator_preflight_continues_but_flags_missing_measured_iq(self):
         attempts = self.confirmed_attempts()
         for attempt in attempts:
             attempt.current_detected = False
@@ -228,8 +266,28 @@ class FrictionExperimentTests(unittest.TestCase):
             actuator_attempts=attempts,
         )
 
-        self.assertFalse(experiment.actuator_complete)
-        self.assertEqual(experiment.configuration_mode, "actuator")
+        self.assertTrue(experiment.actuator_complete)
+        self.assertFalse(experiment.measured_current_complete)
+        self.assertEqual(experiment.configuration_mode, "velocity")
+        self.assertFalse(experiment.estimate().valid)
+        self.assertIn("направления +, −", experiment.estimate().note)
+
+    def test_command_limit_is_independent_from_measured_current_trip(self):
+        config = self.config()
+        config.current_trip_limit_a = 0.5
+        attempts = self.confirmed_attempts()
+        for attempt in attempts:
+            attempt.command_voltage_v = 2.0 * attempt.direction
+            attempt.current_detected = attempt.direction < 0
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            actuator_attempts=attempts,
+        )
+
+        self.assertTrue(experiment.actuator_complete)
+        self.assertGreater(experiment.working_current_limit_a, config.current_trip_limit_a)
 
     def test_state_machine_runs_a_point_and_checkpoints_result(self):
         experiment = self.experiment_after_preflight()
@@ -329,3 +387,63 @@ class FrictionExperimentTests(unittest.TestCase):
                 break
 
         self.assertIn("скорость по углу", violation)
+
+    def test_single_angle_dropout_does_not_fake_reverse_movement(self):
+        experiment = FrictionExperiment(
+            self.config(),
+            1.0,
+            phase_resistance_ohm=0.675,
+        )
+        experiment.start(0.0)
+        self.add_stationary_samples(experiment, 0.0, 0.015)
+        experiment.tick(0.5)
+
+        violation, actions = experiment.add_sample(
+            TelemetrySample(
+                timestamp_s=0.55,
+                voltage_q_v=0.1,
+                current_q_a=0.02,
+                angle_rad=0.0,
+            )
+        )
+        self.assertIsNone(violation)
+        self.assertEqual(actions, [])
+        violation, actions = experiment.add_sample(
+            TelemetrySample(
+                timestamp_s=0.60,
+                voltage_q_v=0.1,
+                current_q_a=0.02,
+                angle_rad=0.015,
+            )
+        )
+
+        self.assertIsNone(violation)
+        self.assertEqual(actions, [])
+        self.assertEqual(experiment.rejected_angle_samples, 1)
+        self.assertEqual(experiment.actuator_attempts, [])
+
+    def test_small_sustained_encoder_motion_is_detected(self):
+        config = self.config()
+        config.movement_threshold_rad = 0.001
+        experiment = FrictionExperiment(config, 1.0, phase_resistance_ohm=0.675)
+        experiment.start(0.0)
+        self.add_stationary_samples(experiment, 0.0, 0.0002)
+        experiment.tick(0.5)
+
+        actions = []
+        for index in range(3):
+            violation, actions = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=0.55 + index * 0.05,
+                    voltage_q_v=0.1,
+                    current_q_a=0.001,
+                    angle_rad=0.0011,
+                )
+            )
+            self.assertIsNone(violation)
+            if actions:
+                break
+
+        self.assertEqual([action.kind for action in actions], ["target", "checkpoint"])
+        self.assertTrue(experiment.actuator_attempts[0].movement_detected)
+        self.assertFalse(experiment.actuator_attempts[0].current_detected)

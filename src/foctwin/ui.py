@@ -54,11 +54,13 @@ from foctwin.domain import (
     TorqueMode,
 )
 from foctwin.friction import (
+    FRICTION_DEFAULT_RECOVERY_ATTEMPTS,
     FRICTION_DIRECT_VOLTAGE_SENTINEL,
     FRICTION_MAX_CURRENT_TRIP_A,
     FRICTION_MAX_TARGET_VELOCITY_RAD_S,
     FRICTION_MAX_VELOCITY_LIMIT_RAD_S,
     FRICTION_MAX_VOLTAGE_LIMIT_V,
+    FRICTION_MAX_RECOVERY_ATTEMPTS,
     FRICTION_MIN_CURRENT_TRIP_A,
     FRICTION_MIN_TARGET_VELOCITY_RAD_S,
     FRICTION_MIN_VOLTAGE_LIMIT_V,
@@ -747,7 +749,7 @@ class MainWindow(QMainWindow):
         self.friction_pulse_duration = spin(0.5, 0.1, 5.0, 2, 0.1)
         self.friction_actuator_pause = spin(0.7, 0.2, 10.0, 2, 0.1)
         self.friction_baseline = spin(1.0, 0.5, 10.0, 2, 0.1)
-        self.friction_movement_threshold = spin(0.002, 0.0001, 0.5, 4, 0.001)
+        self.friction_movement_threshold = spin(0.001, 0.0001, 0.5, 4, 0.0005)
         self.friction_current_floor = spin(0.01, 0.001, 10.0, 3, 0.005)
         self.friction_breakaway_margin = spin(1.2, 1.01, 2.0, 2, 0.05)
         self.friction_settle = spin(2.0, 1.0, 30.0, 1, 0.5)
@@ -757,8 +759,8 @@ class MainWindow(QMainWindow):
         self.friction_downsample.setRange(5, 100)
         self.friction_downsample.setValue(20)
         self.friction_recoveries = QSpinBox()
-        self.friction_recoveries.setRange(0, 10)
-        self.friction_recoveries.setValue(3)
+        self.friction_recoveries.setRange(0, FRICTION_MAX_RECOVERY_ATTEMPTS)
+        self.friction_recoveries.setValue(FRICTION_DEFAULT_RECOVERY_ATTEMPTS)
         fields = (
             ("Начальный Uq, В", self.friction_pulse_start),
             ("Шаг Uq, В", self.friction_pulse_step),
@@ -980,9 +982,9 @@ class MainWindow(QMainWindow):
             payload = self.project.load_checkpoint("friction")
             if payload is None:
                 raise ValueError("В проекте нет checkpoint теста трения")
-            if int(payload.get("schema", 0)) != 3:
+            if int(payload.get("schema", 0)) != 4:
                 raise ValueError(
-                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.3; "
+                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.4; "
                     "начните новый двухэтапный тест"
                 )
             points = [
@@ -1049,31 +1051,6 @@ class MainWindow(QMainWindow):
                 "сопротивление фазы",
             )
             return
-        host_limits = self.guard.limits
-        if (
-            config.current_trip_limit_a > host_limits.current_a
-            or config.voltage_limit_v > host_limits.voltage_v
-            or config.pulse_max_voltage_v > host_limits.voltage_v
-            or config.velocity_limit_rad_s > host_limits.velocity_rad_s
-            or config.angle_min_rad < host_limits.angle_min_rad
-            or config.angle_max_rad > host_limits.angle_max_rad
-        ):
-            QMessageBox.warning(
-                self,
-                "Тест трения",
-                "Лимиты опыта не должны быть шире программных аварийных порогов FOCTwin",
-            )
-            return
-        estimated_pulse_current = config.pulse_max_voltage_v / self.profile.phase_resistance_ohm
-        if estimated_pulse_current > config.current_trip_limit_a:
-            QMessageBox.warning(
-                self,
-                "Тест трения",
-                "Максимальный Uq соответствует примерно "
-                f"{estimated_pulse_current:.3g} А по сопротивлению фазы, что выше аварийного "
-                "предела измеренного тока. Уменьшите Uq max или увеличьте оба токовых порога.",
-            )
-            return
         sample = self._last_sample
         if sample is None or self._last_telemetry_received_at is None:
             QMessageBox.warning(self, "Тест трения", "Нет свежей распознанной телеметрии")
@@ -1102,21 +1079,14 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self,
             "Запуск автоматического теста",
-            "FOCTwin временно отключит компенсацию сопротивления фазы, включит torque + Voltage "
-            "и подаст короткие прямые импульсы Uq. После первого движения Uq сразу станет нулём. "
-            "Четыре скоростные точки начнутся только после подтверждённого измеренного Iq. "
-            f"Диапазон импульсов: {config.pulse_start_voltage_v:g}…"
-            f"{config.pulse_max_voltage_v:g} В; аварийный Iq {config.current_trip_limit_a:g} А. "
-            f"Общие пределы: {config.voltage_limit_v:g} В, "
-            f"{config.velocity_limit_rad_s:g} рад/с, координата "
-            f"[{config.angle_min_rad:g}; {config.angle_max_rad:g}].\n\n"
-            "Держите питание доступным для ручного отключения. Запустить?",
+            self._friction_confirmation_text(config),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._apply_friction_limits(config)
         self._save_user_settings()
         manual_mask = self.monitor_mask
         self._friction_restore_mask = manual_mask
@@ -1178,7 +1148,7 @@ class MainWindow(QMainWindow):
         self.friction_start_button.setEnabled(False)
         self.friction_resume_button.setEnabled(False)
         self.friction_stop_button.setEnabled(True)
-        self.friction_status_label.setText("Preflight пройден; применяется конфигурация опыта…")
+        self.friction_status_label.setText("Применяется конфигурация исполнительного preflight…")
         self._log(
             "FRICTION",
             f"{'Продолжение' if resumed else 'Запуск'} опыта #{self._friction_experiment_id}: "
@@ -1186,6 +1156,52 @@ class MainWindow(QMainWindow):
         )
         self._save_friction_checkpoint()
         self._queue_commands(commands, self._begin_friction_motion)
+
+    def _friction_confirmation_text(self, config: FrictionTestConfig) -> str:
+        estimated_pulse_current = config.pulse_max_voltage_v / self.profile.phase_resistance_ohm
+        maximum_velocity_alc = estimated_pulse_current * config.breakaway_margin
+        return (
+            "FOCTwin временно отключит компенсацию сопротивления фазы, включит torque + Voltage "
+            "и подаст короткие прямые импульсы Uq. После подтверждённого движения Uq сразу "
+            "станет нулём.\n\n"
+            "Пределы будут согласованы автоматически:\n"
+            f"• измеренный Iq: ±{config.current_trip_limit_a:g} А;\n"
+            f"• напряжение: ±{config.voltage_limit_v:g} В;\n"
+            f"• скорость по углу: ±{config.velocity_limit_rad_s:g} рад/с;\n"
+            f"• координата: [{config.angle_min_rad:g}; {config.angle_max_rad:g}] рад.\n\n"
+            f"При Uq max={config.pulse_max_voltage_v:g} В расчёт Uq/R даёт до "
+            f"{estimated_pulse_current:.3g} А. Это оценка команды, а не измеренный ток, поэтому "
+            f"аварийный порог Iq не будет искусственно повышен. После найденного страгивания ALC "
+            f"скоростного PI рассчитается автоматически; его возможный максимум "
+            f"{maximum_velocity_alc:.3g} А. Если Iq не наблюдается в каком-либо направлении, "
+            "тест продолжит диагностику, но не разрешит принять недостоверную модель трения.\n\n"
+            f"Допускается до {config.max_recovery_attempts} восстановлений телеметрии. "
+            "Держите питание доступным для ручного отключения. Запустить?"
+        )
+
+    def _apply_friction_limits(self, config: FrictionTestConfig) -> None:
+        self.current_limit.setValue(config.current_trip_limit_a)
+        self.voltage_limit.setValue(config.voltage_limit_v)
+        self.velocity_limit.setValue(config.velocity_limit_rad_s)
+        self.angle_min.setValue(config.angle_min_rad)
+        self.angle_max.setValue(config.angle_max_rad)
+        self.device_limit_spins["current_a"].setValue(config.current_trip_limit_a)
+        self.device_limit_spins["voltage_v"].setValue(config.voltage_limit_v)
+        self.device_limit_spins["velocity_rad_s"].setValue(config.velocity_limit_rad_s)
+        previous = self.guard.limits
+        limits = SafetyLimits(
+            current_a=config.current_trip_limit_a,
+            voltage_v=config.voltage_limit_v,
+            velocity_rad_s=config.velocity_limit_rad_s,
+            angle_min_rad=config.angle_min_rad,
+            angle_max_rad=config.angle_max_rad,
+            trial_timeout_s=previous.trial_timeout_s,
+            telemetry_timeout_s=previous.telemetry_timeout_s,
+        )
+        limits.validate()
+        self.profile.safety = limits
+        self.guard = SafetyGuard(limits)
+        self._sync_device_limits_to_profile()
 
     def _friction_configuration_commands(
         self,
@@ -1340,7 +1356,8 @@ class MainWindow(QMainWindow):
                 if experiment is None:
                     continue
                 self.friction_status_label.setText(
-                    "Страгивание и Iq подтверждены; PWM отключается и настраивается скоростной этап…"
+                    "Страгивание найдено в обе стороны; PWM отключается и автоматически "
+                    "настраивается командный ALC скоростного этапа…"
                 )
                 commands = self._friction_configuration_commands(
                     experiment.config,
@@ -1446,7 +1463,7 @@ class MainWindow(QMainWindow):
             self._friction_telemetry_paths.append(str(recorder_path))
         estimate = experiment.estimate()
         result = {
-            "schema": 3,
+            "schema": 4,
             "status": status,
             "config": experiment.config.to_dict(),
             "motor_parameters": {
@@ -1460,9 +1477,11 @@ class MainWindow(QMainWindow):
                 "current_detection_threshold_a": experiment.current_detection_threshold_a,
                 "working_current_limit_a": experiment.working_current_limit_a,
                 "complete": experiment.actuator_complete,
+                "measured_current_complete": experiment.measured_current_complete,
             },
             "telemetry_paths": self._friction_telemetry_paths,
             "interruption_count": experiment.interruption_count,
+            "rejected_angle_samples": experiment.rejected_angle_samples,
             "error": error or None,
         }
         self._friction_last_estimate = estimate
@@ -2838,7 +2857,7 @@ class MainWindow(QMainWindow):
                 return
 
         ignored = (
-            frozenset({"velocity_rad_s"})
+            frozenset({"velocity_rad_s", "angle_rad"})
             if experiment is not None and self._friction_running()
             else frozenset()
         )

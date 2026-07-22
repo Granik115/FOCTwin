@@ -173,7 +173,7 @@ class SafetyGuard:
                     )
             else:
                 self._soft_limit_counts[signal] = 0
-        if sample.angle_rad is not None:
+        if sample.angle_rad is not None and "angle_rad" not in ignored_signals:
             if sample.angle_rad < self.limits.angle_min_rad:
                 violations.append(
                     SafetyViolation(
