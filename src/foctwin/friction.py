@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable
 
@@ -24,6 +24,12 @@ FRICTION_VELOCITY_WINDOW_S = 0.5
 FRICTION_SOFT_LIMIT_SAMPLES = 3
 FRICTION_SOFT_LIMIT_TOLERANCE = 0.05
 FRICTION_HARD_LIMIT_MULTIPLIER = 2.0
+FRICTION_DEFAULT_RECOVERY_ATTEMPTS = 50
+FRICTION_MAX_RECOVERY_ATTEMPTS = 100
+FRICTION_ANGLE_GLITCH_RATE_RAD_S = 0.5
+FRICTION_ANGLE_GLITCH_MARGIN_RAD = 0.0005
+FRICTION_ANGLE_RESOLUTION_RAD = 0.0001
+FRICTION_MOVEMENT_CONFIRMATION_SAMPLES = 2
 
 
 class FrictionPhase(str, Enum):
@@ -85,14 +91,14 @@ class FrictionTestConfig:
     pulse_duration_s: float = 0.5
     actuator_pause_s: float = 0.7
     baseline_s: float = 1.0
-    movement_threshold_rad: float = 0.002
+    movement_threshold_rad: float = 0.001
     measured_current_floor_a: float = 0.01
     breakaway_margin: float = 1.2
     settle_s: float = 2.0
     measure_s: float = 4.0
     pause_s: float = 1.0
     monitor_downsample: int = 20
-    max_recovery_attempts: int = 3
+    max_recovery_attempts: int = FRICTION_DEFAULT_RECOVERY_ATTEMPTS
 
     @property
     def targets(self) -> tuple[float, ...]:
@@ -190,12 +196,15 @@ class FrictionTestConfig:
             raise ValueError("Нужно не менее 1 с стабилизации, 2 с измерения и 0,5 с паузы")
         if not 5 <= self.monitor_downsample <= 100:
             raise ValueError("Downsample опыта должен быть от 5 до 100")
-        if not 0 <= self.max_recovery_attempts <= 10:
-            raise ValueError("Число автоматических восстановлений должно быть от 0 до 10")
+        if not 0 <= self.max_recovery_attempts <= FRICTION_MAX_RECOVERY_ATTEMPTS:
+            raise ValueError(
+                "Число автоматических восстановлений должно быть от 0 до "
+                f"{FRICTION_MAX_RECOVERY_ATTEMPTS}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["algorithm_schema"] = 3
+        payload["algorithm_schema"] = 4
         payload["targets_rad_s"] = list(self.targets)
         payload["monitor_mask"] = FRICTION_MONITOR_MASK
         payload["torque_mode"] = FRICTION_TORQUE_MODE
@@ -214,7 +223,14 @@ class FrictionTestConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> FrictionTestConfig:
         field_names = cls.__dataclass_fields__.keys()
-        config = cls(**{name: payload[name] for name in field_names if name in payload})
+        values = {name: payload[name] for name in field_names if name in payload}
+        schema = int(payload.get("algorithm_schema", 0) or 0)
+        if schema < 4:
+            if values.get("max_recovery_attempts") == 3:
+                values["max_recovery_attempts"] = FRICTION_DEFAULT_RECOVERY_ATTEMPTS
+            if values.get("movement_threshold_rad") == 0.002:
+                values["movement_threshold_rad"] = 0.001
+        config = cls(**values)
         config.validate()
         return config
 
@@ -234,6 +250,7 @@ class FrictionPointResult:
     current_source: str = "measured_iq"
     mean_measured_current_q_a: float | None = None
     voltage_saturation_fraction: float | None = None
+    measured_current_detected: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -321,6 +338,7 @@ def summarize_friction_point(
     torque_constant_nm_per_a: float,
     *,
     voltage_limit_v: float | None = None,
+    measured_current_floor_a: float | None = None,
 ) -> FrictionPointResult:
     steady_samples = list(steady_samples)
     transient_samples = list(transient_samples)
@@ -361,10 +379,16 @@ def summarize_friction_point(
             "Недостаточно устойчивых отсчётов",
             current_source,
             float(np.mean(measured_currents)) if measured_currents.size else None,
+            measured_current_detected=False,
         )
 
     mean_current = float(np.mean(currents))
     current_std = float(np.std(currents))
+    measured_current_detected = True
+    if measured_current_floor_a is not None:
+        measured_current_detected = bool(
+            np.count_nonzero(np.abs(measured_currents) >= measured_current_floor_a) >= 3
+        )
     direction_ok = mean_velocity * target_velocity_rad_s > 0
     tracking_tolerance = max(0.005, abs(target_velocity_rad_s) * 0.3)
     tracking_error = abs(mean_velocity - target_velocity_rad_s)
@@ -380,7 +404,12 @@ def summarize_friction_point(
     else:
         breakaway = abs(mean_current) * torque_constant_nm_per_a
 
-    valid = direction_ok and tracking_error <= tracking_tolerance and stable
+    valid = (
+        direction_ok
+        and tracking_error <= tracking_tolerance
+        and stable
+        and measured_current_detected
+    )
     problems: list[str] = []
     if not direction_ok:
         problems.append("направление не совпало с целью")
@@ -388,6 +417,8 @@ def summarize_friction_point(
         problems.append("скорость не достигнута")
     if not stable:
         problems.append("скорость неустойчива")
+    if not measured_current_detected:
+        problems.append("измеренный Iq не отличается от шума")
     saturation_fraction: float | None = None
     if voltage_limit_v is not None and voltage_limit_v > 0:
         voltages = np.asarray(
@@ -416,6 +447,7 @@ def summarize_friction_point(
             float(np.mean(measured_currents)) if measured_currents.size else None
         ),
         voltage_saturation_fraction=saturation_fraction,
+        measured_current_detected=measured_current_detected,
     )
 
 
@@ -527,6 +559,12 @@ class FrictionExperiment:
         self.soft_limit_counts: dict[str, int] = {}
         self._repeat_velocity_point = False
         self._recovery_mode = "actuator"
+        self.rejected_angle_samples = 0
+        self._trusted_angle_sample: TelemetrySample | None = None
+        self._pending_angle_sample: TelemetrySample | None = None
+        self._trusted_fast_angle_step: float | None = None
+        self._movement_candidate = 0
+        self._movement_candidate_samples = 0
 
     @property
     def active(self) -> bool:
@@ -552,6 +590,11 @@ class FrictionExperiment:
 
     @property
     def actuator_complete(self) -> bool:
+        found = self.breakaway_results
+        return all(direction in found for direction in (1, -1))
+
+    @property
+    def measured_current_complete(self) -> bool:
         found = self.breakaway_results
         return all(direction in found and found[direction].current_detected for direction in (1, -1))
 
@@ -582,6 +625,7 @@ class FrictionExperiment:
             raise RuntimeError("Friction experiment has already been started")
         self.phase_started_s = now_s
         self.phase_samples.clear()
+        self._reset_angle_filter()
         if self.actuator_complete:
             self.phase = FrictionPhase.ZERO
         else:
@@ -596,6 +640,7 @@ class FrictionExperiment:
         event_time_s = sample.timestamp_s if now_s is None else now_s
         if self.phase in {FrictionPhase.IDLE, FrictionPhase.RECOVERING}:
             return None, []
+        sample = self._filter_angle_sample(sample)
         violation = self._violation(sample)
         if violation:
             return violation, []
@@ -640,21 +685,9 @@ class FrictionExperiment:
                 return []
             found = self.breakaway_results
             if all(direction in found for direction in (1, -1)):
-                missing_current = [
-                    "+" if direction > 0 else "−"
-                    for direction in (1, -1)
-                    if not found[direction].current_detected
-                ]
-                if missing_current:
-                    return self.abort(
-                        "Страгивание найдено, но измеренный Iq не подтвердился для направления "
-                        + ", ".join(missing_current)
-                    )
                 working_limit = self.working_current_limit_a
-                if working_limit is None or working_limit > self.config.current_trip_limit_a:
-                    return self.abort(
-                        "Найденное страгивание требует тока выше аварийного предела опыта"
-                    )
+                if working_limit is None:
+                    return self.abort("Не удалось рассчитать командный предел скоростного этапа")
                 self.phase = FrictionPhase.CONFIGURING_VELOCITY
                 self.phase_started_s = now_s
                 return [FrictionAction("configure_velocity"), FrictionAction("checkpoint")]
@@ -679,6 +712,7 @@ class FrictionExperiment:
                     self.transient_samples,
                     self.torque_constant_nm_per_a,
                     voltage_limit_v=self.config.voltage_limit_v,
+                    measured_current_floor_a=self.current_detection_threshold_a,
                 )
             )
             self.phase = FrictionPhase.PAUSE
@@ -712,6 +746,8 @@ class FrictionExperiment:
         self.transient_samples.clear()
         self.steady_samples.clear()
         self.phase_samples.clear()
+        self.angle_window.clear()
+        self._reset_angle_filter()
         return [FrictionAction("safe_stop")]
 
     def resume_after_recovery(self, now_s: float) -> list[FrictionAction]:
@@ -719,6 +755,8 @@ class FrictionExperiment:
             return []
         self.phase_started_s = now_s
         self.phase_samples.clear()
+        self.angle_window.clear()
+        self._reset_angle_filter()
         if self._recovery_mode == "velocity":
             self.phase = FrictionPhase.ZERO
         else:
@@ -733,17 +771,33 @@ class FrictionExperiment:
     def estimate(self) -> FrictionEstimate:
         estimate = estimate_friction(self.points)
         found = self.breakaway_results
-        if all(direction in found for direction in (1, -1)):
+        positive = None
+        negative = None
+        if 1 in found and found[1].current_detected:
             positive = found[1].mean_abs_measured_current_a * self.torque_constant_nm_per_a
-            negative = found[-1].mean_abs_measured_current_a * self.torque_constant_nm_per_a
             estimate.breakaway_positive_nm = positive
+        if -1 in found and found[-1].current_detected:
+            negative = found[-1].mean_abs_measured_current_a * self.torque_constant_nm_per_a
             estimate.breakaway_negative_nm = negative
+        if positive is not None and negative is not None:
             estimate.breakaway_friction_nm = (positive + negative) / 2.0
+        if self.actuator_complete and not self.measured_current_complete:
+            missing = [
+                "+" if direction > 0 else "−"
+                for direction in (1, -1)
+                if not found[direction].current_detected
+            ]
+            estimate.valid = False
+            estimate.note = (
+                "Страгивание найдено, но измеренный Iq не подтверждён для направления "
+                + ", ".join(missing)
+                + "; модель трения принимать нельзя"
+            )
         return estimate
 
     def checkpoint_payload(self, experiment_id: int | None) -> dict[str, Any]:
         return {
-            "schema": 3,
+            "schema": 4,
             "experiment_id": experiment_id,
             "phase": self.phase.value,
             "config": self.config.to_dict(),
@@ -754,22 +808,12 @@ class FrictionExperiment:
             "actuator_attempts": [attempt.to_dict() for attempt in self.actuator_attempts],
             "completed_points": [point.to_dict() for point in self.points],
             "interruption_count": self.interruption_count,
+            "rejected_angle_samples": self.rejected_angle_samples,
             "abort_reason": self.abort_reason,
         }
 
     def _start_next_pulse(self, now_s: float) -> list[FrictionAction]:
         found = self.breakaway_results
-        if all(direction in found for direction in (1, -1)):
-            missing_current = [
-                "+" if direction > 0 else "−"
-                for direction in (1, -1)
-                if not found[direction].current_detected
-            ]
-            if missing_current:
-                return self.abort(
-                    "Страгивание найдено, но измеренный Iq не подтвердился для направления "
-                    + ", ".join(missing_current)
-                )
         attempted = {
             (attempt.direction, round(abs(attempt.command_voltage_v), 12))
             for attempt in self.actuator_attempts
@@ -783,6 +827,8 @@ class FrictionExperiment:
                 self.phase_started_s = now_s
                 self.phase_samples.clear()
                 self.pulse_start_angle = self._latest_angle()
+                self._movement_candidate = 0
+                self._movement_candidate_samples = 0
                 if self.pulse_start_angle is None:
                     return self.abort("Нет координаты перед импульсом Uq")
                 return [FrictionAction("target", direction * voltage)]
@@ -819,7 +865,8 @@ class FrictionExperiment:
             if currents.size
             else 0
         )
-        current_detected = above_threshold >= 3
+        required_samples = 3 if currents.size >= 3 else 2
+        current_detected = currents.size >= 2 and above_threshold >= required_samples
         self.actuator_attempts.append(
             ActuatorPulseResult(
                 direction=1 if target > 0 else -1,
@@ -867,11 +914,90 @@ class FrictionExperiment:
         ):
             return 0
         signed_delta = math.copysign(1.0, target) * (sample.angle_rad - self.pulse_start_angle)
-        if signed_delta >= self.config.movement_threshold_rad:
-            return 1
-        if signed_delta <= -self.config.movement_threshold_rad:
-            return -1
+        detected = 0
+        movement_threshold = max(
+            self.config.movement_threshold_rad * 0.5,
+            self.config.movement_threshold_rad - FRICTION_ANGLE_RESOLUTION_RAD,
+        )
+        if signed_delta + 1e-12 >= movement_threshold:
+            detected = 1
+        elif signed_delta - 1e-12 <= -movement_threshold:
+            detected = -1
+        if detected == 0:
+            self._movement_candidate = 0
+            self._movement_candidate_samples = 0
+            return 0
+        if detected != self._movement_candidate:
+            self._movement_candidate = detected
+            self._movement_candidate_samples = 1
+        else:
+            self._movement_candidate_samples += 1
+        if self._movement_candidate_samples >= FRICTION_MOVEMENT_CONFIRMATION_SAMPLES:
+            return detected
         return 0
+
+    def _reset_angle_filter(self) -> None:
+        self._trusted_angle_sample = None
+        self._pending_angle_sample = None
+        self._trusted_fast_angle_step = None
+
+    def _angle_jump_limit(self, previous: TelemetrySample, current: TelemetrySample) -> float:
+        elapsed = min(0.02, max(0.0, current.timestamp_s - previous.timestamp_s))
+        return max(
+            self.config.movement_threshold_rad * 3.0,
+            FRICTION_ANGLE_GLITCH_RATE_RAD_S * elapsed + FRICTION_ANGLE_GLITCH_MARGIN_RAD,
+        )
+
+    def _filter_angle_sample(self, sample: TelemetrySample) -> TelemetrySample:
+        if sample.angle_rad is None or not math.isfinite(sample.angle_rad):
+            return sample
+        trusted = self._trusted_angle_sample
+        if trusted is None or trusted.angle_rad is None:
+            self._trusted_angle_sample = sample
+            self._pending_angle_sample = None
+            return sample
+        if abs(sample.angle_rad - trusted.angle_rad) <= self._angle_jump_limit(trusted, sample):
+            if self._pending_angle_sample is not None:
+                self.rejected_angle_samples += 1
+            self._pending_angle_sample = None
+            self._trusted_fast_angle_step = None
+            self._trusted_angle_sample = sample
+            return sample
+        current_step_from_trusted = sample.angle_rad - trusted.angle_rad
+        fast_step = self._trusted_fast_angle_step
+        if (
+            fast_step is not None
+            and fast_step * current_step_from_trusted > 0
+            and 0.25 <= abs(current_step_from_trusted / fast_step) <= 4.0
+        ):
+            self._pending_angle_sample = None
+            self._trusted_fast_angle_step = current_step_from_trusted
+            self._trusted_angle_sample = sample
+            return sample
+        pending = self._pending_angle_sample
+        if (
+            pending is not None
+            and pending.angle_rad is not None
+        ):
+            pending_step = pending.angle_rad - trusted.angle_rad
+            current_step = sample.angle_rad - pending.angle_rad
+            steps_form_motion = (
+                pending_step * current_step > 0
+                and 0.25 <= abs(current_step / pending_step) <= 4.0
+            )
+            if (
+                abs(current_step) <= self._angle_jump_limit(pending, sample)
+                or steps_form_motion
+            ):
+                self._pending_angle_sample = None
+                self._trusted_fast_angle_step = current_step if steps_form_motion else None
+                self._trusted_angle_sample = sample
+                return sample
+        if pending is not None:
+            self.rejected_angle_samples += 1
+        self._trusted_fast_angle_step = None
+        self._pending_angle_sample = sample
+        return replace(sample, angle_rad=None)
 
     def _start_velocity_point(self, now_s: float, *, increment: bool) -> list[FrictionAction]:
         if increment:

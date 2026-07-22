@@ -51,3 +51,12 @@ class DomainTests(unittest.TestCase):
             guard.check(sample, ignored_signals=frozenset({"velocity_rad_s"})),
             [],
         )
+
+    def test_safety_guard_can_defer_angle_to_experiment_filter(self):
+        guard = SafetyGuard(SafetyLimits(angle_min_rad=-1.0, angle_max_rad=1.0))
+        sample = TelemetrySample(timestamp_s=0, angle_rad=1.5708)
+
+        self.assertEqual(
+            guard.check(sample, ignored_signals=frozenset({"angle_rad"})),
+            [],
+        )

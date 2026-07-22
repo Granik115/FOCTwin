@@ -2,10 +2,11 @@
 
 ## What FOCTwin can enforce
 
-- Refuse a test whose declared envelope is outside the active host safety limits.
+- Synchronize the test, host and SimpleFOC envelopes after explicit confirmation.
 - Disable PWM before changing control modes or phase-resistance compensation.
 - Stop a direct-Uq pulse as soon as angle movement crosses the configured threshold.
-- Require measured Iq in multiple samples before starting friction identification.
+- Keep command ALC separate from the measured-Iq emergency threshold and reject a friction point
+  whose measured current remains inside the noise floor.
 - Derive experiment speed from angle instead of trusting impossible firmware velocity spikes.
 - Stop immediately on travel violation or a twofold current, voltage or angle-speed excursion.
 - Require three consecutive samples for a smaller working-limit excess.
@@ -25,27 +26,29 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Two-stage friction experiment (0.3.3)
+## Two-stage friction experiment (0.3.4)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
 With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from
 ±0.1 V to ±0.5 V and last 0.5 s at most. The user-approved maximum Uq and measured-current trip
-limit must fit inside the active host envelope, and the resistance-based current estimate for the
-largest pulse must not exceed the current trip.
+limit are shown before start. FOCTwin automatically synchronizes the active host and SimpleFOC
+limits. The resistance-based current estimate is displayed as a command estimate and does not
+silently widen the independent measured-current trip.
 
-The first movement in each direction immediately commands Uq=0. Wrong-direction motion aborts
-the experiment. The velocity stage is blocked unless both directions moved and measured Iq was
-above its noise-derived threshold in at least three samples. No voltage-derived current is
-accepted as a substitute.
+Confirmed movement in each direction immediately commands Uq=0. Wrong-direction motion aborts
+the experiment. Movement unlocks the diagnostic velocity stage independently of current-sensor
+quality; any velocity point whose measured Iq stays inside the noise floor is invalid and cannot
+be accepted. No voltage-derived current is accepted as a substitute for the final torque.
 
 Before velocity control starts, PWM is disabled and the configured phase resistance is restored.
-The velocity-controller current limit is set slightly above the larger breakaway-equivalent
-current but remains below the experiment trip limit. Final torque and friction coefficients use
-measured Iq only.
+The velocity-controller command limit is set slightly above the larger breakaway-equivalent
+current. The measured-current trip remains independent and can stop the drive at a lower value.
+Final torque and friction coefficients use measured Iq only.
 
 During this experiment, the firmware velocity field is diagnostic. Safety speed comes from the
 rolling angle slope. This keeps impossible isolated values such as +43 rad/s from stopping a
-stationary shaft while preserving actual speed and travel protection.
+stationary shaft while preserving actual speed and travel protection. The angle path also rejects
+an isolated zero/dropout or jump that returns on the next sample; sustained motion is retained.
 
 ## Failure and restoration policy
 

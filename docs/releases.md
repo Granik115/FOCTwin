@@ -19,6 +19,16 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.4
+
+- Filtered isolated encoder zeroes and jumps without masking sustained shaft movement.
+- Lowered the default confirmed movement threshold to 0.001 rad and require two matching samples.
+- Separated the automatically calculated velocity-controller ALC from the measured-Iq trip.
+- Automatically synchronize experiment, FOCTwin and SimpleFOC limits after one confirmation.
+- Continue diagnostic speed points after movement in both directions while invalidating any point
+  whose measured Iq remains inside the noise floor.
+- Increased the default telemetry recovery allowance from 3 to 50 for board-reset workflows.
+
 ## 0.3.3
 
 - Replaced the invalid immediate velocity test with a two-stage actuator/friction workflow.
