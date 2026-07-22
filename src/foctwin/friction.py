@@ -30,6 +30,11 @@ FRICTION_ANGLE_GLITCH_RATE_RAD_S = 0.5
 FRICTION_ANGLE_GLITCH_MARGIN_RAD = 0.0005
 FRICTION_ANGLE_RESOLUTION_RAD = 0.0001
 FRICTION_MOVEMENT_CONFIRMATION_SAMPLES = 2
+FRICTION_MIN_POSITION_BIN_WIDTH_RAD = 0.01
+FRICTION_MAX_POSITION_BIN_WIDTH_RAD = 10.0
+FRICTION_MIN_POSITION_BIN_SAMPLES = 8
+FRICTION_CURRENT_CONFIRMATION_FRACTION = 0.6
+FRICTION_CURRENT_DIRECTION_FRACTION = 0.8
 
 
 class FrictionPhase(str, Enum):
@@ -66,6 +71,8 @@ class ActuatorPulseResult:
     current_detected: bool
     sample_count: int
     note: str
+    start_angle_rad: float | None = None
+    end_angle_rad: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,6 +106,7 @@ class FrictionTestConfig:
     pause_s: float = 1.0
     monitor_downsample: int = 20
     max_recovery_attempts: int = FRICTION_DEFAULT_RECOVERY_ATTEMPTS
+    position_bin_width_rad: float = 0.1
 
     @property
     def targets(self) -> tuple[float, ...]:
@@ -201,10 +209,20 @@ class FrictionTestConfig:
                 "Число автоматических восстановлений должно быть от 0 до "
                 f"{FRICTION_MAX_RECOVERY_ATTEMPTS}"
             )
+        if not (
+            FRICTION_MIN_POSITION_BIN_WIDTH_RAD
+            <= self.position_bin_width_rad
+            <= FRICTION_MAX_POSITION_BIN_WIDTH_RAD
+        ):
+            raise ValueError(
+                "Ширина интервала карты должна быть от "
+                f"{FRICTION_MIN_POSITION_BIN_WIDTH_RAD:g} до "
+                f"{FRICTION_MAX_POSITION_BIN_WIDTH_RAD:g} рад"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["algorithm_schema"] = 4
+        payload["algorithm_schema"] = 5
         payload["targets_rad_s"] = list(self.targets)
         payload["monitor_mask"] = FRICTION_MONITOR_MASK
         payload["torque_mode"] = FRICTION_TORQUE_MODE
@@ -251,12 +269,42 @@ class FrictionPointResult:
     mean_measured_current_q_a: float | None = None
     voltage_saturation_fraction: float | None = None
     measured_current_detected: bool = True
+    start_angle_rad: float | None = None
+    end_angle_rad: float | None = None
+    mean_angle_rad: float | None = None
+    mean_voltage_q_v: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> FrictionPointResult:
+        field_names = cls.__dataclass_fields__.keys()
+        return cls(**{name: payload[name] for name in field_names if name in payload})
+
+
+@dataclass(slots=True)
+class PositionFrictionObservation:
+    position_center_rad: float
+    position_min_rad: float
+    position_max_rad: float
+    target_velocity_rad_s: float
+    mean_velocity_rad_s: float
+    mean_voltage_q_v: float
+    mean_measured_current_q_a: float
+    measured_torque_nm: float | None
+    voltage_equivalent_current_a: float
+    voltage_equivalent_torque_nm: float
+    sample_count: int
+    motion_valid: bool
+    measured_current_detected: bool
+    note: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PositionFrictionObservation:
         field_names = cls.__dataclass_fields__.keys()
         return cls(**{name: payload[name] for name in field_names if name in payload})
 
@@ -288,6 +336,22 @@ def _trimmed(values: Iterable[float], fraction: float = 0.1) -> np.ndarray:
     ordered = np.sort(array)
     trim = min(int(ordered.size * fraction), max(0, (ordered.size - 3) // 2))
     return ordered[trim : ordered.size - trim] if trim else ordered
+
+
+def _measured_current_is_confirmed(
+    currents: np.ndarray,
+    floor_a: float,
+    target_direction: float,
+) -> bool:
+    if currents.size < 3:
+        return False
+    above_floor = np.abs(currents) >= floor_a
+    required = max(3, math.ceil(currents.size * FRICTION_CURRENT_CONFIRMATION_FRACTION))
+    count = int(np.count_nonzero(above_floor))
+    if count < required:
+        return False
+    aligned = currents[above_floor] * math.copysign(1.0, target_direction) >= floor_a
+    return bool(np.count_nonzero(aligned) >= math.ceil(count * FRICTION_CURRENT_DIRECTION_FRACTION))
 
 
 def _angle_slope_metrics(
@@ -363,6 +427,12 @@ def summarize_friction_point(
     measured_currents = _trimmed(
         sample.current_q_a for sample in usable if sample.current_q_a is not None
     )
+    angles = _trimmed(
+        sample.angle_rad for sample in usable if sample.angle_rad is not None
+    )
+    voltages_q = _trimmed(
+        sample.voltage_q_v for sample in usable if sample.voltage_q_v is not None
+    )
     current_source = "measured_iq"
     currents = measured_currents
     if velocities.size < 10 or currents.size < 10:
@@ -386,8 +456,10 @@ def summarize_friction_point(
     current_std = float(np.std(currents))
     measured_current_detected = True
     if measured_current_floor_a is not None:
-        measured_current_detected = bool(
-            np.count_nonzero(np.abs(measured_currents) >= measured_current_floor_a) >= 3
+        measured_current_detected = _measured_current_is_confirmed(
+            measured_currents,
+            measured_current_floor_a,
+            target_velocity_rad_s,
         )
     direction_ok = mean_velocity * target_velocity_rad_s > 0
     tracking_tolerance = max(0.005, abs(target_velocity_rad_s) * 0.3)
@@ -418,7 +490,7 @@ def summarize_friction_point(
     if not stable:
         problems.append("скорость неустойчива")
     if not measured_current_detected:
-        problems.append("измеренный Iq не отличается от шума")
+        problems.append("измеренный Iq не подтверждён устойчиво или имеет неверный знак")
     saturation_fraction: float | None = None
     if voltage_limit_v is not None and voltage_limit_v > 0:
         voltages = np.asarray(
@@ -448,7 +520,136 @@ def summarize_friction_point(
         ),
         voltage_saturation_fraction=saturation_fraction,
         measured_current_detected=measured_current_detected,
+        start_angle_rad=(
+            next(
+                (
+                    float(sample.angle_rad)
+                    for sample in usable
+                    if sample.angle_rad is not None and math.isfinite(sample.angle_rad)
+                ),
+                None,
+            )
+        ),
+        end_angle_rad=(
+            next(
+                (
+                    float(sample.angle_rad)
+                    for sample in reversed(usable)
+                    if sample.angle_rad is not None and math.isfinite(sample.angle_rad)
+                ),
+                None,
+            )
+        ),
+        mean_angle_rad=float(np.mean(angles)) if angles.size else None,
+        mean_voltage_q_v=float(np.mean(voltages_q)) if voltages_q.size else None,
     )
+
+
+def summarize_position_observations(
+    target_velocity_rad_s: float,
+    samples: Iterable[TelemetrySample],
+    torque_constant_nm_per_a: float,
+    phase_resistance_ohm: float,
+    back_emf_v_per_krpm: float,
+    *,
+    bin_width_rad: float,
+    measured_current_floor_a: float,
+) -> list[PositionFrictionObservation]:
+    """Preserve local friction diagnostics instead of collapsing a whole sweep to one row.
+
+    Measured-Iq torque remains the only physically accepted torque.  The voltage-derived value
+    is retained as an explicitly diagnostic estimate because the present hardware current signal
+    has repeatedly vanished in one direction or at particular shaft positions.
+    """
+
+    if phase_resistance_ohm <= 0:
+        raise ValueError("Для позиционной карты нужно положительное сопротивление фазы")
+    if not (
+        FRICTION_MIN_POSITION_BIN_WIDTH_RAD
+        <= bin_width_rad
+        <= FRICTION_MAX_POSITION_BIN_WIDTH_RAD
+    ):
+        raise ValueError("Недопустимая ширина интервала позиционной карты")
+    usable = [
+        sample
+        for sample in samples
+        if sample.angle_rad is not None
+        and sample.voltage_q_v is not None
+        and sample.current_q_a is not None
+        and math.isfinite(sample.timestamp_s)
+        and math.isfinite(sample.angle_rad)
+        and math.isfinite(sample.voltage_q_v)
+        and math.isfinite(sample.current_q_a)
+    ]
+    grouped: dict[int, list[TelemetrySample]] = {}
+    for sample in usable:
+        assert sample.angle_rad is not None
+        index = math.floor(sample.angle_rad / bin_width_rad)
+        grouped.setdefault(index, []).append(sample)
+
+    back_emf_v_per_rad_s = back_emf_v_per_krpm / (1000.0 * 2.0 * math.pi / 60.0)
+    observations: list[PositionFrictionObservation] = []
+    for index in sorted(grouped):
+        group = sorted(grouped[index], key=lambda sample: sample.timestamp_s)
+        unique_group: list[TelemetrySample] = []
+        previous_timestamp: float | None = None
+        for sample in group:
+            if previous_timestamp is None or sample.timestamp_s > previous_timestamp:
+                unique_group.append(sample)
+                previous_timestamp = sample.timestamp_s
+        if len(unique_group) < FRICTION_MIN_POSITION_BIN_SAMPLES:
+            continue
+        timestamps = np.asarray([sample.timestamp_s for sample in unique_group], dtype=float)
+        angles = np.asarray([float(sample.angle_rad) for sample in unique_group], dtype=float)
+        if timestamps[-1] - timestamps[0] < 0.05:
+            continue
+        mean_velocity = float(np.polyfit(timestamps - timestamps[0], angles, 1)[0])
+        voltages = _trimmed(float(sample.voltage_q_v) for sample in unique_group)
+        currents = _trimmed(float(sample.current_q_a) for sample in unique_group)
+        mean_voltage = float(np.mean(voltages))
+        mean_current = float(np.mean(currents))
+        current_detected = _measured_current_is_confirmed(
+            currents,
+            measured_current_floor_a,
+            target_velocity_rad_s,
+        )
+        tracking_tolerance = max(0.01, abs(target_velocity_rad_s) * 0.35)
+        motion_valid = bool(
+            mean_velocity * target_velocity_rad_s > 0
+            and abs(mean_velocity - target_velocity_rad_s) <= tracking_tolerance
+        )
+        equivalent_current = (
+            mean_voltage - back_emf_v_per_rad_s * mean_velocity
+        ) / phase_resistance_ohm
+        problems: list[str] = []
+        if not motion_valid:
+            problems.append("локальная скорость не достигнута")
+        if not current_detected:
+            problems.append("Iq не подтверждён; оценка по Uq только диагностическая")
+        observations.append(
+            PositionFrictionObservation(
+                position_center_rad=(index + 0.5) * bin_width_rad,
+                position_min_rad=float(np.min(angles)),
+                position_max_rad=float(np.max(angles)),
+                target_velocity_rad_s=target_velocity_rad_s,
+                mean_velocity_rad_s=mean_velocity,
+                mean_voltage_q_v=mean_voltage,
+                mean_measured_current_q_a=mean_current,
+                measured_torque_nm=(
+                    abs(mean_current) * torque_constant_nm_per_a
+                    if current_detected
+                    else None
+                ),
+                voltage_equivalent_current_a=equivalent_current,
+                voltage_equivalent_torque_nm=abs(equivalent_current)
+                * torque_constant_nm_per_a,
+                sample_count=len(unique_group),
+                motion_valid=motion_valid,
+                measured_current_detected=current_detected,
+                note="ОК" if not problems else "; ".join(problems),
+            )
+        )
+    return observations
 
 
 def estimate_friction(points: Iterable[FrictionPointResult]) -> FrictionEstimate:
@@ -534,7 +735,9 @@ class FrictionExperiment:
         completed_points: Iterable[FrictionPointResult] = (),
         *,
         phase_resistance_ohm: float,
+        back_emf_v_per_krpm: float = 0.0,
         actuator_attempts: Iterable[ActuatorPulseResult] = (),
+        position_observations: Iterable[PositionFrictionObservation] = (),
     ) -> None:
         config.validate()
         if phase_resistance_ohm <= 0:
@@ -542,8 +745,10 @@ class FrictionExperiment:
         self.config = config
         self.torque_constant_nm_per_a = torque_constant_nm_per_a
         self.phase_resistance_ohm = phase_resistance_ohm
+        self.back_emf_v_per_krpm = back_emf_v_per_krpm
         self.points = list(completed_points)
         self.actuator_attempts = list(actuator_attempts)
+        self.position_observations = list(position_observations)
         self.phase = FrictionPhase.IDLE
         self.phase_started_s = 0.0
         self.point_index = len(self.points) - 1
@@ -705,13 +910,23 @@ class FrictionExperiment:
             target = self.current_target
             if target is None:
                 return self.abort("Внутренняя ошибка: потеряна текущая скорость")
-            self.points.append(
-                summarize_friction_point(
+            point = summarize_friction_point(
+                target,
+                self.steady_samples,
+                self.transient_samples,
+                self.torque_constant_nm_per_a,
+                voltage_limit_v=self.config.voltage_limit_v,
+                measured_current_floor_a=self.current_detection_threshold_a,
+            )
+            self.points.append(point)
+            self.position_observations.extend(
+                summarize_position_observations(
                     target,
                     self.steady_samples,
-                    self.transient_samples,
                     self.torque_constant_nm_per_a,
-                    voltage_limit_v=self.config.voltage_limit_v,
+                    self.phase_resistance_ohm,
+                    self.back_emf_v_per_krpm,
+                    bin_width_rad=self.config.position_bin_width_rad,
                     measured_current_floor_a=self.current_detection_threshold_a,
                 )
             )
@@ -797,16 +1012,20 @@ class FrictionExperiment:
 
     def checkpoint_payload(self, experiment_id: int | None) -> dict[str, Any]:
         return {
-            "schema": 4,
+            "schema": 5,
             "experiment_id": experiment_id,
             "phase": self.phase.value,
             "config": self.config.to_dict(),
             "motor_parameters": {
                 "torque_constant_nm_per_a": self.torque_constant_nm_per_a,
                 "phase_resistance_ohm": self.phase_resistance_ohm,
+                "back_emf_v_per_krpm": self.back_emf_v_per_krpm,
             },
             "actuator_attempts": [attempt.to_dict() for attempt in self.actuator_attempts],
             "completed_points": [point.to_dict() for point in self.points],
+            "position_observations": [
+                observation.to_dict() for observation in self.position_observations
+            ],
             "interruption_count": self.interruption_count,
             "rejected_angle_samples": self.rejected_angle_samples,
             "abort_reason": self.abort_reason,
@@ -886,6 +1105,8 @@ class FrictionExperiment:
                     if current_detected
                     else f"{note}; измеренный Iq не подтверждён"
                 ),
+                start_angle_rad=self.pulse_start_angle,
+                end_angle_rad=latest,
             )
         )
 

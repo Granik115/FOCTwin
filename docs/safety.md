@@ -26,7 +26,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Two-stage friction experiment (0.3.4)
+## Two-stage friction experiment (0.3.5)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
 With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from
@@ -44,6 +44,12 @@ Before velocity control starts, PWM is disabled and the configured phase resista
 The velocity-controller command limit is set slightly above the larger breakaway-equivalent
 current. The measured-current trip remains independent and can stop the drive at a lower value.
 Final torque and friction coefficients use measured Iq only.
+
+Measured current must be present in most samples and predominantly have the sign required by the
+commanded direction. Sparse bursts or alternating-sign current no longer validate a point. Each
+velocity sweep is also divided into angle bins. Local Uq, speed and a resistance/back-EMF estimate
+are retained for diagnosis, but that voltage-equivalent torque cannot be accepted as measured
+friction.
 
 During this experiment, the firmware velocity field is diagnostic. Safety speed comes from the
 rolling angle slope. This keeps impossible isolated values such as +43 rad/s from stopping a

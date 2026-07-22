@@ -116,6 +116,34 @@ class ProjectStore:
                 f"UPDATE experiments SET {', '.join(assignments)} WHERE id = ?", values
             )
 
+    def experiment_results(
+        self,
+        kind: str,
+        *,
+        status: str = "completed",
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return durable result payloads for building cumulative identification maps."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, result_json
+                FROM experiments
+                WHERE kind = ? AND status = ? AND result_json IS NOT NULL
+                ORDER BY id
+                """,
+                (kind, status),
+            ).fetchall()
+        results: list[tuple[int, dict[str, Any]]] = []
+        for experiment_id, result_json in rows:
+            try:
+                payload = json.loads(result_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                results.append((int(experiment_id), payload))
+        return results
+
     def save_profile(self, profile: MotorProfile) -> Path:
         safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in profile.name)
         path = self.profile_dir / f"{safe_name}.json"

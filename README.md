@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.4 contains:
+Version 0.3.5 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -41,6 +41,10 @@ Version 0.3.4 contains:
   points instead of hiding the rest of the experiment;
 - a gated four-point velocity experiment (`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`) that uses
   measured Iq for directional Coulomb, viscous and breakaway estimates;
+- a cumulative position map that keeps each breakaway coordinate and divides velocity sweeps into
+  configurable angle bins, storing measured-Iq torque separately from a diagnostic Uq estimate;
+- sustained-current validation that rejects sparse or wrong-sign Iq bursts instead of accepting
+  a speed point after only three nonzero current samples;
 - automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
   Serial link reconnects, with 50 recoveries by default for board-reset workflows;
 - explicit review before identified friction values are accepted into the active profile;
