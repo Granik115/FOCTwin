@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -46,6 +47,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.friction_movement_threshold.value(), 0.001)
             self.assertEqual(window.friction_recoveries.value(), 50)
             self.assertEqual(window.friction_position_bin.value(), 0.1)
+            self.assertEqual(window.friction_automatic_positions.value(), 1)
+            self.assertEqual(window.friction_automatic_position_step.value(), 1.0)
             self.assertGreater(window.friction_high_speed.maximum(), 0.05)
             self.assertGreater(window.friction_voltage_limit.maximum(), 12.0)
             self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
@@ -102,6 +105,8 @@ class UiSmokeTests(unittest.TestCase):
             first.friction_measure.setValue(8.0)
             first.friction_recoveries.setValue(5)
             first.friction_position_bin.setValue(0.2)
+            first.friction_automatic_positions.setValue(4)
+            first.friction_automatic_position_step.setValue(-0.75)
             first._save_user_settings()
             first.close()
 
@@ -120,6 +125,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(second.friction_measure.value(), 8.0)
             self.assertEqual(second.friction_recoveries.value(), 5)
             self.assertEqual(second.friction_position_bin.value(), 0.2)
+            self.assertEqual(second.friction_automatic_positions.value(), 4)
+            self.assertEqual(second.friction_automatic_position_step.value(), -0.75)
             second.close()
 
     def test_friction_configuration_forces_bounded_modes_and_monitoring(self):
@@ -181,7 +188,7 @@ class UiSmokeTests(unittest.TestCase):
             window.friction_pulse_max.setValue(2.0)
             config = window._friction_config_from_widgets()
 
-            text = window._friction_confirmation_text(config)
+            text = window._friction_confirmation_text(config, (0.0, 1.0, 2.0))
             window._apply_friction_limits(config)
 
             self.assertIn("автоматически", text)
@@ -189,6 +196,8 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("не будет искусственно повышен", text)
             self.assertIn("Скоростные участки действительно перемещают вал", text)
             self.assertIn("интервалы по 0.1 рад", text)
+            self.assertIn("Автоматических положений: 3 (0, 1, 2 рад)", text)
+            self.assertIn("angle + Voltage torque", text)
             self.assertEqual(window.guard.limits.current_a, 1.0)
             self.assertEqual(window.guard.limits.voltage_v, 24.0)
             self.assertEqual(window.guard.limits.velocity_rad_s, 0.5)
@@ -197,6 +206,50 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.device_limit_spins["current_a"].value(), 1.0)
             self.assertEqual(window.device_limit_spins["voltage_v"].value(), 24.0)
             self.assertEqual(window.device_limit_spins["velocity_rad_s"].value(), 0.5)
+            window.close()
+
+    def test_automatic_positioning_uses_angle_mode_and_loaded_pid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+
+            commands = window._friction_positioning_commands(
+                window._friction_config_from_widgets(),
+                1.25,
+                2.5,
+            )
+
+            self.assertEqual(
+                commands[:5],
+                ["AE0", "AR0.675", "ALC2.5", "ALU12", "ALV0.3"],
+            )
+            self.assertIn("AAP35", commands)
+            self.assertIn("AVP20.4", commands)
+            self.assertEqual(
+                commands[-7:],
+                ["AT0", "AC2", "A1.25", "AMC", "AMD20", "AMS1111111", "AE1"],
+            )
+            window.close()
+
+    def test_slow_recovery_beeps_once_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window._friction_recovery_started_at = 100.0
+            window._friction_recovery_sound_enabled = True
+            window._friction_recovery_alerted = False
+
+            with patch("foctwin.ui.QApplication.beep") as beep:
+                self.assertFalse(window._alert_slow_friction_recovery(105.0))
+                self.assertTrue(window._alert_slow_friction_recovery(105.1))
+                self.assertFalse(window._alert_slow_friction_recovery(110.0))
+                beep.assert_called_once_with()
+
+            window._friction_recovery_sound_enabled = False
+            window._friction_recovery_alerted = False
+            with patch("foctwin.ui.QApplication.beep") as beep:
+                self.assertFalse(window._alert_slow_friction_recovery(110.0))
+                beep.assert_not_called()
             window.close()
 
     def test_full_configuration_contains_limits_pid_modes_target_and_monitoring(self):

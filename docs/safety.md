@@ -26,7 +26,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Two-stage friction experiment (0.3.5)
+## Multi-position two-stage friction experiment (0.3.6)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
 With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from
