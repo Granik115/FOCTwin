@@ -51,6 +51,12 @@ Evidence mode does not perform automatic controller tuning. Its repeatability es
 diagnostic input for a future direct real-motor optimizer; it must not be interpreted as permission
 to test unstable gains or remove the independent return controller.
 
+Before startup, FOCTwin 0.3.9 reconciles the positioning and fixed-velocity Uq ceilings with the
+configured pulse ceiling. A lower dependent ceiling is raised only up to the already configured
+pulse value, and an excessive dependent ceiling is reduced to the unchanged global experiment
+limit. The application reports all such changes once and continues; it does not silently increase
+the global voltage envelope or the independent measured-current trip.
+
 ## Legacy multi-position diagnostic behaviour (0.3.7 compatibility)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.

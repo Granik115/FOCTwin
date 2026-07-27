@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.8 contains:
+Version 0.3.9 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -79,6 +79,8 @@ Version 0.3.8 contains:
 - automatically synchronized experiment, FOCTwin and SimpleFOC limits, with command ALC kept
   separate from the independently measured-current emergency threshold and every change stated
   in the confirmation dialog;
+- automatic reconciliation of the positioning and fixed-velocity Uq ceilings with the pulse
+  ceiling and the global experiment voltage limit, reported once without blocking test startup;
 - temporary direct-voltage operation for actuator preflight followed by automatic restoration of
   phase resistance and the user's manual configuration with PWM left disabled;
 - rolling angle-slope speed and confirmed small-motion detection for experiment decisions, with

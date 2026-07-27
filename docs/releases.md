@@ -19,6 +19,17 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.9
+
+- Reconcile the positioning and evidence-mode fixed-velocity Uq ceilings automatically before a
+  friction test starts. Values below the pulse ceiling are raised, values above the global
+  experiment limit are reduced, and all changes are shown in one warning without cancelling the
+  run.
+- Keep the global experiment voltage limit unchanged. Invalid primary pulse limits still fail
+  validation instead of being silently widened.
+- Cover the reported 10 V pulse / 3 V positioning preset conflict and upper-bound clamping with
+  Qt smoke tests.
+
 ## 0.3.8
 
 - Add an evidence protocol that records raw and accepted shaft angles and compares a PWM-disabled

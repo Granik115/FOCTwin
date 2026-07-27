@@ -288,6 +288,57 @@ class UiSmokeTests(unittest.TestCase):
             self.assertFalse(preset.adaptive_positioning_enabled)
             window.close()
 
+    def test_friction_uq_ceilings_are_synchronized_before_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window.friction_evidence_mode.setChecked(True)
+            window.friction_voltage_limit.setValue(25.0)
+            window.friction_pulse_max.setValue(10.0)
+            window.friction_position_voltage_max.setValue(3.0)
+            window.friction_fixed_velocity_voltage.setValue(3.0)
+
+            adjustments = window._synchronize_friction_uq_ceilings()
+            config = window._friction_config_from_widgets()
+
+            self.assertEqual(
+                adjustments,
+                (
+                    "• Максимальный Uq автосмещения: 3 → 10 В",
+                    "• Фиксированный Uq скорости: 3 → 10 В",
+                ),
+            )
+            self.assertEqual(window.friction_position_voltage_max.value(), 10.0)
+            self.assertEqual(window.friction_fixed_velocity_voltage.value(), 10.0)
+            config.validate()
+            self.assertEqual(window._synchronize_friction_uq_ceilings(), ())
+            window.close()
+
+    def test_friction_uq_ceilings_are_clamped_to_experiment_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window.friction_evidence_mode.setChecked(True)
+            window.friction_voltage_limit.setValue(12.0)
+            window.friction_pulse_max.setValue(10.0)
+            window.friction_position_voltage_max.setValue(20.0)
+            window.friction_fixed_velocity_voltage.setValue(15.0)
+
+            adjustments = window._synchronize_friction_uq_ceilings()
+            config = window._friction_config_from_widgets()
+
+            self.assertEqual(
+                adjustments,
+                (
+                    "• Максимальный Uq автосмещения: 20 → 12 В",
+                    "• Фиксированный Uq скорости: 15 → 12 В",
+                ),
+            )
+            self.assertEqual(window.friction_position_voltage_max.value(), 12.0)
+            self.assertEqual(window.friction_fixed_velocity_voltage.value(), 12.0)
+            config.validate()
+            window.close()
+
     def test_automatic_positioning_uses_angle_mode_and_loaded_pid(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
