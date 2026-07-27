@@ -722,7 +722,7 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Безопасный двухэтапный план")
         config_grid = QGridLayout(config_group)
         self.friction_evidence_mode = QCheckBox(
-            "Доказательный режим 0.3.8: PWM off/on, повторы, фиксированный ALC"
+            "Доказательный режим 0.3.9: PWM off/on, повторы, фиксированный ALC"
         )
         self.friction_evidence_mode.setChecked(True)
         config_grid.addWidget(self.friction_evidence_mode, 0, 0, 1, 4)
@@ -1155,6 +1155,29 @@ class MainWindow(QMainWindow):
             position_validation_large_rad=self.friction_position_validation_large.value(),
         )
 
+    def _synchronize_friction_uq_ceilings(self) -> tuple[str, ...]:
+        pulse_max = self.friction_pulse_max.value()
+        voltage_limit = self.friction_voltage_limit.value()
+        if pulse_max > voltage_limit:
+            return ()
+
+        adjustments: list[str] = []
+        dependent_ceilings = [
+            ("Максимальный Uq автосмещения", self.friction_position_voltage_max),
+        ]
+        if self.friction_evidence_mode.isChecked():
+            dependent_ceilings.append(
+                ("Фиксированный Uq скорости", self.friction_fixed_velocity_voltage)
+            )
+        for label, widget in dependent_ceilings:
+            previous = widget.value()
+            synchronized = min(max(previous, pulse_max), voltage_limit)
+            if math.isclose(previous, synchronized, rel_tol=0.0, abs_tol=1e-12):
+                continue
+            widget.setValue(synchronized)
+            adjustments.append(f"• {label}: {previous:g} → {synchronized:g} В")
+        return tuple(adjustments)
+
     def _set_friction_config_widgets(self, config: FrictionTestConfig) -> None:
         self.friction_low_speed.setValue(config.low_velocity_rad_s)
         self.friction_high_speed.setValue(config.high_velocity_rad_s)
@@ -1308,7 +1331,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("В проекте нет checkpoint теста трения")
             if int(payload.get("schema", 0)) != 8:
                 raise ValueError(
-                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.8; "
+                    "Checkpoint создан старым алгоритмом и несовместим со схемой 8; "
                     "начните новый комплексный диагностический тест"
                 )
             points = [
@@ -1405,6 +1428,17 @@ class MainWindow(QMainWindow):
         if self._configuration_apply_in_progress or self._command_queue or self._command_timer.isActive():
             QMessageBox.information(self, "Тест трения", "Дождитесь завершения текущих команд")
             return
+        uq_adjustments = self._synchronize_friction_uq_ceilings()
+        if uq_adjustments:
+            QMessageBox.warning(
+                self,
+                "Автоматическое согласование Uq",
+                "FOCTwin автоматически согласовал зависимые пределы Uq:\n"
+                + "\n".join(uq_adjustments)
+                + "\n\nОни не могут быть ниже максимального Uq импульсов "
+                f"({self.friction_pulse_max.value():g} В) и выше предела напряжения опыта "
+                f"({self.friction_voltage_limit.value():g} В). Запуск будет продолжен.",
+            )
         config = self._friction_config_from_widgets()
         try:
             config.validate()
