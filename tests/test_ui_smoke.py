@@ -54,6 +54,14 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.friction_position_tolerance.value(), 0.005)
             self.assertEqual(window.friction_position_voltage_step.value(), 0.25)
             self.assertEqual(window.friction_position_voltage_max.value(), 3.0)
+            self.assertTrue(window.friction_evidence_mode.isChecked())
+            self.assertEqual(window.friction_pwm_off_observation.value(), 60.0)
+            self.assertEqual(window.friction_breakaway_repeats.value(), 3)
+            self.assertEqual(window.friction_residual_movement.value(), 0.005)
+            self.assertEqual(window.friction_velocity_travel.value(), 0.2)
+            self.assertEqual(window.friction_fixed_velocity_voltage.value(), 3.0)
+            self.assertFalse(window.friction_adaptive_positioning.isChecked())
+            self.assertTrue(window.friction_position_validation.isChecked())
             self.assertGreater(window.friction_high_speed.maximum(), 0.05)
             self.assertGreater(window.friction_voltage_limit.maximum(), 12.0)
             self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
@@ -118,6 +126,20 @@ class UiSmokeTests(unittest.TestCase):
             first.friction_position_voltage_max.setValue(4.0)
             first.friction_position_stall_window.setValue(4.0)
             first.friction_position_min_progress.setValue(0.001)
+            first.friction_evidence_mode.setChecked(True)
+            first.friction_pwm_off_observation.setValue(90.0)
+            first.friction_breakaway_repeats.setValue(4)
+            first.friction_residual_movement.setValue(0.007)
+            first.friction_breakaway_verify.setValue(1.4)
+            first.friction_velocity_travel.setValue(0.25)
+            first.friction_fixed_velocity_voltage.setValue(3.5)
+            first.friction_adaptive_positioning.setChecked(False)
+            first.friction_pole_pairs.setValue(15)
+            first.friction_electrical_divisions.setValue(10)
+            first.friction_position_validation.setChecked(True)
+            first.friction_position_validation_small.setValue(0.12)
+            first.friction_position_validation_medium.setValue(0.35)
+            first.friction_position_validation_large.setValue(0.7)
             first._save_user_settings()
             first.close()
 
@@ -144,6 +166,20 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(second.friction_position_voltage_max.value(), 4.0)
             self.assertEqual(second.friction_position_stall_window.value(), 4.0)
             self.assertEqual(second.friction_position_min_progress.value(), 0.001)
+            self.assertTrue(second.friction_evidence_mode.isChecked())
+            self.assertEqual(second.friction_pwm_off_observation.value(), 90.0)
+            self.assertEqual(second.friction_breakaway_repeats.value(), 4)
+            self.assertEqual(second.friction_residual_movement.value(), 0.007)
+            self.assertEqual(second.friction_breakaway_verify.value(), 1.4)
+            self.assertEqual(second.friction_velocity_travel.value(), 0.25)
+            self.assertEqual(second.friction_fixed_velocity_voltage.value(), 3.5)
+            self.assertFalse(second.friction_adaptive_positioning.isChecked())
+            self.assertEqual(second.friction_pole_pairs.value(), 15)
+            self.assertEqual(second.friction_electrical_divisions.value(), 10)
+            self.assertTrue(second.friction_position_validation.isChecked())
+            self.assertEqual(second.friction_position_validation_small.value(), 0.12)
+            self.assertEqual(second.friction_position_validation_medium.value(), 0.35)
+            self.assertEqual(second.friction_position_validation_large.value(), 0.7)
             second.close()
 
     def test_friction_configuration_forces_bounded_modes_and_monitoring(self):
@@ -214,7 +250,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("Скоростные участки действительно перемещают вал", text)
             self.assertIn("интервалы по 0.1 рад", text)
             self.assertIn("Измерений по координатам: 3 (0, 1, 2 рад)", text)
-            self.assertIn("Uq будет повышаться", text)
+            self.assertIn("Позиционный ALC фиксирован", text)
+            self.assertIn("остаточным перемещением", text)
+            self.assertIn("PWM отключённым", text)
             self.assertIn("шесть скоростных точек", text)
             self.assertIn("angle + Voltage torque", text)
             self.assertEqual(window.guard.limits.current_a, 1.0)
@@ -225,6 +263,29 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(window.device_limit_spins["current_a"].value(), 1.0)
             self.assertEqual(window.device_limit_spins["voltage_v"].value(), 24.0)
             self.assertEqual(window.device_limit_spins["velocity_rad_s"].value(), 0.5)
+            window.close()
+
+    def test_evidence_observer_keeps_pwm_disabled_and_preset_uses_two_periods(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            config = window._friction_config_from_widgets()
+
+            commands = window._friction_configuration_commands(config, mode="observer")
+            window._apply_friction_evidence_preset()
+            preset = window._friction_config_from_widgets()
+
+            self.assertEqual(commands[0], "AE0")
+            self.assertNotIn("AE1", commands)
+            self.assertTrue(preset.evidence_mode)
+            self.assertEqual(preset.automatic_position_count, 17)
+            self.assertEqual(preset.map_passes, 2)
+            self.assertAlmostEqual(
+                preset.automatic_position_step_rad,
+                preset.recommended_electrical_step_rad,
+                places=6,
+            )
+            self.assertFalse(preset.adaptive_positioning_enabled)
             window.close()
 
     def test_automatic_positioning_uses_angle_mode_and_loaded_pid(self):

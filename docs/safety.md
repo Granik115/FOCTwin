@@ -26,7 +26,32 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Multi-position diagnostic friction experiment (0.3.7)
+## Evidence diagnostic experiment (0.3.8)
+
+Evidence mode begins each position with an attended PWM-disabled observation. It does not issue an
+enable command until that observation is complete. The following PWM-enabled zero baseline uses
+the same raw-angle counters, so the final report can compare dropout and velocity-spike rates
+without silently filtering the source evidence out of the CSV.
+
+A pulse is not accepted as breakaway merely because its peak angle crossed a threshold. Uq is
+zeroed, the configured verification interval elapses, and the signed residual displacement must
+remain above the evidence threshold. Motion that returns is retained as evidence of elastic
+deflection, backlash or encoder quantization. Each direction is repeated before the test advances.
+
+Velocity comparisons use one user-approved Uq ceiling at every coordinate and terminate after a
+bounded travelled distance. Fixed-limit position-validation steps likewise disable adaptive ALC.
+Consequently the experiment may report a failed point that legacy positioning could eventually
+reach by increasing its ceiling; that failure is intentional controller evidence.
+
+The two-electrical-period preset only constructs a measurement plan. It does not widen travel,
+speed, voltage or measured-current safety limits. The full planned sweep must fit inside the
+existing envelope before PWM can be enabled.
+
+Evidence mode does not perform automatic controller tuning. Its repeatability estimate is
+diagnostic input for a future direct real-motor optimizer; it must not be interpreted as permission
+to test unstable gains or remove the independent return controller.
+
+## Legacy multi-position diagnostic behaviour (0.3.7 compatibility)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
 With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from

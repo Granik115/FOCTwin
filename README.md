@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.7 contains:
+Version 0.3.8 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -36,6 +36,15 @@ Version 0.3.7 contains:
   monitoring before PWM is enabled;
 - an actuator preflight that alternates short direct-Uq pulses, zeros Uq on the first detected
   movement and finds breakaway independently in both directions;
+- an evidence mode that compares raw encoder/SSI behaviour with PWM disabled and enabled, preserves
+  both raw and accepted angles, and distinguishes PWM-correlated dropouts from independent faults;
+- residual breakaway confirmation after Uq returns to zero, with repeated signed trials that keep
+  reversible elastic motion separate from static-friction thresholds;
+- a two-electrical-period position preset derived from the motor pole-pair count, plus explicit
+  tests for electrical-period repetition and approach-direction hysteresis;
+- fixed-Uq, distance-bounded velocity comparisons and repeated fixed-limit position steps of ±0.1,
+  ±0.3 and ±0.6 rad, so controller evidence and same-start dispersion are not altered by adaptive
+  voltage ceilings;
 - separate recording of commanded Uq, actual Uq and measured Iq; movement in both directions
   advances the diagnostic, while missing measured-current evidence invalidates affected friction
   points instead of hiding the rest of the experiment;
@@ -64,6 +73,8 @@ Version 0.3.7 contains:
   breakaway envelopes, directional asymmetry, repeated-position variability, speed tracking,
   measured-Iq usability, telemetry interruptions and readiness for Simulink identification,
   saved as a short standalone JSON alongside the full experiment export;
+- robust objective-dispersion evidence and a recommended repeat count for a future guarded
+  real-motor optimizer, plus a data-driven stateful semi-mechanical friction-model recommendation;
 - explicit review before identified friction values are accepted into the active profile;
 - automatically synchronized experiment, FOCTwin and SimpleFOC limits, with command ALC kept
   separate from the independently measured-current emergency threshold and every change stated

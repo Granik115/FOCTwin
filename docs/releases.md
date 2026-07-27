@@ -19,6 +19,36 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.8
+
+- Add an evidence protocol that records raw and accepted shaft angles and compares a PWM-disabled
+  observation with an otherwise equivalent PWM-enabled zero baseline. The report distinguishes
+  encoder/SSI dropouts that exist without PWM from faults whose rate rises with PWM.
+- Confirm breakaway only after the pulse has ended and a configurable residual displacement
+  remains. Peak motion that substantially returns during the zero interval is reported as
+  elasticity, backlash or encoder quantization rather than static-friction breakaway.
+- Repeat every signed breakaway measurement and report within-condition variability instead of
+  treating one threshold as deterministic.
+- Add a two-electrical-period experiment preset based on the configured pole-pair count. It
+  samples eight mechanical positions per electrical period and tests whether the spatial pattern
+  repeats at the electrical period.
+- Run comparison velocity legs with one fixed Uq ceiling and stop them by travelled distance,
+  preventing a local measurement from spanning several radians or changing its available
+  actuation with a provisional breakaway estimate.
+- Revisit positions after opposite approaches and report approach-direction hysteresis separately
+  from ordinary repeat noise and directional friction asymmetry.
+- After the map, repeatedly run fixed-limit position steps of ±0.1, ±0.3 and ±0.6 rad without
+  adaptive ALC. These trials characterize the loaded position/velocity controller and the
+  same-start objective dispersion rather than hiding behaviour behind automatic voltage increases.
+- Estimate objective dispersion with robust statistics and recommend a minimum repeat count plus
+  median/MAD aggregation before direct real-motor `surrogateopt` tuning is enabled in a future
+  release.
+- Recommend a stateful semi-mechanical Simulink friction structure from the observed evidence,
+  including stick/slip state, coordinate and direction maps, approach history, elastic return,
+  electrical-angle periodicity and bounded correlated variability when supported.
+- Checkpoint and result schema 8 preserve observer state, raw-angle diagnostics, repeated pulses
+  and the fixed-limit position-validation sequence.
+
 ## 0.3.7
 
 - Diagnose the 0.3.6 automatic-position failure correctly: a residual error of 0.44–0.98 rad
