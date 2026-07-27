@@ -4,10 +4,11 @@ import json
 import os
 import sqlite3
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from foctwin.domain import MotorProfile
 
@@ -166,7 +167,7 @@ class ProjectStore:
             raise ValueError(f"Некорректный checkpoint этапа {stage}")
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
-            raise ValueError(f"Checkpoint этапа {stage} не содержит данных")
+            raise ValueError(f"Checkpoint этапа {stage} не содержит данных")  # noqa: TRY004
         return payload
 
     def save_export(self, label: str, payload: dict[str, Any]) -> Path:

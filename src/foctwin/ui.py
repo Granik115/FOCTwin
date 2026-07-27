@@ -8,8 +8,9 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
-from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,9 +38,9 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -47,8 +48,8 @@ from PySide6.QtWidgets import (
 
 from foctwin import __version__
 from foctwin.domain import (
-    MotorProfile,
     MotionMode,
+    MotorProfile,
     SafetyGuard,
     SafetyLimits,
     TelemetrySample,
@@ -59,11 +60,11 @@ from foctwin.friction import (
     FRICTION_DIRECT_VOLTAGE_SENTINEL,
     FRICTION_MAX_AUTOMATIC_POSITIONS,
     FRICTION_MAX_CURRENT_TRIP_A,
+    FRICTION_MAX_POSITION_BIN_WIDTH_RAD,
+    FRICTION_MAX_RECOVERY_ATTEMPTS,
     FRICTION_MAX_TARGET_VELOCITY_RAD_S,
     FRICTION_MAX_VELOCITY_LIMIT_RAD_S,
     FRICTION_MAX_VOLTAGE_LIMIT_V,
-    FRICTION_MAX_RECOVERY_ATTEMPTS,
-    FRICTION_MAX_POSITION_BIN_WIDTH_RAD,
     FRICTION_MIN_CURRENT_TRIP_A,
     FRICTION_MIN_POSITION_BIN_WIDTH_RAD,
     FRICTION_MIN_TARGET_VELOCITY_RAD_S,
@@ -147,8 +148,10 @@ class MainWindow(QMainWindow):
     SETTINGS_KEY = "manual/startup-configuration-v1"
     COMMAND_INTERVAL_MS = 45
     PID_FIELDS = ("p", "i", "d", "ramp", "lpf")
-    PID_ROW_BY_FIELD = {field: row for row, field in enumerate(PID_FIELDS)}
-    PID_LIMIT_BINDINGS = {
+    PID_ROW_BY_FIELD: ClassVar[dict[str, int]] = {
+        field: row for row, field in enumerate(PID_FIELDS)
+    }
+    PID_LIMIT_BINDINGS: ClassVar[dict[str, str]] = {
         "angle": "velocity_rad_s",
         "velocity": "current_a",
         "current_q": "voltage_v",
@@ -1882,7 +1885,7 @@ class MainWindow(QMainWindow):
                 map_path = self._save_friction_position_history()
                 if map_path is not None:
                     self._log("FRICTION", f"Накопительная карта координат сохранена: {map_path}")
-            except Exception as exc:  # Preserve motor restoration even if map export fails.
+            except Exception as exc:  # noqa: BLE001
                 self._log("ERROR", f"Не удалось обновить карту координат: {exc}")
         self._save_friction_checkpoint()
         self.friction_start_button.setEnabled(True)
@@ -2674,7 +2677,7 @@ class MainWindow(QMainWindow):
         return str(getattr(data, "value", data))
 
     @staticmethod
-    def _set_combo_enum(combo: QComboBox, enum_type: type[MotionMode] | type[TorqueMode], value: object) -> None:
+    def _set_combo_enum(combo: QComboBox, enum_type: type[MotionMode | TorqueMode], value: object) -> None:
         try:
             expected = enum_type(str(value))
         except ValueError:
@@ -2773,7 +2776,7 @@ class MainWindow(QMainWindow):
         self.device.protocol = self.protocol
         try:
             self.device.connect(self.port_combo.currentText().strip(), int(self.baud_combo.currentText()))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._connecting = False
             self._log("ERROR", f"Не удалось подключиться: {exc}")
             self.connection_details.setText(f"Ошибка подключения: {exc}")
@@ -3183,7 +3186,7 @@ class MainWindow(QMainWindow):
         try:
             self.device.discard_pending_input()
             self.device.set_dtr(False)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._log("ERROR", f"Не удалось опустить DTR для восстановления телеметрии: {exc}")
             self._send_monitor_configuration("повторно настроен без DTR")
             return
@@ -3200,7 +3203,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.device.set_dtr(True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._transport_recovery_in_progress = False
             self._log("ERROR", f"Не удалось поднять DTR после восстановления: {exc}")
             return
@@ -3240,7 +3243,7 @@ class MainWindow(QMainWindow):
         self._log("TX", command)
         try:
             self.device.send(command)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._log("ERROR", str(exc))
             self.statusBar().showMessage(str(exc), 5000)
             return False
@@ -3289,7 +3292,7 @@ class MainWindow(QMainWindow):
         def worker() -> None:
             try:
                 self.matlab.start()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.signals.matlab_state.emit(False, str(exc))
             else:
                 self.signals.matlab_state.emit(True, "MATLAB Engine запущен")
@@ -3565,7 +3568,7 @@ class MainWindow(QMainWindow):
         if self.project:
             try:
                 self.project.event(level, "app", message)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     def _refresh_status(self) -> None:
@@ -3600,7 +3603,7 @@ class MainWindow(QMainWindow):
                 self.device.send(
                     self.protocol.phase_resistance(self.profile.phase_resistance_ohm)
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         self.device.disconnect()
         if self.matlab.connected:

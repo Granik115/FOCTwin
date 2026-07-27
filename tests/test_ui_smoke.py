@@ -9,8 +9,8 @@ try:
     from PySide6.QtCore import QSettings, Qt
     from PySide6.QtWidgets import QApplication
 
-    from foctwin.ui import MainWindow
     from foctwin.protocol import CommanderResponse
+    from foctwin.ui import MainWindow
 except ImportError:
     QApplication = None
     MainWindow = None

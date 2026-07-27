@@ -131,7 +131,7 @@ class TelemetryRecorder:
                 writer.writerow({field: getattr(sample, field) for field in self.FIELDS})
                 # Keep completed rows durable without making the Qt event loop wait for disk I/O.
                 handle.flush()
-        except Exception as exc:  # pragma: no cover - depends on filesystem failures
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - filesystem failures
             self.last_error = str(exc)
         finally:
             try:

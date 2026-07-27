@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-
 SAFETY_SOFT_LIMIT_SAMPLES = 3
 SAFETY_SOFT_LIMIT_TOLERANCE = 0.05
 SAFETY_HARD_LIMIT_MULTIPLIER = 2.0

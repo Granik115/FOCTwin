@@ -7,7 +7,6 @@ from typing import Any
 
 from foctwin.domain import MotionMode, TorqueMode
 
-
 MOTION_CODES = {
     MotionMode.TORQUE: 0,
     MotionMode.VELOCITY: 1,

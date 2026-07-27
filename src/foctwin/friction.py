@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
 from foctwin.domain import TelemetrySample
-
 
 FRICTION_MONITOR_MASK = "1111111"
 FRICTION_MIN_TARGET_VELOCITY_RAD_S = 0.005
