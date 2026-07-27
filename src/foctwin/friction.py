@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 
 from foctwin.domain import TelemetrySample
-
 
 FRICTION_MONITOR_MASK = "1111111"
 FRICTION_MIN_TARGET_VELOCITY_RAD_S = 0.005
@@ -35,6 +35,12 @@ FRICTION_MAX_POSITION_BIN_WIDTH_RAD = 10.0
 FRICTION_MIN_POSITION_BIN_SAMPLES = 8
 FRICTION_CURRENT_CONFIRMATION_FRACTION = 0.6
 FRICTION_CURRENT_DIRECTION_FRACTION = 0.8
+FRICTION_MIN_AUTOMATIC_POSITION_STEP_RAD = 0.01
+FRICTION_MAX_AUTOMATIC_POSITION_STEP_RAD = 100.0
+FRICTION_MAX_AUTOMATIC_POSITIONS = 20
+FRICTION_POSITION_TOLERANCE_RAD = 0.01
+FRICTION_POSITION_SETTLE_S = 1.0
+FRICTION_POSITION_TIMEOUT_S = 60.0
 
 
 class FrictionPhase(str, Enum):
@@ -47,6 +53,10 @@ class FrictionPhase(str, Enum):
     SETTLING = "settling"
     MEASURING = "measuring"
     PAUSE = "pause"
+    CONFIGURING_POSITION = "configuring_position"
+    POSITIONING = "positioning"
+    POSITION_SETTLING = "position_settling"
+    CONFIGURING_ACTUATOR = "configuring_actuator"
     RECOVERING = "recovering"
     COMPLETE = "complete"
     ABORTED = "aborted"
@@ -73,6 +83,8 @@ class ActuatorPulseResult:
     note: str
     start_angle_rad: float | None = None
     end_angle_rad: float | None = None
+    position_index: int = 0
+    measurement_position_rad: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,6 +119,8 @@ class FrictionTestConfig:
     monitor_downsample: int = 20
     max_recovery_attempts: int = FRICTION_DEFAULT_RECOVERY_ATTEMPTS
     position_bin_width_rad: float = 0.1
+    automatic_position_count: int = 1
+    automatic_position_step_rad: float = 1.0
 
     @property
     def targets(self) -> tuple[float, ...]:
@@ -122,9 +136,17 @@ class FrictionTestConfig:
         actuator_s = self.baseline_s + 2 * len(self.pulse_levels) * (
             self.pulse_duration_s + self.actuator_pause_s
         )
-        return actuator_s + self.pause_s + len(self.targets) * (
+        measurement_s = actuator_s + self.pause_s + len(self.targets) * (
             self.settle_s + self.measure_s + self.pause_s
         )
+        positioning_s = max(
+            FRICTION_POSITION_SETTLE_S,
+            abs(self.automatic_position_step_rad) / self.velocity_limit_rad_s,
+        )
+        return self.automatic_position_count * measurement_s + max(
+            0,
+            self.automatic_position_count - 1,
+        ) * positioning_s
 
     @property
     def position_margin_rad(self) -> float:
@@ -142,6 +164,22 @@ class FrictionTestConfig:
         if not values or values[-1] < self.pulse_max_voltage_v - 1e-12:
             values.append(self.pulse_max_voltage_v)
         return tuple(values)
+
+    def automatic_position_targets(self, start_angle_rad: float) -> tuple[float, ...]:
+        targets = tuple(
+            start_angle_rad + index * self.automatic_position_step_rad
+            for index in range(self.automatic_position_count)
+        )
+        safe_min = self.angle_min_rad + self.position_margin_rad
+        safe_max = self.angle_max_rad - self.position_margin_rad
+        outside = [target for target in targets if not safe_min <= target <= safe_max]
+        if outside:
+            raise ValueError(
+                "Автоматические точки выходят из безопасного диапазона стартовых координат "
+                f"[{safe_min:.6g}; {safe_max:.6g}] рад: "
+                + ", ".join(f"{target:.6g}" for target in outside)
+            )
+        return targets
 
     def validate(self) -> None:
         if not (
@@ -219,10 +257,25 @@ class FrictionTestConfig:
                 f"{FRICTION_MIN_POSITION_BIN_WIDTH_RAD:g} до "
                 f"{FRICTION_MAX_POSITION_BIN_WIDTH_RAD:g} рад"
             )
+        if not 1 <= self.automatic_position_count <= FRICTION_MAX_AUTOMATIC_POSITIONS:
+            raise ValueError(
+                "Число автоматических положений должно быть от 1 до "
+                f"{FRICTION_MAX_AUTOMATIC_POSITIONS}"
+            )
+        if self.automatic_position_count > 1 and not (
+            FRICTION_MIN_AUTOMATIC_POSITION_STEP_RAD
+            <= abs(self.automatic_position_step_rad)
+            <= FRICTION_MAX_AUTOMATIC_POSITION_STEP_RAD
+        ):
+            raise ValueError(
+                "Модуль шага автоматического смещения должен быть от "
+                f"{FRICTION_MIN_AUTOMATIC_POSITION_STEP_RAD:g} до "
+                f"{FRICTION_MAX_AUTOMATIC_POSITION_STEP_RAD:g} рад"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["algorithm_schema"] = 5
+        payload["algorithm_schema"] = 6
         payload["targets_rad_s"] = list(self.targets)
         payload["monitor_mask"] = FRICTION_MONITOR_MASK
         payload["torque_mode"] = FRICTION_TORQUE_MODE
@@ -273,6 +326,8 @@ class FrictionPointResult:
     end_angle_rad: float | None = None
     mean_angle_rad: float | None = None
     mean_voltage_q_v: float | None = None
+    position_index: int = 0
+    measurement_position_rad: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -490,7 +545,12 @@ def summarize_friction_point(
     if not stable:
         problems.append("скорость неустойчива")
     if not measured_current_detected:
-        problems.append("измеренный Iq не подтверждён устойчиво или имеет неверный знак")
+        if direction_ok and tracking_error <= tracking_tolerance and stable:
+            problems.append(
+                "движение пригодно для карты Uq; измеренный Iq нельзя считать моментом"
+            )
+        else:
+            problems.append("измеренный Iq не подтверждён устойчиво или имеет неверный знак")
     saturation_fraction: float | None = None
     if voltage_limit_v is not None and voltage_limit_v > 0:
         voltages = np.asarray(
@@ -738,6 +798,9 @@ class FrictionExperiment:
         back_emf_v_per_krpm: float = 0.0,
         actuator_attempts: Iterable[ActuatorPulseResult] = (),
         position_observations: Iterable[PositionFrictionObservation] = (),
+        position_targets_rad: Iterable[float] = (0.0,),
+        position_index: int = 0,
+        point_index: int | None = None,
     ) -> None:
         config.validate()
         if phase_resistance_ohm <= 0:
@@ -749,9 +812,18 @@ class FrictionExperiment:
         self.points = list(completed_points)
         self.actuator_attempts = list(actuator_attempts)
         self.position_observations = list(position_observations)
+        self.position_targets_rad = tuple(float(value) for value in position_targets_rad)
+        if not self.position_targets_rad:
+            raise ValueError("Для опыта нужна хотя бы одна координата измерения")
+        if not 0 <= position_index < len(self.position_targets_rad):
+            raise ValueError("Неверный номер автоматической координаты")
+        self.position_index = position_index
         self.phase = FrictionPhase.IDLE
         self.phase_started_s = 0.0
-        self.point_index = len(self.points) - 1
+        completed_here = sum(
+            point.position_index == self.position_index for point in self.points
+        )
+        self.point_index = completed_here - 1 if point_index is None else point_index
         self.transient_samples: list[TelemetrySample] = []
         self.steady_samples: list[TelemetrySample] = []
         self.phase_samples: list[TelemetrySample] = []
@@ -770,6 +842,9 @@ class FrictionExperiment:
         self._trusted_fast_angle_step: float | None = None
         self._movement_candidate = 0
         self._movement_candidate_samples = 0
+        self._continuous_angle_reference_rad: float | None = None
+        self._board_angle_offset_rad = 0.0
+        self._positioning_started_s = 0.0
 
     @property
     def active(self) -> bool:
@@ -782,6 +857,14 @@ class FrictionExperiment:
         return None
 
     @property
+    def current_position_target_rad(self) -> float:
+        return self.position_targets_rad[self.position_index]
+
+    @property
+    def automatic_positioning_enabled(self) -> bool:
+        return len(self.position_targets_rad) > 1
+
+    @property
     def current_pulse_voltage_v(self) -> float | None:
         return self._pulse_target()
 
@@ -789,6 +872,17 @@ class FrictionExperiment:
     def breakaway_results(self) -> dict[int, ActuatorPulseResult]:
         found: dict[int, ActuatorPulseResult] = {}
         for attempt in self.actuator_attempts:
+            if attempt.position_index != self.position_index:
+                continue
+            if attempt.movement_detected:
+                found.setdefault(attempt.direction, attempt)
+        return found
+
+    def breakaway_results_for_position(self, position_index: int) -> dict[int, ActuatorPulseResult]:
+        found: dict[int, ActuatorPulseResult] = {}
+        for attempt in self.actuator_attempts:
+            if attempt.position_index != position_index:
+                continue
             if attempt.movement_detected:
                 found.setdefault(attempt.direction, attempt)
         return found
@@ -804,9 +898,38 @@ class FrictionExperiment:
         return all(direction in found and found[direction].current_detected for direction in (1, -1))
 
     @property
+    def all_actuator_positions_complete(self) -> bool:
+        return all(
+            all(
+                direction in self.breakaway_results_for_position(position_index)
+                for direction in (1, -1)
+            )
+            for position_index in range(len(self.position_targets_rad))
+        )
+
+    @property
+    def all_measured_current_positions_complete(self) -> bool:
+        return all(
+            all(
+                direction in found and found[direction].current_detected
+                for direction in (1, -1)
+            )
+            for found in (
+                self.breakaway_results_for_position(position_index)
+                for position_index in range(len(self.position_targets_rad))
+            )
+        )
+
+    @property
     def configuration_mode(self) -> str:
         if self.phase == FrictionPhase.RECOVERING:
             return self._recovery_mode
+        if self.phase in {
+            FrictionPhase.CONFIGURING_POSITION,
+            FrictionPhase.POSITIONING,
+            FrictionPhase.POSITION_SETTLING,
+        }:
+            return "position"
         if self.actuator_complete or self.phase in {
             FrictionPhase.CONFIGURING_VELOCITY,
             FrictionPhase.ZERO,
@@ -825,12 +948,64 @@ class FrictionExperiment:
         voltage = max(abs(result.command_voltage_v) for result in self.breakaway_results.values())
         return voltage / self.phase_resistance_ohm * self.config.breakaway_margin
 
+    @property
+    def positioning_current_limit_a(self) -> float | None:
+        moving_attempts = [
+            attempt
+            for attempt in self.actuator_attempts
+            if attempt.movement_detected
+        ]
+        if not moving_attempts:
+            return None
+        voltage = max(abs(attempt.command_voltage_v) for attempt in moving_attempts)
+        return voltage / self.phase_resistance_ohm * self.config.breakaway_margin
+
+    def seed_angle(
+        self,
+        angle_rad: float | None,
+        *,
+        continuous_reference_rad: float | None = None,
+    ) -> None:
+        if angle_rad is not None and math.isfinite(angle_rad):
+            raw_angle = float(angle_rad)
+            if continuous_reference_rad is None:
+                continuous_angle = raw_angle
+            else:
+                continuous_angle = raw_angle + math.tau * round(
+                    (continuous_reference_rad - raw_angle) / math.tau
+                )
+            self._continuous_angle_reference_rad = continuous_angle
+            self._board_angle_offset_rad = continuous_angle - raw_angle
+
+    def board_target_for_continuous(self, continuous_target_rad: float) -> float:
+        return continuous_target_rad - self._board_angle_offset_rad
+
     def start(self, now_s: float) -> list[FrictionAction]:
         if self.phase != FrictionPhase.IDLE:
             raise RuntimeError("Friction experiment has already been started")
         self.phase_started_s = now_s
         self.phase_samples.clear()
         self._reset_angle_filter()
+        completed_here = sum(
+            point.position_index == self.position_index for point in self.points
+        )
+        if completed_here >= len(self.config.targets):
+            if self.position_index + 1 >= len(self.position_targets_rad):
+                self.phase = FrictionPhase.COMPLETE
+                return [FrictionAction("finish")]
+            self.position_index += 1
+            self.point_index = -1
+            self.phase = FrictionPhase.CONFIGURING_POSITION
+            return [FrictionAction("configure_position")]
+        if (
+            self._continuous_angle_reference_rad is not None
+            and abs(
+                self._continuous_angle_reference_rad - self.current_position_target_rad
+            )
+            > FRICTION_POSITION_TOLERANCE_RAD
+        ):
+            self.phase = FrictionPhase.CONFIGURING_POSITION
+            return [FrictionAction("configure_position")]
         if self.actuator_complete:
             self.phase = FrictionPhase.ZERO
         else:
@@ -841,11 +1016,16 @@ class FrictionExperiment:
         self,
         sample: TelemetrySample,
         now_s: float | None = None,
+        *,
+        angle_prepared: bool = False,
     ) -> tuple[str | None, list[FrictionAction]]:
         event_time_s = sample.timestamp_s if now_s is None else now_s
-        if self.phase in {FrictionPhase.IDLE, FrictionPhase.RECOVERING}:
+        if self.phase == FrictionPhase.IDLE:
             return None, []
-        sample = self._filter_angle_sample(sample)
+        if not angle_prepared:
+            sample = self.prepare_sample(sample)
+        if self.phase == FrictionPhase.RECOVERING:
+            return None, []
         violation = self._violation(sample)
         if violation:
             return violation, []
@@ -865,6 +1045,8 @@ class FrictionExperiment:
             self.transient_samples.append(sample)
         elif self.phase == FrictionPhase.MEASURING:
             self.steady_samples.append(sample)
+        elif self.phase in {FrictionPhase.POSITIONING, FrictionPhase.POSITION_SETTLING}:
+            self.phase_samples.append(sample)
         angle_violation = self._angle_velocity_violation()
         if angle_violation:
             return angle_violation, []
@@ -897,6 +1079,40 @@ class FrictionExperiment:
                 self.phase_started_s = now_s
                 return [FrictionAction("configure_velocity"), FrictionAction("checkpoint")]
             return self._start_next_pulse(now_s)
+        if self.phase == FrictionPhase.POSITIONING:
+            if elapsed >= FRICTION_POSITION_TIMEOUT_S:
+                return self.abort(
+                    "Автоматическое смещение не достигло координаты "
+                    f"{self.current_position_target_rad:.6g} рад за "
+                    f"{FRICTION_POSITION_TIMEOUT_S:g} с"
+                )
+            latest = self._latest_angle(self.phase_samples)
+            if (
+                latest is not None
+                and abs(latest - self.current_position_target_rad)
+                <= FRICTION_POSITION_TOLERANCE_RAD
+            ):
+                self.phase = FrictionPhase.POSITION_SETTLING
+                self.phase_started_s = now_s
+            return []
+        if self.phase == FrictionPhase.POSITION_SETTLING:
+            latest = self._latest_angle(self.phase_samples)
+            if latest is None:
+                return []
+            if abs(latest - self.current_position_target_rad) > FRICTION_POSITION_TOLERANCE_RAD:
+                self.phase = FrictionPhase.POSITIONING
+                self.phase_started_s = self._positioning_started_s
+                return []
+            if now_s - self._positioning_started_s >= FRICTION_POSITION_TIMEOUT_S:
+                return self.abort(
+                    "Автоматическое смещение не установилось в координате "
+                    f"{self.current_position_target_rad:.6g} рад"
+                )
+            if elapsed >= FRICTION_POSITION_SETTLE_S and self._position_is_settled():
+                self.phase = FrictionPhase.CONFIGURING_ACTUATOR
+                self.phase_started_s = now_s
+                return [FrictionAction("configure_actuator"), FrictionAction("checkpoint")]
+            return []
         if self.phase == FrictionPhase.ZERO and elapsed >= self.config.pause_s:
             if self._repeat_velocity_point and self.current_target is not None:
                 self._repeat_velocity_point = False
@@ -918,6 +1134,8 @@ class FrictionExperiment:
                 voltage_limit_v=self.config.voltage_limit_v,
                 measured_current_floor_a=self.current_detection_threshold_a,
             )
+            point.position_index = self.position_index
+            point.measurement_position_rad = self.current_position_target_rad
             self.points.append(point)
             self.position_observations.extend(
                 summarize_position_observations(
@@ -935,8 +1153,15 @@ class FrictionExperiment:
             return [FrictionAction("target", 0.0), FrictionAction("checkpoint")]
         if self.phase == FrictionPhase.PAUSE and elapsed >= self.config.pause_s:
             if self.point_index + 1 >= len(self.config.targets):
-                self.phase = FrictionPhase.COMPLETE
-                return [FrictionAction("finish")]
+                if self.position_index + 1 >= len(self.position_targets_rad):
+                    self.phase = FrictionPhase.COMPLETE
+                    return [FrictionAction("finish")]
+                self.position_index += 1
+                self.point_index = -1
+                self.phase = FrictionPhase.CONFIGURING_POSITION
+                self.phase_started_s = now_s
+                self.phase_samples.clear()
+                return [FrictionAction("configure_position"), FrictionAction("checkpoint")]
             return self._start_velocity_point(now_s, increment=True)
         return []
 
@@ -946,6 +1171,26 @@ class FrictionExperiment:
         self.phase = FrictionPhase.ZERO
         self.phase_started_s = now_s
         self.phase_samples.clear()
+        return [FrictionAction("target", 0.0)]
+
+    def position_configuration_applied(self, now_s: float) -> list[FrictionAction]:
+        if self.phase != FrictionPhase.CONFIGURING_POSITION:
+            return []
+        self.phase = FrictionPhase.POSITIONING
+        self.phase_started_s = now_s
+        self._positioning_started_s = now_s
+        self.phase_samples.clear()
+        self.angle_window.clear()
+        return [FrictionAction("position_target", self.current_position_target_rad)]
+
+    def actuator_configuration_applied(self, now_s: float) -> list[FrictionAction]:
+        if self.phase != FrictionPhase.CONFIGURING_ACTUATOR:
+            return []
+        self.phase = FrictionPhase.ACTUATOR_BASELINE
+        self.phase_started_s = now_s
+        self.phase_samples.clear()
+        self.angle_window.clear()
+        self._reset_angle_filter()
         return [FrictionAction("target", 0.0)]
 
     def enter_recovery(self) -> list[FrictionAction]:
@@ -974,9 +1219,18 @@ class FrictionExperiment:
         self._reset_angle_filter()
         if self._recovery_mode == "velocity":
             self.phase = FrictionPhase.ZERO
+        elif self._recovery_mode == "position":
+            self.phase = FrictionPhase.POSITIONING
+            self._positioning_started_s = now_s
         else:
             self.phase = FrictionPhase.ACTUATOR_BASELINE
-        return [FrictionAction("target", 0.0)]
+        target = (
+            self.current_position_target_rad
+            if self._recovery_mode == "position"
+            else 0.0
+        )
+        action_kind = "position_target" if self._recovery_mode == "position" else "target"
+        return [FrictionAction(action_kind, target)]
 
     def abort(self, reason: str) -> list[FrictionAction]:
         self.abort_reason = reason
@@ -985,37 +1239,50 @@ class FrictionExperiment:
 
     def estimate(self) -> FrictionEstimate:
         estimate = estimate_friction(self.points)
-        found = self.breakaway_results
-        positive = None
-        negative = None
-        if 1 in found and found[1].current_detected:
-            positive = found[1].mean_abs_measured_current_a * self.torque_constant_nm_per_a
-            estimate.breakaway_positive_nm = positive
-        if -1 in found and found[-1].current_detected:
-            negative = found[-1].mean_abs_measured_current_a * self.torque_constant_nm_per_a
-            estimate.breakaway_negative_nm = negative
-        if positive is not None and negative is not None:
-            estimate.breakaway_friction_nm = (positive + negative) / 2.0
-        if self.actuator_complete and not self.measured_current_complete:
-            missing = [
-                "+" if direction > 0 else "−"
-                for direction in (1, -1)
-                if not found[direction].current_detected
-            ]
+        directional_torques: dict[int, list[float]] = {1: [], -1: []}
+        missing: list[str] = []
+        for position_index, position_target in enumerate(self.position_targets_rad):
+            found = self.breakaway_results_for_position(position_index)
+            for direction in (1, -1):
+                attempt = found.get(direction)
+                if attempt is None or not attempt.current_detected:
+                    missing.append(
+                        f"{position_target:.6g} рад/"
+                        + ("+" if direction > 0 else "−")
+                    )
+                    continue
+                directional_torques[direction].append(
+                    attempt.mean_abs_measured_current_a * self.torque_constant_nm_per_a
+                )
+        positive = directional_torques[1]
+        negative = directional_torques[-1]
+        if positive:
+            estimate.breakaway_positive_nm = float(np.mean(positive))
+        if negative:
+            estimate.breakaway_negative_nm = float(np.mean(negative))
+        if positive and negative:
+            estimate.breakaway_friction_nm = (
+                estimate.breakaway_positive_nm + estimate.breakaway_negative_nm
+            ) / 2.0
+        if missing:
             estimate.valid = False
             estimate.note = (
-                "Страгивание найдено, но измеренный Iq не подтверждён для направления "
+                "Мотор и карта по Uq пригодны для продолжения, но физический момент по Iq "
+                "нельзя принимать для точек "
                 + ", ".join(missing)
-                + "; модель трения принимать нельзя"
+                + ": измеренный Iq отсутствует или имеет неверный знак"
             )
         return estimate
 
     def checkpoint_payload(self, experiment_id: int | None) -> dict[str, Any]:
         return {
-            "schema": 5,
+            "schema": 6,
             "experiment_id": experiment_id,
             "phase": self.phase.value,
             "config": self.config.to_dict(),
+            "position_targets_rad": list(self.position_targets_rad),
+            "position_index": self.position_index,
+            "point_index": self.point_index,
             "motor_parameters": {
                 "torque_constant_nm_per_a": self.torque_constant_nm_per_a,
                 "phase_resistance_ohm": self.phase_resistance_ohm,
@@ -1036,6 +1303,7 @@ class FrictionExperiment:
         attempted = {
             (attempt.direction, round(abs(attempt.command_voltage_v), 12))
             for attempt in self.actuator_attempts
+            if attempt.position_index == self.position_index
         }
         for voltage in self.config.pulse_levels:
             for direction in (1, -1):
@@ -1107,6 +1375,8 @@ class FrictionExperiment:
                 ),
                 start_angle_rad=self.pulse_start_angle,
                 end_angle_rad=latest,
+                position_index=self.position_index,
+                measurement_position_rad=self.current_position_target_rad,
             )
         )
 
@@ -1116,6 +1386,7 @@ class FrictionExperiment:
         attempted = {
             (attempt.direction, round(abs(attempt.command_voltage_v), 12))
             for attempt in self.actuator_attempts
+            if attempt.position_index == self.position_index
         }
         found = self.breakaway_results
         for voltage in self.config.pulse_levels:
@@ -1162,6 +1433,35 @@ class FrictionExperiment:
         self._pending_angle_sample = None
         self._trusted_fast_angle_step = None
 
+    def prepare_sample(self, sample: TelemetrySample) -> TelemetrySample:
+        """Unwrap the shaft angle across board resets, then reject isolated angle glitches."""
+
+        raw_angle = sample.angle_rad
+        prepared = self._filter_angle_sample(sample)
+        if (
+            raw_angle is not None
+            and prepared.angle_rad is not None
+            and self._trusted_angle_sample is prepared
+        ):
+            self._board_angle_offset_rad = prepared.angle_rad - raw_angle
+        return prepared
+
+    def _unwrap_angle_sample(self, sample: TelemetrySample) -> TelemetrySample:
+        angle = sample.angle_rad
+        reference = self._continuous_angle_reference_rad
+        if angle is None or not math.isfinite(angle) or reference is None:
+            return sample
+        unwrapped = angle + math.tau * round((reference - angle) / math.tau)
+        if math.isclose(unwrapped, angle, rel_tol=0.0, abs_tol=1e-12):
+            return sample
+        return replace(sample, angle_rad=unwrapped)
+
+    def _trust_angle_sample(self, sample: TelemetrySample) -> TelemetrySample:
+        self._trusted_angle_sample = sample
+        if sample.angle_rad is not None:
+            self._continuous_angle_reference_rad = float(sample.angle_rad)
+        return sample
+
     def _angle_jump_limit(self, previous: TelemetrySample, current: TelemetrySample) -> float:
         elapsed = min(0.02, max(0.0, current.timestamp_s - previous.timestamp_s))
         return max(
@@ -1172,18 +1472,17 @@ class FrictionExperiment:
     def _filter_angle_sample(self, sample: TelemetrySample) -> TelemetrySample:
         if sample.angle_rad is None or not math.isfinite(sample.angle_rad):
             return sample
+        sample = self._unwrap_angle_sample(sample)
         trusted = self._trusted_angle_sample
         if trusted is None or trusted.angle_rad is None:
-            self._trusted_angle_sample = sample
             self._pending_angle_sample = None
-            return sample
+            return self._trust_angle_sample(sample)
         if abs(sample.angle_rad - trusted.angle_rad) <= self._angle_jump_limit(trusted, sample):
             if self._pending_angle_sample is not None:
                 self.rejected_angle_samples += 1
             self._pending_angle_sample = None
             self._trusted_fast_angle_step = None
-            self._trusted_angle_sample = sample
-            return sample
+            return self._trust_angle_sample(sample)
         current_step_from_trusted = sample.angle_rad - trusted.angle_rad
         fast_step = self._trusted_fast_angle_step
         if (
@@ -1193,8 +1492,7 @@ class FrictionExperiment:
         ):
             self._pending_angle_sample = None
             self._trusted_fast_angle_step = current_step_from_trusted
-            self._trusted_angle_sample = sample
-            return sample
+            return self._trust_angle_sample(sample)
         pending = self._pending_angle_sample
         if (
             pending is not None
@@ -1212,8 +1510,7 @@ class FrictionExperiment:
             ):
                 self._pending_angle_sample = None
                 self._trusted_fast_angle_step = current_step if steps_form_motion else None
-                self._trusted_angle_sample = sample
-                return sample
+                return self._trust_angle_sample(sample)
         if pending is not None:
             self.rejected_angle_samples += 1
         self._trusted_fast_angle_step = None
@@ -1244,6 +1541,25 @@ class FrictionExperiment:
             and math.isfinite(sample.angle_rad)
         ]
         return len(angles) >= 4 and max(angles) - min(angles) < self.config.movement_threshold_rad
+
+    def _position_is_settled(self) -> bool:
+        if not self.phase_samples:
+            return False
+        latest_timestamp = self.phase_samples[-1].timestamp_s
+        angles = [
+            sample.angle_rad
+            for sample in self.phase_samples
+            if sample.timestamp_s >= latest_timestamp - FRICTION_POSITION_SETTLE_S
+            and sample.angle_rad is not None
+            and math.isfinite(sample.angle_rad)
+        ]
+        return (
+            len(angles) >= 4
+            and max(angles) - min(angles)
+            <= max(self.config.movement_threshold_rad, FRICTION_POSITION_TOLERANCE_RAD / 2.0)
+            and abs(angles[-1] - self.current_position_target_rad)
+            <= FRICTION_POSITION_TOLERANCE_RAD
+        )
 
     def _set_current_detection_threshold(self) -> None:
         latest_timestamp = self.phase_samples[-1].timestamp_s if self.phase_samples else 0.0

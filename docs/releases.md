@@ -19,6 +19,26 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.6
+
+- Repeat the actuator preflight and all four velocity points at up to 20 automatic shaft
+  positions. The first position is the current angle; later positions use a signed configurable
+  step.
+- Move between measurement positions with the loaded angle and velocity controllers in
+  `angle + Voltage torque`, while retaining the experiment's voltage, velocity and travel limits.
+- Validate the complete predicted sweep around every automatic position before PWM can be
+  enabled, stop if a requested position does not settle within 60 seconds, and checkpoint the
+  outer position index plus the inner velocity point.
+- Keep a continuous experiment coordinate when a board reset changes the reported angle by a
+  whole turn, while translating future position targets into the board's new coordinate frame to
+  prevent an unintended extra revolution.
+- Offer a per-start checkbox for a short sound when telemetry restoration took more than five
+  seconds; the alert fires once per long interruption.
+- Replace the ambiguous final “model cannot be used” wording with an explicit distinction:
+  the motor and Uq position map remain usable, while unconfirmed/wrong-sign Iq cannot be treated
+  as a physical torque measurement.
+- Checkpoint and result schema 6 include automatic position targets and progress.
+
 ## 0.3.5
 
 - Record the shaft coordinate of every direct-Uq breakaway event.

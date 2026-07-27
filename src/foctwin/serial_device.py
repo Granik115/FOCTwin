@@ -94,7 +94,7 @@ class SerialDevice:
     def send(self, command: str) -> None:
         if not self.connected:
             raise RuntimeError("Serial device is not connected")
-        payload = f"{command.rstrip()}\n".encode("utf-8")
+        payload = f"{command.rstrip()}\n".encode()
         with self._write_lock:
             self._port.write(payload)
             self._port.flush()
@@ -121,7 +121,7 @@ class SerialDevice:
                 self.send(command)
                 sent.append(command)
                 time.sleep(0.015)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
         return sent
 
@@ -134,7 +134,7 @@ class SerialDevice:
                 received_at = time.monotonic()
                 for line in framer.feed(raw):
                     self.on_line(received_at, line)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.on_state(False, f"Ошибка Serial: {exc}")
         finally:
             if not self._stop.is_set():
