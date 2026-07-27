@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.6 contains:
+Version 0.3.7 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -39,13 +39,19 @@ Version 0.3.6 contains:
 - separate recording of commanded Uq, actual Uq and measured Iq; movement in both directions
   advances the diagnostic, while missing measured-current evidence invalidates affected friction
   points instead of hiding the rest of the experiment;
-- a gated four-point velocity experiment (`+0.02`, `-0.02`, `+0.05`, `-0.05 rad/s`) that uses
-  measured Iq for directional Coulomb, viscous and breakaway estimates;
+- a gated six-point velocity experiment at low, geometric-middle and high speed in both
+  directions, retaining transient rise, acceleration and overshoot diagnostics as well as
+  steady-state tracking;
 - a cumulative position map that keeps each breakaway coordinate and divides velocity sweeps into
   configurable angle bins, storing measured-Iq torque separately from a diagnostic Uq estimate;
 - optional multi-position friction runs: the current coordinate is measured first, then the
-  loaded angle/velocity controllers move by a signed configurable step and repeat local preflight
-  plus all four velocity points at every bounded position;
+  loaded angle/velocity controllers move by a signed configurable step and repeat a zero baseline,
+  local preflight and all six velocity points at every bounded position;
+- configurable forward/reverse map passes that revisit coordinates to expose approach-direction
+  hysteresis and repeatability instead of collapsing every coordinate into one sample;
+- adaptive automatic positioning that raises only its own ALC after both a progress stall and
+  confirmed Uq saturation, up to a separately approved voltage ceiling; a stall without
+  saturation is reported as a controller/mode problem;
 - continuous host-side angle tracking across board resets, with position commands translated back
   into the board's current turn reference so a ±2π reset cannot request an extra revolution;
 - sustained-current validation that rejects sparse or wrong-sign Iq bursts instead of accepting
@@ -54,6 +60,10 @@ Version 0.3.6 contains:
   Serial link reconnects, with 50 recoveries by default for board-reset workflows;
 - an optional short alert after telemetry finally returns from an interruption longer than five
   seconds, selectable in every test-start confirmation;
+- a structured diagnostic report covering zero-signal quality, position-step performance,
+  breakaway envelopes, directional asymmetry, repeated-position variability, speed tracking,
+  measured-Iq usability, telemetry interruptions and readiness for Simulink identification,
+  saved as a short standalone JSON alongside the full experiment export;
 - explicit review before identified friction values are accepted into the active profile;
 - automatically synchronized experiment, FOCTwin and SimpleFOC limits, with command ALC kept
   separate from the independently measured-current emergency threshold and every change stated

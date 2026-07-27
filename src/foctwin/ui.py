@@ -60,6 +60,7 @@ from foctwin.friction import (
     FRICTION_DIRECT_VOLTAGE_SENTINEL,
     FRICTION_MAX_AUTOMATIC_POSITIONS,
     FRICTION_MAX_CURRENT_TRIP_A,
+    FRICTION_MAX_MAP_PASSES,
     FRICTION_MAX_POSITION_BIN_WIDTH_RAD,
     FRICTION_MAX_RECOVERY_ATTEMPTS,
     FRICTION_MAX_TARGET_VELOCITY_RAD_S,
@@ -71,6 +72,7 @@ from foctwin.friction import (
     FRICTION_MIN_VOLTAGE_LIMIT_V,
     FRICTION_MONITOR_MASK,
     ActuatorPulseResult,
+    BaselineDiagnostic,
     FrictionAction,
     FrictionEstimate,
     FrictionExperiment,
@@ -78,6 +80,7 @@ from foctwin.friction import (
     FrictionPointResult,
     FrictionTestConfig,
     PositionFrictionObservation,
+    PositioningResult,
 )
 from foctwin.matlab_backend import MatlabBackend
 from foctwin.project_store import ProjectStore
@@ -789,6 +792,14 @@ class MainWindow(QMainWindow):
             3,
             0.1,
         )
+        self.friction_map_passes = QSpinBox()
+        self.friction_map_passes.setRange(1, FRICTION_MAX_MAP_PASSES)
+        self.friction_map_passes.setValue(2)
+        self.friction_position_tolerance = spin(0.005, 0.0001, 0.1, 4, 0.001)
+        self.friction_position_voltage_step = spin(0.25, 0.01, 20.0, 3, 0.05)
+        self.friction_position_voltage_max = spin(3.0, 0.1, 100.0, 3, 0.25)
+        self.friction_position_stall_window = spin(3.0, 1.0, 15.0, 1, 0.5)
+        self.friction_position_min_progress = spin(0.002, 0.0001, 0.1, 4, 0.0005)
         fields = (
             ("Начальный Uq, В", self.friction_pulse_start),
             ("Шаг Uq, В", self.friction_pulse_step),
@@ -814,6 +825,12 @@ class MainWindow(QMainWindow):
             ("Интервал карты координат, рад", self.friction_position_bin),
             ("Автоматических положений", self.friction_automatic_positions),
             ("Шаг автосмещения, рад", self.friction_automatic_position_step),
+            ("Проходов карты туда/обратно", self.friction_map_passes),
+            ("Допуск автопозиции, рад", self.friction_position_tolerance),
+            ("Шаг повышения Uq автосмещения, В", self.friction_position_voltage_step),
+            ("Максимальный Uq автосмещения, В", self.friction_position_voltage_max),
+            ("Окно обнаружения остановки, с", self.friction_position_stall_window),
+            ("Минимальный прогресс за окно, рад", self.friction_position_min_progress),
         )
         rows_per_column = (len(fields) + 1) // 2
         for index, (label, widget) in enumerate(fields):
@@ -880,14 +897,33 @@ class MainWindow(QMainWindow):
                 "Отсчёты",
                 "Статус",
             ],
-            4,
+            len(FrictionTestConfig().targets),
         )
-        for row, target in enumerate((0.02, -0.02, 0.05, -0.05)):
+        for row, target in enumerate(FrictionTestConfig().targets):
             self.friction_points_table.setItem(row, 0, QTableWidgetItem("текущая"))
             self.friction_points_table.setItem(row, 1, QTableWidgetItem(f"{target:g}"))
             for column in range(2, self.friction_points_table.columnCount()):
                 self.friction_points_table.setItem(row, column, QTableWidgetItem("—"))
         content_layout.addWidget(self.friction_points_table)
+
+        positioning_group = QGroupBox("Диагностика автоматических смещений")
+        positioning_layout = QVBoxLayout(positioning_group)
+        self.friction_positioning_table = table(
+            [
+                "№",
+                "Старт, рад",
+                "Цель, рад",
+                "Финиш, рад",
+                "Ошибка, рад",
+                "Время, с",
+                "Uq нач./кон., В",
+                "Повышений",
+                "Статус",
+            ],
+            0,
+        )
+        positioning_layout.addWidget(self.friction_positioning_table)
+        content_layout.addWidget(positioning_group)
 
         position_group = QGroupBox("Карта трения по координате")
         position_layout = QVBoxLayout(position_group)
@@ -940,13 +976,17 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.friction_accept_button)
         content_layout.addWidget(result_group)
 
-        future = QLabel(
-            "Следующие этапы идентификации — инерция, позиционная неравномерность и расширенные "
-            "возбуждения — будут добавляться поверх этого же механизма опытов и checkpoint."
+        diagnostic_group = QGroupBox("Диагностический отчёт")
+        diagnostic_layout = QVBoxLayout(diagnostic_group)
+        self.friction_diagnostic_report = QPlainTextEdit()
+        self.friction_diagnostic_report.setReadOnly(True)
+        self.friction_diagnostic_report.setMaximumHeight(320)
+        self.friction_diagnostic_report.setPlainText(
+            "После опыта здесь появятся однозначные выводы по автосмещению, трению, "
+            "асимметрии, повторяемости, Iq, телеметрии и готовности данных для модели."
         )
-        future.setObjectName("hint")
-        future.setWordWrap(True)
-        content_layout.addWidget(future)
+        diagnostic_layout.addWidget(self.friction_diagnostic_report)
+        content_layout.addWidget(diagnostic_group)
         content_layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -969,6 +1009,12 @@ class MainWindow(QMainWindow):
             self.friction_position_bin,
             self.friction_automatic_positions,
             self.friction_automatic_position_step,
+            self.friction_map_passes,
+            self.friction_position_tolerance,
+            self.friction_position_voltage_step,
+            self.friction_position_voltage_max,
+            self.friction_position_stall_window,
+            self.friction_position_min_progress,
         ):
             widget.valueChanged.connect(self._refresh_friction_duration)
         self._refresh_friction_duration()
@@ -1000,6 +1046,12 @@ class MainWindow(QMainWindow):
             position_bin_width_rad=self.friction_position_bin.value(),
             automatic_position_count=self.friction_automatic_positions.value(),
             automatic_position_step_rad=self.friction_automatic_position_step.value(),
+            map_passes=self.friction_map_passes.value(),
+            position_tolerance_rad=self.friction_position_tolerance.value(),
+            positioning_voltage_step_v=self.friction_position_voltage_step.value(),
+            positioning_voltage_max_v=self.friction_position_voltage_max.value(),
+            position_stall_window_s=self.friction_position_stall_window.value(),
+            position_min_progress_rad=self.friction_position_min_progress.value(),
         )
 
     def _set_friction_config_widgets(self, config: FrictionTestConfig) -> None:
@@ -1027,24 +1079,33 @@ class MainWindow(QMainWindow):
         self.friction_position_bin.setValue(config.position_bin_width_rad)
         self.friction_automatic_positions.setValue(config.automatic_position_count)
         self.friction_automatic_position_step.setValue(config.automatic_position_step_rad)
+        self.friction_map_passes.setValue(config.map_passes)
+        self.friction_position_tolerance.setValue(config.position_tolerance_rad)
+        self.friction_position_voltage_step.setValue(config.positioning_voltage_step_v)
+        self.friction_position_voltage_max.setValue(config.positioning_voltage_max_v)
+        self.friction_position_stall_window.setValue(config.position_stall_window_s)
+        self.friction_position_min_progress.setValue(config.position_min_progress_rad)
         self._refresh_friction_duration()
 
     def _refresh_friction_duration(self, *_args: object) -> None:
         config = self._friction_config_from_widgets()
         self.friction_duration_label.setText(
             f"Сначала Uq ±{config.pulse_start_voltage_v:g}…±{config.pulse_max_voltage_v:g} В "
-            f"с шагом {config.pulse_step_voltage_v:g} В; затем скорости: "
-            f"+{config.low_velocity_rad_s:g}, −{config.low_velocity_rad_s:g}, "
-            f"+{config.high_velocity_rad_s:g}, −{config.high_velocity_rad_s:g} рад/с. "
+            f"с шагом {config.pulse_step_voltage_v:g} В; затем три модуля скорости "
+            f"{', '.join(f'{value:g}' for value in config.speed_levels)} рад/с "
+            "в обе стороны. "
             f"Карта: интервалы по {config.position_bin_width_rad:g} рад. "
-            f"Положений: {config.automatic_position_count}, шаг "
-            f"{config.automatic_position_step_rad:+g} рад. "
+            f"Уникальных положений: {config.automatic_position_count}, проходов: "
+            f"{config.map_passes}, измерений по координатам: "
+            f"{config.measurement_position_count}, шаг {config.automatic_position_step_rad:+g} рад. "
+            f"Автосмещение повышает Uq по {config.positioning_voltage_step_v:g} В до "
+            f"{config.positioning_voltage_max_v:g} В при подтверждённом насыщении. "
             f"Худший случай без восстановлений: около {config.estimated_duration_s:.0f} с."
         )
         self.friction_points_table.setRowCount(
-            config.automatic_position_count * len(config.targets)
+            config.measurement_position_count * len(config.targets)
         )
-        for position_index in range(config.automatic_position_count):
+        for position_index in range(config.measurement_position_count):
             for point_index, target in enumerate(config.targets):
                 row = position_index * len(config.targets) + point_index
                 position_label = (
@@ -1079,10 +1140,10 @@ class MainWindow(QMainWindow):
             payload = self.project.load_checkpoint("friction")
             if payload is None:
                 raise ValueError("В проекте нет checkpoint теста трения")
-            if int(payload.get("schema", 0)) != 6:
+            if int(payload.get("schema", 0)) != 7:
                 raise ValueError(
-                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.6; "
-                    "начните новый тест с автоматическими координатами"
+                    "Checkpoint создан старым алгоритмом и несовместим с 0.3.7; "
+                    "начните новый комплексный диагностический тест"
                 )
             points = [
                 FrictionPointResult.from_dict(point)
@@ -1095,6 +1156,14 @@ class MainWindow(QMainWindow):
             position_observations = [
                 PositionFrictionObservation.from_dict(observation)
                 for observation in payload.get("position_observations", [])
+            ]
+            baseline_diagnostics = [
+                BaselineDiagnostic.from_dict(diagnostic)
+                for diagnostic in payload.get("baseline_diagnostics", [])
+            ]
+            positioning_results = [
+                PositioningResult.from_dict(result)
+                for result in payload.get("positioning_results", [])
             ]
             position_targets = tuple(
                 float(value) for value in payload.get("position_targets_rad", ())
@@ -1118,6 +1187,8 @@ class MainWindow(QMainWindow):
             completed_points=points,
             actuator_attempts=actuator_attempts,
             position_observations=position_observations,
+            baseline_diagnostics=baseline_diagnostics,
+            positioning_results=positioning_results,
             experiment_id=int(experiment_id) if experiment_id is not None else None,
             telemetry_paths=telemetry_paths,
             position_targets_rad=position_targets,
@@ -1131,6 +1202,8 @@ class MainWindow(QMainWindow):
         completed_points: list[FrictionPointResult] | None = None,
         actuator_attempts: list[ActuatorPulseResult] | None = None,
         position_observations: list[PositionFrictionObservation] | None = None,
+        baseline_diagnostics: list[BaselineDiagnostic] | None = None,
+        positioning_results: list[PositioningResult] | None = None,
         experiment_id: int | None = None,
         telemetry_paths: list[str] | None = None,
         position_targets_rad: tuple[float, ...] | None = None,
@@ -1199,7 +1272,7 @@ class MainWindow(QMainWindow):
                 if position_targets_rad is not None
                 else config.automatic_position_targets(sample.angle_rad)
             )
-            if len(position_targets) != config.automatic_position_count:
+            if len(position_targets) != config.measurement_position_count:
                 raise ValueError("Число сохранённых координат не совпадает с настройкой опыта")
             safe_min = config.angle_min_rad + config.position_margin_rad
             safe_max = config.angle_max_rad - config.position_margin_rad
@@ -1237,9 +1310,12 @@ class MainWindow(QMainWindow):
         completed = list(completed_points or [])
         attempts = list(actuator_attempts or [])
         observations = list(position_observations or [])
+        baselines = list(baseline_diagnostics or [])
+        moves = list(positioning_results or [])
         self._render_actuator_attempts(attempts)
         self._render_friction_points(completed)
         self._render_position_observations(observations)
+        self._render_positioning_results(moves)
         self._friction_experiment = FrictionExperiment(
             config,
             self.profile.torque_constant_nm_per_a,
@@ -1248,6 +1324,8 @@ class MainWindow(QMainWindow):
             back_emf_v_per_krpm=self.profile.back_emf_v_per_krpm,
             actuator_attempts=attempts,
             position_observations=observations,
+            baseline_diagnostics=baselines,
+            positioning_results=moves,
             position_targets_rad=position_targets,
             position_index=position_index,
             point_index=point_index,
@@ -1338,8 +1416,10 @@ class MainWindow(QMainWindow):
     ) -> str:
         estimated_pulse_current = config.pulse_max_voltage_v / self.profile.phase_resistance_ohm
         maximum_velocity_alc = estimated_pulse_current * config.breakaway_margin
-        low_speed_travel = config.low_velocity_rad_s * (config.settle_s + config.measure_s)
-        high_speed_travel = config.high_velocity_rad_s * (config.settle_s + config.measure_s)
+        speed_travel = [
+            speed * (config.settle_s + config.measure_s)
+            for speed in config.speed_levels
+        ]
         positions = (
             position_targets
             if position_targets is not None
@@ -1365,13 +1445,19 @@ class MainWindow(QMainWindow):
             f"{maximum_velocity_alc:.3g} А. Если Iq не наблюдается в каком-либо направлении, "
             "тест продолжит диагностику, но не разрешит принять недостоверную модель трения.\n\n"
             "Скоростные участки действительно перемещают вал: расчётный путь одного участка "
-            f"составляет около {low_speed_travel:.3g} рад на малой и {high_speed_travel:.3g} рад "
-            "на большой скорости. Во время прохода данные будут разбиты на интервалы по "
+            "для трёх модулей скорости составляет около "
+            f"{', '.join(f'{value:.3g}' for value in speed_travel)} рад. "
+            "Во время прохода данные будут разбиты на интервалы по "
             f"{config.position_bin_width_rad:g} рад и сохранены как карта координат.\n\n"
-            f"Автоматических положений: {len(positions)} ({position_text} рад). Между ними "
+            f"Измерений по координатам: {len(positions)} ({position_text} рад), проходов карты "
+            f"{config.map_passes}. Между ними "
             "FOCTwin включит angle + Voltage torque с загруженными коэффициентами, ограничит "
-            f"скорость до {config.velocity_limit_rad_s:g} рад/с и дождётся устойчивой координаты. "
-            "В каждой позиции preflight и четыре скорости выполняются заново.\n\n"
+            f"скорость до {config.velocity_limit_rad_s:g} рад/с и потребует ошибку не больше "
+            f"{config.position_tolerance_rad:g} рад. Если вал остановится при насыщении, Uq "
+            f"будет повышаться по {config.positioning_voltage_step_v:g} В, но не выше "
+            f"{config.positioning_voltage_max_v:g} В. Остановка без насыщения будет отмечена как "
+            "ошибка регулятора/режима, а не как недостаток напряжения. В каждой позиции спокойный "
+            "ноль, preflight и шесть скоростных точек выполняются заново.\n\n"
             f"Допускается до {config.max_recovery_attempts} восстановлений телеметрии. "
             "Держите питание доступным для ручного отключения. Запустить?"
         )
@@ -1630,11 +1716,21 @@ class MainWindow(QMainWindow):
                             experiment.board_target_for_continuous(action.value)
                         )
                     )
+            elif action.kind == "position_limit" and action.value is not None:
+                self._send(self.protocol.current_limit(action.value))
+                if experiment is not None:
+                    voltage = action.value * self.profile.phase_resistance_ohm
+                    self.friction_status_label.setText(
+                        "Вал остановился при насыщении; предел автосмещения повышен до "
+                        f"эквивалентных {voltage:.6g} В Uq "
+                        f"({action.value:.6g} А в ALC)."
+                    )
             elif action.kind == "checkpoint":
                 if experiment is not None:
                     self._render_actuator_attempts(experiment.actuator_attempts)
                     self._render_friction_points(experiment.points)
                     self._render_position_observations(experiment.position_observations)
+                    self._render_positioning_results(experiment.positioning_results)
                 self._save_friction_checkpoint()
             elif action.kind == "configure_velocity":
                 if experiment is None:
@@ -1708,7 +1804,7 @@ class MainWindow(QMainWindow):
             experiment.velocity_configuration_applied(time.monotonic())
         )
         self.friction_status_label.setText(
-            "Исполнительная часть подтверждена; выдержка перед четырьмя скоростными точками…"
+            "Исполнительная часть подтверждена; выдержка перед шестью скоростными точками…"
         )
 
     def _finish_friction_position_configuration(self) -> None:
@@ -1780,6 +1876,7 @@ class MainWindow(QMainWindow):
                 f"{len(experiment.position_targets_rad)} · "
                 f"{phase_names.get(experiment.phase, experiment.phase.value)} · цель "
                 f"{experiment.current_position_target_rad:.6g} рад · "
+                f"Uq max {experiment.positioning_voltage_limit_v or 0.0:.6g} В · "
                 f"{max(0.0, now - experiment.phase_started_s):.1f} с · "
                 f"восстановлений {experiment.recovery_attempts}/"
                 f"{experiment.config.max_recovery_attempts}"
@@ -1825,8 +1922,9 @@ class MainWindow(QMainWindow):
         if recorder_path is not None and str(recorder_path) not in self._friction_telemetry_paths:
             self._friction_telemetry_paths.append(str(recorder_path))
         estimate = experiment.estimate()
+        diagnostic_report = experiment.diagnostic_report()
         result = {
-            "schema": 6,
+            "schema": 7,
             "status": status,
             "config": experiment.config.to_dict(),
             "automatic_positions": {
@@ -1858,6 +1956,13 @@ class MainWindow(QMainWindow):
                 "accepted_torque_source": "measured_iq_only",
                 "voltage_estimate_status": "diagnostic_only",
             },
+            "baseline_diagnostics": [
+                diagnostic.to_dict() for diagnostic in experiment.baseline_diagnostics
+            ],
+            "positioning_results": [
+                item.to_dict() for item in experiment.positioning_results
+            ],
+            "diagnostic_report": diagnostic_report,
             "telemetry_paths": self._friction_telemetry_paths,
             "interruption_count": experiment.interruption_count,
             "rejected_angle_samples": experiment.rejected_angle_samples,
@@ -1867,7 +1972,9 @@ class MainWindow(QMainWindow):
         self._render_actuator_attempts(experiment.actuator_attempts)
         self._render_friction_points(experiment.points)
         self._render_position_observations(experiment.position_observations)
+        self._render_positioning_results(experiment.positioning_results)
         self._render_friction_estimate(estimate)
+        self._render_diagnostic_report(diagnostic_report)
         if self.project is not None and self._friction_experiment_id is not None:
             fields: dict[str, object] = {
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -1881,6 +1988,14 @@ class MainWindow(QMainWindow):
                 result,
             )
             self._log("FRICTION", f"Результат сохранён: {export_path}")
+            diagnostic_path = self.project.save_export(
+                f"motor_diagnostic_{self._friction_experiment_id}",
+                diagnostic_report,
+            )
+            self._log(
+                "FRICTION",
+                f"Короткий диагностический отчёт сохранён: {diagnostic_path}",
+            )
             try:
                 map_path = self._save_friction_position_history()
                 if map_path is not None:
@@ -2011,6 +2126,7 @@ class MainWindow(QMainWindow):
     def _clear_friction_results(self) -> None:
         self.friction_actuator_table.setRowCount(0)
         self.friction_position_table.setRowCount(0)
+        self.friction_positioning_table.setRowCount(0)
         self.friction_actuator_note.setText(
             "Идёт проверка исполнительной части: команда Uq, фактический Uq и измеренный Iq "
             "не смешиваются."
@@ -2026,6 +2142,9 @@ class MainWindow(QMainWindow):
         self.friction_position_note.setText(
             "Карта появится после первого полезного скоростного участка. Оценка по Uq "
             "сохраняется только как диагностика, пока измерение Iq не подтверждено."
+        )
+        self.friction_diagnostic_report.setPlainText(
+            "Диагностический вывод будет сформирован даже при безопасной остановке теста."
         )
 
     def _render_actuator_attempts(self, attempts: list[ActuatorPulseResult]) -> None:
@@ -2082,6 +2201,103 @@ class MainWindow(QMainWindow):
             )
             for column, value in enumerate(values):
                 self.friction_points_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _render_positioning_results(self, results: list[PositioningResult]) -> None:
+        self.friction_positioning_table.setRowCount(len(results))
+        for row, result in enumerate(results):
+            values = (
+                str(result.position_index + 1),
+                (
+                    "—"
+                    if result.start_position_rad is None
+                    else f"{result.start_position_rad:.6g}"
+                ),
+                f"{result.target_position_rad:.6g}",
+                (
+                    "—"
+                    if result.final_position_rad is None
+                    else f"{result.final_position_rad:.6g}"
+                ),
+                (
+                    "—"
+                    if result.final_error_rad is None
+                    else f"{result.final_error_rad:.6g}"
+                ),
+                f"{result.duration_s:.3g}",
+                (
+                    f"{result.initial_voltage_limit_v:.6g} / "
+                    f"{result.final_voltage_limit_v:.6g}"
+                ),
+                str(result.voltage_boost_count),
+                result.note,
+            )
+            for column, value in enumerate(values):
+                self.friction_positioning_table.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem(value),
+                )
+
+    def _render_diagnostic_report(self, report: dict[str, object]) -> None:
+        lines = [str(report.get("verdict", "Диагностический вывод отсутствует."))]
+        findings = report.get("findings", [])
+        if isinstance(findings, list) and findings:
+            lines.append("")
+            lines.append("Обнаружено:")
+            severity_labels = {
+                "critical": "БЛОКИРУЕТ",
+                "high": "ВАЖНО",
+                "medium": "УЧЕСТЬ",
+            }
+            for index, item in enumerate(findings, 1):
+                if not isinstance(item, dict):
+                    continue
+                severity = severity_labels.get(str(item.get("severity")), "ИНФО")
+                lines.append(f"{index}. [{severity}] {item.get('conclusion', '')}")
+                evidence = item.get("evidence")
+                if isinstance(evidence, dict) and evidence:
+                    rendered = ", ".join(
+                        f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}"
+                        for key, value in evidence.items()
+                        if value is not None
+                    )
+                    if rendered:
+                        lines.append(f"   Данные: {rendered}")
+                next_action = item.get("next_action")
+                if next_action:
+                    lines.append(f"   Дальше: {next_action}")
+        recommendation = report.get("model_recommendation")
+        if isinstance(recommendation, dict):
+            lines.append("")
+            lines.append("Для модели:")
+            terms = recommendation.get("friction_terms", [])
+            if isinstance(terms, list):
+                lines.append("• трение: " + ", ".join(str(value) for value in terms))
+            lines.append(
+                "• измеренный Iq можно использовать как момент: "
+                + (
+                    "да"
+                    if recommendation.get("use_measured_iq_as_torque")
+                    else "нет"
+                )
+            )
+            lines.append(
+                "• абсолютную инерцию уже можно оценивать: "
+                + (
+                    "да"
+                    if recommendation.get("absolute_inertia_identification_ready")
+                    else "нет"
+                )
+            )
+            lines.append(
+                "• нужен диапазон/робастная оптимизация: "
+                + (
+                    "да"
+                    if recommendation.get("robust_range_required")
+                    else "пока не подтверждено"
+                )
+            )
+        self.friction_diagnostic_report.setPlainText("\n".join(lines))
 
     def _render_position_observations(
         self,
