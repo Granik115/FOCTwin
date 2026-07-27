@@ -795,7 +795,7 @@ class MainWindow(QMainWindow):
             1.0,
             -100.0,
             100.0,
-            3,
+            6,
             0.1,
         )
         self.friction_map_passes = QSpinBox()
