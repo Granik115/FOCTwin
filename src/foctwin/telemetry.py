@@ -76,6 +76,8 @@ class TelemetryRecorder:
         "current_d_a",
         "velocity_rad_s",
         "angle_rad",
+        "raw_angle_rad",
+        "angle_rejected",
         "raw",
     )
 

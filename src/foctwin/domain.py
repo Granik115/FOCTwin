@@ -107,6 +107,8 @@ class TelemetrySample:
     current_d_a: float | None = None
     velocity_rad_s: float | None = None
     angle_rad: float | None = None
+    raw_angle_rad: float | None = None
+    angle_rejected: bool = False
     raw: str = ""
 
 
