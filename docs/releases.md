@@ -19,6 +19,23 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.7
+
+- Diagnose the 0.3.6 automatic-position failure correctly: a residual error of 0.44–0.98 rad
+  while Uq is pinned at 2.16 or 1.56 V is saturation, not an overly large 0.01-rad tolerance.
+- Detect a progress stall, distinguish saturated from unsaturated positioning, and raise only the
+  positioning ALC in bounded voltage-equivalent steps up to a separately configured maximum.
+- Replace two speed magnitudes with low, geometric-middle and high speeds in both directions,
+  retaining transient acceleration, rise-time and overshoot evidence.
+- Add forward/reverse coordinate passes so the same position can be compared after opposite
+  approaches for repeatability, hysteresis and changing preload.
+- Save a zero baseline at every measurement position and record every automatic move with start,
+  target, final error, duration, initial/final Uq ceiling, boost count, hold values and saturation.
+- Produce a structured Russian diagnostic report with evidence and next actions for
+  position-dependent or asymmetric friction, poor repeatability, controller-path faults,
+  unreliable Iq, failed speed tracking, encoder/current zero quality and telemetry interruptions.
+- Checkpoint and result schema 7 preserve the complete diagnostic state.
+
 ## 0.3.6
 
 - Repeat the actuator preflight and all four velocity points at up to 20 automatic shaft

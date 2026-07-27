@@ -72,6 +72,9 @@ class FrictionAnalysisTests(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertAlmostEqual(result.mean_velocity_rad_s, 0.02, places=5)
         self.assertLess(result.velocity_std_rad_s, 0.001)
+        self.assertTrue(result.motion_valid)
+        self.assertIsNotNone(result.rise_time_s)
+        self.assertIsNotNone(result.transient_peak_velocity_rad_s)
 
     def test_point_is_not_accepted_when_measured_current_stays_in_noise(self):
         samples = [
@@ -122,16 +125,27 @@ class FrictionAnalysisTests(unittest.TestCase):
     def test_default_experiment_starts_narrow_but_accepts_user_increases(self):
         config = FrictionTestConfig()
         config.validate()
-        self.assertEqual(config.targets, (0.02, -0.02, 0.05, -0.05))
+        self.assertEqual(
+            config.targets,
+            (
+                0.02,
+                -0.02,
+                (0.02 * 0.05) ** 0.5,
+                -(0.02 * 0.05) ** 0.5,
+                0.05,
+                -0.05,
+            ),
+        )
         self.assertEqual(config.to_dict()["monitor_mask"], FRICTION_MONITOR_MASK)
         self.assertEqual(config.to_dict()["torque_mode"], "voltage")
         self.assertEqual(config.to_dict()["velocity_estimator"]["source"], "angle_slope")
-        self.assertEqual(config.to_dict()["algorithm_schema"], 6)
+        self.assertEqual(config.to_dict()["algorithm_schema"], 7)
         self.assertEqual(config.movement_threshold_rad, 0.001)
         self.assertEqual(config.max_recovery_attempts, 50)
         self.assertEqual(config.position_bin_width_rad, 0.1)
         self.assertEqual(config.automatic_position_count, 1)
-        self.assertEqual(config.automatic_position_targets(0.25), (0.25,))
+        self.assertEqual(config.map_passes, 2)
+        self.assertEqual(config.automatic_position_targets(0.25), (0.25, 0.25))
 
         config.current_trip_limit_a = 1.5
         config.voltage_limit_v = 24.0
@@ -163,9 +177,13 @@ class FrictionAnalysisTests(unittest.TestCase):
             angle_max_rad=5.0,
             automatic_position_count=3,
             automatic_position_step_rad=-1.0,
+            map_passes=2,
         )
 
-        self.assertEqual(config.automatic_position_targets(1.0), (1.0, 0.0, -1.0))
+        self.assertEqual(
+            config.automatic_position_targets(1.0),
+            (1.0, 0.0, -1.0, 0.0, 1.0),
+        )
 
         config.automatic_position_step_rad = 3.0
         with self.assertRaisesRegex(ValueError, "безопасного диапазона"):
@@ -218,6 +236,7 @@ class FrictionExperimentTests(unittest.TestCase):
             settle_s=1.0,
             measure_s=2.0,
             pause_s=0.5,
+            map_passes=1,
         )
 
     @staticmethod
@@ -392,7 +411,7 @@ class FrictionExperimentTests(unittest.TestCase):
         self.assertTrue(experiment.points[0].valid)
         self.assertGreaterEqual(len(experiment.position_observations), 1)
         checkpoint = experiment.checkpoint_payload(7)
-        self.assertEqual(checkpoint["schema"], 6)
+        self.assertEqual(checkpoint["schema"], 7)
         self.assertEqual(checkpoint["experiment_id"], 7)
         self.assertGreaterEqual(len(checkpoint["position_observations"]), 1)
 
@@ -430,7 +449,7 @@ class FrictionExperimentTests(unittest.TestCase):
             phase_resistance_ohm=0.675,
             actuator_attempts=self.confirmed_attempts(),
             position_targets_rad=(0.0, 1.0),
-            point_index=3,
+            point_index=len(config.targets) - 1,
         )
         experiment.phase = FrictionPhase.PAUSE
         experiment.phase_started_s = 0.0
@@ -486,6 +505,140 @@ class FrictionExperimentTests(unittest.TestCase):
             ["configure_actuator", "checkpoint"],
         )
         self.assertFalse(experiment.actuator_complete)
+
+    def test_stalled_saturated_positioning_raises_only_its_own_limit(self):
+        config = self.config()
+        config.positioning_voltage_step_v = 0.25
+        config.positioning_voltage_max_v = 0.7
+        config.position_stall_window_s = 3.0
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            actuator_attempts=self.confirmed_attempts(),
+            position_targets_rad=(0.0, 1.0),
+            position_index=1,
+        )
+        experiment.phase = FrictionPhase.CONFIGURING_POSITION
+        experiment.seed_angle(0.0)
+
+        actions = experiment.position_configuration_applied(0.0)
+        self.assertEqual(actions[0].kind, "position_target")
+        self.assertAlmostEqual(experiment.positioning_voltage_limit_v, 0.24)
+        for index in range(70):
+            violation, _ = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=index * 0.05,
+                    voltage_q_v=0.24,
+                    current_q_a=0.0,
+                    velocity_rad_s=0.0,
+                    angle_rad=0.0,
+                )
+            )
+            self.assertIsNone(violation)
+
+        actions = experiment.tick(3.2)
+
+        self.assertEqual([action.kind for action in actions], ["position_limit", "checkpoint"])
+        self.assertAlmostEqual(experiment.positioning_voltage_limit_v, 0.49)
+        self.assertAlmostEqual(actions[0].value, 0.49 / 0.675)
+        self.assertEqual(experiment.phase, FrictionPhase.POSITIONING)
+
+    def test_positioning_stall_without_saturation_reports_controller_path(self):
+        config = self.config()
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            actuator_attempts=self.confirmed_attempts(),
+            position_targets_rad=(0.0, 1.0),
+            position_index=1,
+        )
+        experiment.phase = FrictionPhase.CONFIGURING_POSITION
+        experiment.seed_angle(0.0)
+        experiment.position_configuration_applied(0.0)
+        for index in range(70):
+            violation, _ = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=index * 0.05,
+                    voltage_q_v=0.05,
+                    current_q_a=0.0,
+                    velocity_rad_s=0.0,
+                    angle_rad=0.0,
+                )
+            )
+            self.assertIsNone(violation)
+
+        actions = experiment.tick(3.2)
+        report = experiment.diagnostic_report()
+
+        self.assertEqual(actions[0].kind, "safe_stop")
+        self.assertEqual(experiment.phase, FrictionPhase.ABORTED)
+        self.assertIn("без насыщения", experiment.abort_reason)
+        self.assertFalse(experiment.positioning_results[0].reached)
+        self.assertTrue(
+            any(
+                item["code"] == "positioning_controller_path"
+                for item in report["findings"]
+            )
+        )
+
+    def test_positioning_at_maximum_uq_reports_local_torque_limit(self):
+        config = self.config()
+        config.positioning_voltage_step_v = 0.04
+        config.positioning_voltage_max_v = 0.24
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            actuator_attempts=self.confirmed_attempts(),
+            position_targets_rad=(0.0, 1.0),
+            position_index=1,
+        )
+        experiment.phase = FrictionPhase.CONFIGURING_POSITION
+        experiment.seed_angle(0.0)
+        experiment.position_configuration_applied(0.0)
+        for index in range(70):
+            violation, _ = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=index * 0.05,
+                    voltage_q_v=0.24,
+                    current_q_a=0.0,
+                    velocity_rad_s=0.0,
+                    angle_rad=0.0,
+                )
+            )
+            self.assertIsNone(violation)
+
+        actions = experiment.tick(3.2)
+        report = experiment.diagnostic_report()
+
+        self.assertEqual(actions[0].kind, "safe_stop")
+        self.assertIn("максимальном Uq", experiment.abort_reason)
+        self.assertTrue(experiment.positioning_results[0].saturated_at_end)
+        self.assertTrue(
+            any(
+                item["code"] == "positioning_torque_limit"
+                for item in report["findings"]
+            )
+        )
+
+    def test_baseline_is_saved_as_a_separate_sensor_diagnostic(self):
+        experiment = FrictionExperiment(
+            self.config(),
+            1.0,
+            phase_resistance_ohm=0.675,
+        )
+        experiment.start(0.0)
+        self.add_stationary_samples(experiment, 0.0, 0.0, current_q_a=0.002)
+
+        experiment.tick(0.5)
+
+        self.assertEqual(len(experiment.baseline_diagnostics), 1)
+        diagnostic = experiment.baseline_diagnostics[0]
+        self.assertEqual(diagnostic.position_index, 0)
+        self.assertAlmostEqual(diagnostic.mean_current_q_a, 0.002)
+        self.assertEqual(diagnostic.note, "ОК")
 
     def test_telemetry_recovery_repeats_current_point(self):
         experiment = self.experiment_after_preflight()

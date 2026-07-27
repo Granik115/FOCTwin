@@ -26,7 +26,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Multi-position two-stage friction experiment (0.3.6)
+## Multi-position diagnostic friction experiment (0.3.7)
 
 The actuator preflight temporarily writes the SimpleFOC `NOT_SET` sentinel to phase resistance.
 With `torque + Voltage`, this makes the target a direct Uq command. Default pulses alternate from
@@ -45,6 +45,13 @@ The velocity-controller command limit is set slightly above the larger breakaway
 current. The measured-current trip remains independent and can stop the drive at a lower value.
 Final torque and friction coefficients use measured Iq only.
 
+Automatic positioning starts from the breakaway-derived limit but does not assume that one
+position represents the whole mechanism. If progress stops while measured Uq is at least 90% of
+the active positioning ceiling, FOCTwin raises only the positioning ALC by the configured step.
+It never exceeds the separately confirmed maximum positioning Uq or the global experiment
+voltage limit. A stall without Uq saturation aborts instead of blindly increasing torque and is
+reported as a likely angle/velocity controller or mode-path problem.
+
 Measured current must be present in most samples and predominantly have the sign required by the
 commanded direction. Sparse bursts or alternating-sign current no longer validate a point. Each
 velocity sweep is also divided into angle bins. Local Uq, speed and a resistance/back-EMF estimate
@@ -55,6 +62,11 @@ During this experiment, the firmware velocity field is diagnostic. Safety speed 
 rolling angle slope. This keeps impossible isolated values such as +43 rad/s from stopping a
 stationary shaft while preserving actual speed and travel protection. The angle path also rejects
 an isolated zero/dropout or jump that returns on the next sample; sustained motion is retained.
+
+The reverse map pass and the third speed level intentionally make the full diagnostic longer.
+They provide repeated coordinates, approach-direction evidence and enough speed levels to detect
+when a single Coulomb-plus-viscous line is inadequate. The start dialog shows the resulting
+position sequence and estimated worst-case duration.
 
 ## Failure and restoration policy
 
