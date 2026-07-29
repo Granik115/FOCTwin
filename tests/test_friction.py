@@ -892,6 +892,74 @@ class EvidenceProtocolTests(unittest.TestCase):
             "residual_displacement_after_zero",
         )
 
+    def test_pwm_off_observer_ignores_inactive_voltage_telemetry(self):
+        config = self.config(
+            pulse_max_voltage_v=0.5,
+            fixed_velocity_voltage_limit_v=0.5,
+            positioning_voltage_max_v=0.5,
+        )
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            position_targets_rad=(1.0,),
+        )
+        experiment.seed_angle(1.0)
+        experiment.start(0.0)
+
+        for index in range(5):
+            violation, _ = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=index * 0.05,
+                    voltage_q_v=-0.627,
+                    voltage_d_v=0.75,
+                    current_q_a=0.0,
+                    current_d_a=0.0,
+                    velocity_rad_s=0.0,
+                    angle_rad=1.0,
+                    raw_angle_rad=1.0,
+                )
+            )
+            self.assertIsNone(violation)
+
+        experiment.tick(config.pwm_off_observation_s + 0.1)
+        experiment.actuator_configuration_applied(config.pwm_off_observation_s + 0.2)
+        violation = None
+        for index in range(3):
+            violation, _ = experiment.add_sample(
+                TelemetrySample(
+                    timestamp_s=config.pwm_off_observation_s + 0.3 + index * 0.05,
+                    voltage_q_v=-0.627,
+                    voltage_d_v=0.0,
+                    current_q_a=0.0,
+                    current_d_a=0.0,
+                    velocity_rad_s=0.0,
+                    angle_rad=1.0,
+                    raw_angle_rad=1.0,
+                )
+            )
+            if violation:
+                break
+
+        self.assertIn("Uq", violation)
+
+    def test_checkpoint_after_pwm_off_resumes_in_actuator_mode(self):
+        config = self.config()
+        pwm_off_baseline = self.baselines()[0]
+        experiment = FrictionExperiment(
+            config,
+            1.0,
+            phase_resistance_ohm=0.675,
+            baseline_diagnostics=(pwm_off_baseline,),
+            position_targets_rad=(1.0,),
+        )
+        experiment.seed_angle(1.0)
+
+        self.assertEqual(experiment.configuration_mode, "actuator")
+        actions = experiment.start(0.0)
+        self.assertEqual(experiment.phase, FrictionPhase.ACTUATOR_BASELINE)
+        self.assertEqual(actions[0].value, 0.0)
+
     def test_repeated_fixed_steps_measure_controller_objective_noise(self):
         config = self.config()
         results = []

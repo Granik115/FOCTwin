@@ -722,7 +722,7 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Безопасный двухэтапный план")
         config_grid = QGridLayout(config_group)
         self.friction_evidence_mode = QCheckBox(
-            "Доказательный режим 0.3.9: PWM off/on, повторы, фиксированный ALC"
+            "Доказательный режим 0.3.10: PWM off/on, повторы, фиксированный ALC"
         )
         self.friction_evidence_mode.setChecked(True)
         config_grid.addWidget(self.friction_evidence_mode, 0, 0, 1, 4)

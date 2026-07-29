@@ -1380,11 +1380,17 @@ class FrictionExperiment:
     def configuration_mode(self) -> str:
         if self.phase == FrictionPhase.RECOVERING:
             return self._recovery_mode
-        if self.config.evidence_mode and self.phase in {
-            FrictionPhase.IDLE,
-            FrictionPhase.CONFIGURING_OBSERVER,
-            FrictionPhase.SENSOR_PWM_OFF,
-        }:
+        if self.config.evidence_mode and (
+            self.phase
+            in {
+                FrictionPhase.CONFIGURING_OBSERVER,
+                FrictionPhase.SENSOR_PWM_OFF,
+            }
+            or (
+                self.phase == FrictionPhase.IDLE
+                and not self._sensor_off_complete_for_position(self.position_index)
+            )
+        ):
             return "observer"
         if self.phase in {
             FrictionPhase.CONFIGURING_POSITION,
@@ -3534,12 +3540,21 @@ class FrictionExperiment:
             if self.configuration_mode == "actuator"
             else self.config.voltage_limit_v
         )
-        for name, value, limit in (
+        monitored_values = [
             ("Iq", sample.current_q_a, self.config.current_trip_limit_a),
             ("Id", sample.current_d_a, self.config.current_trip_limit_a),
-            ("Uq", sample.voltage_q_v, uq_limit),
-            ("Ud", sample.voltage_d_v, self.config.voltage_limit_v),
-        ):
+        ]
+        if self.configuration_mode != "observer":
+            monitored_values.extend(
+                (
+                    ("Uq", sample.voltage_q_v, uq_limit),
+                    ("Ud", sample.voltage_d_v, self.config.voltage_limit_v),
+                )
+            )
+        else:
+            self.soft_limit_counts["Uq"] = 0
+            self.soft_limit_counts["Ud"] = 0
+        for name, value, limit in monitored_values:
             violation = self._debounced_limit(name, value, limit)
             if violation:
                 return violation
