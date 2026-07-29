@@ -30,6 +30,8 @@ FRICTION_ANGLE_GLITCH_RATE_RAD_S = 0.5
 FRICTION_ANGLE_GLITCH_MARGIN_RAD = 0.0005
 FRICTION_ANGLE_RESOLUTION_RAD = 0.0001
 FRICTION_MOVEMENT_CONFIRMATION_SAMPLES = 2
+FRICTION_MIN_PULSE_SAMPLES = 2
+FRICTION_EVIDENCE_RECOMMENDED_PULSE_MAX_V = 3.0
 FRICTION_MIN_POSITION_BIN_WIDTH_RAD = 0.01
 FRICTION_MAX_POSITION_BIN_WIDTH_RAD = 10.0
 FRICTION_MIN_POSITION_BIN_SAMPLES = 8
@@ -103,6 +105,10 @@ class ActuatorPulseResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def has_measurement(self) -> bool:
+        return self.sample_count >= FRICTION_MIN_PULSE_SAMPLES
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ActuatorPulseResult:
@@ -336,6 +342,26 @@ class FrictionTestConfig:
         if not values or values[-1] < self.pulse_max_voltage_v - 1e-12:
             values.append(self.pulse_max_voltage_v)
         return tuple(values)
+
+    def with_recommended_evidence_pulse_ceiling(self) -> FrictionTestConfig:
+        if not self.evidence_mode:
+            return self
+        pulse_max = min(
+            max(
+                self.pulse_max_voltage_v,
+                FRICTION_EVIDENCE_RECOMMENDED_PULSE_MAX_V,
+            ),
+            self.voltage_limit_v,
+        )
+        return replace(
+            self,
+            pulse_max_voltage_v=pulse_max,
+            positioning_voltage_max_v=max(self.positioning_voltage_max_v, pulse_max),
+            fixed_velocity_voltage_limit_v=max(
+                self.fixed_velocity_voltage_limit_v,
+                pulse_max,
+            ),
+        )
 
     def automatic_position_targets(self, start_angle_rad: float) -> tuple[float, ...]:
         unique_targets = tuple(
@@ -1189,6 +1215,8 @@ class FrictionExperiment:
         point_index: int | None = None,
         position_validation_active: bool = False,
         position_validation_index: int = -1,
+        interruption_count: int = 0,
+        rejected_angle_samples: int = 0,
     ) -> None:
         config.validate()
         if phase_resistance_ohm <= 0:
@@ -1221,12 +1249,12 @@ class FrictionExperiment:
         self.pulse_start_angle: float | None = None
         self.current_detection_threshold_a = config.measured_current_floor_a
         self.recovery_attempts = 0
-        self.interruption_count = 0
+        self.interruption_count = max(0, int(interruption_count))
         self.abort_reason = ""
         self.soft_limit_counts: dict[str, int] = {}
         self._repeat_velocity_point = False
         self._recovery_mode = "actuator"
-        self.rejected_angle_samples = 0
+        self.rejected_angle_samples = max(0, int(rejected_angle_samples))
         self._trusted_angle_sample: TelemetrySample | None = None
         self._pending_angle_sample: TelemetrySample | None = None
         self._trusted_fast_angle_step: float | None = None
@@ -3060,6 +3088,17 @@ class FrictionExperiment:
         )
 
     def _finish_pulse(self, now_s: float, *, moved: bool) -> list[FrictionAction]:
+        complete_samples = sum(
+            sample.voltage_q_v is not None
+            and math.isfinite(sample.voltage_q_v)
+            and sample.current_q_a is not None
+            and math.isfinite(sample.current_q_a)
+            and sample.angle_rad is not None
+            and math.isfinite(sample.angle_rad)
+            for sample in self.phase_samples
+        )
+        if complete_samples < FRICTION_MIN_PULSE_SAMPLES:
+            return self.enter_recovery()
         self._record_pulse(moved, "страгивание" if moved else "движения нет")
         if self.config.evidence_mode:
             self._pending_actuator_attempt_index = len(self.actuator_attempts) - 1
