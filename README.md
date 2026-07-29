@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.10 contains:
+Version 0.3.11 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -67,6 +67,8 @@ Version 0.3.10 contains:
   a speed point after only three nonzero current samples;
 - automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
   Serial link reconnects, with 50 recoveries by default for board-reset workflows;
+- a decisive evidence preset with a 3 V preflight floor, automatic expansion of the reported
+  0.5 V failed checkpoint, and mandatory retry of any pulse that did not record enough telemetry;
 - an optional short alert after telemetry finally returns from an interruption longer than five
   seconds, selectable in every test-start confirmation;
 - a structured diagnostic report covering zero-signal quality, position-step performance,

@@ -19,6 +19,20 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.11
+
+- Raise the explicit two-electrical-period preset to a 3 V direct-Uq preflight ceiling (or the
+  lower global experiment limit) instead of retaining the generic 0.5 V default. A deliberately
+  higher existing ceiling is preserved.
+- Repair a failed schema-8 checkpoint whose 0.5 V ceiling did not find breakaway: keep completed
+  PWM-off/on evidence and valid pulses, raise only the preflight and dependent ceilings to 3 V,
+  show the correction, and continue above the already tested levels after confirmation.
+- Never accept an actuator pulse without at least two complete Uq/Iq/angle samples. Stop safely,
+  recover telemetry and retry the same signed voltage instead of recording a false no-motion
+  result.
+- Discard old zero-sample pulse attempts when restoring a checkpoint and preserve cumulative
+  interruption and rejected-angle counters across application restarts.
+
 ## 0.3.10
 
 - Do not apply Uq/Ud working-limit checks while evidence mode intentionally keeps PWM disabled.

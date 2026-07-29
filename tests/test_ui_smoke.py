@@ -280,6 +280,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertTrue(preset.evidence_mode)
             self.assertEqual(preset.automatic_position_count, 17)
             self.assertEqual(preset.map_passes, 2)
+            self.assertEqual(preset.pulse_max_voltage_v, 3.0)
+            self.assertEqual(preset.positioning_voltage_max_v, 3.0)
+            self.assertEqual(preset.fixed_velocity_voltage_limit_v, 3.0)
             self.assertAlmostEqual(
                 preset.automatic_position_step_rad,
                 preset.recommended_electrical_step_rad,

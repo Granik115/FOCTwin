@@ -1,5 +1,6 @@
 import math
 import unittest
+from dataclasses import replace
 
 from foctwin.domain import TelemetrySample
 from foctwin.friction import (
@@ -659,6 +660,45 @@ class FrictionExperimentTests(unittest.TestCase):
         self.assertEqual(experiment.phase, FrictionPhase.SETTLING)
         self.assertEqual(actions[0].value, 0.02)
 
+    def test_pulse_without_measurements_enters_recovery_and_is_retried(self):
+        experiment = FrictionExperiment(
+            self.config(),
+            1.0,
+            phase_resistance_ohm=0.675,
+        )
+        experiment.start(0.0)
+        self.add_stationary_samples(experiment, 0.0, 0.0)
+        actions = experiment.tick(0.5)
+        self.assertEqual(actions[0].value, 0.1)
+
+        actions = experiment.tick(1.0)
+
+        self.assertEqual(experiment.phase, FrictionPhase.RECOVERING)
+        self.assertEqual([action.kind for action in actions], ["safe_stop"])
+        self.assertEqual(experiment.actuator_attempts, [])
+        self.assertEqual(experiment.interruption_count, 1)
+
+        actions = experiment.resume_after_recovery(10.0)
+        self.assertEqual(experiment.phase, FrictionPhase.ACTUATOR_BASELINE)
+        self.assertEqual(actions[0].value, 0.0)
+        self.add_stationary_samples(experiment, 10.0, 0.0)
+        actions = experiment.tick(10.5)
+        self.assertEqual(actions[0].value, 0.1)
+
+    def test_checkpoint_counters_are_preserved_across_process_restart(self):
+        experiment = FrictionExperiment(
+            self.config(),
+            1.0,
+            phase_resistance_ohm=0.675,
+            interruption_count=3,
+            rejected_angle_samples=4,
+        )
+
+        payload = experiment.checkpoint_payload(55)
+
+        self.assertEqual(payload["interruption_count"], 3)
+        self.assertEqual(payload["rejected_angle_samples"], 4)
+
     def test_soft_limit_requires_three_consecutive_samples(self):
         config = self.config()
         config.current_trip_limit_a = 0.05
@@ -890,6 +930,33 @@ class EvidenceProtocolTests(unittest.TestCase):
         self.assertEqual(
             config.to_dict()["actuator_preflight"]["breakaway_confirmation"],
             "residual_displacement_after_zero",
+        )
+
+    def test_evidence_preflight_expands_only_to_bounded_recommended_ceiling(self):
+        config = self.config(
+            pulse_max_voltage_v=0.5,
+            positioning_voltage_max_v=3.0,
+            fixed_velocity_voltage_limit_v=3.0,
+            voltage_limit_v=12.0,
+        )
+
+        expanded = config.with_recommended_evidence_pulse_ceiling()
+
+        self.assertEqual(expanded.pulse_max_voltage_v, 3.0)
+        self.assertEqual(expanded.positioning_voltage_max_v, 3.0)
+        self.assertEqual(expanded.fixed_velocity_voltage_limit_v, 3.0)
+        self.assertEqual(expanded.voltage_limit_v, 12.0)
+        expanded.validate()
+
+        deliberate_higher = replace(
+            expanded,
+            pulse_max_voltage_v=10.0,
+            positioning_voltage_max_v=10.0,
+            fixed_velocity_voltage_limit_v=10.0,
+        )
+        self.assertEqual(
+            deliberate_higher.with_recommended_evidence_pulse_ceiling(),
+            deliberate_higher,
         )
 
     def test_pwm_off_observer_ignores_inactive_voltage_telemetry(self):
