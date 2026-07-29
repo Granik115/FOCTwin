@@ -26,12 +26,17 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Evidence diagnostic experiment (0.3.8)
+## Evidence diagnostic experiment (0.3.10)
 
 Evidence mode begins each position with an attended PWM-disabled observation. It does not issue an
 enable command until that observation is complete. The following PWM-enabled zero baseline uses
 the same raw-angle counters, so the final report can compare dropout and velocity-spike rates
 without silently filtering the source evidence out of the CSV.
+
+During the PWM-disabled observation, Uq/Ud telemetry may contain a stale or internal firmware
+value even though the bridge is disabled. FOCTwin therefore suspends only the Uq/Ud working-limit
+checks for that phase. Measured-current, coordinate and host-derived angle-speed checks remain
+active, and voltage checks resume when actuator configuration enables PWM.
 
 A pulse is not accepted as breakaway merely because its peak angle crossed a threshold. Uq is
 zeroed, the configured verification interval elapses, and the signed residual displacement must

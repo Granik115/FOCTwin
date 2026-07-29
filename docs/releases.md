@@ -19,6 +19,18 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.3.10
+
+- Do not apply Uq/Ud working-limit checks while evidence mode intentionally keeps PWM disabled.
+  SimpleFOC can continue reporting a stale or internal voltage value in that state even though no
+  drive voltage is applied. Measured-current, coordinate and angle-slope safety checks remain
+  active.
+- Resume a schema-8 checkpoint in actuator mode when the PWM-off observation for the current
+  position is already complete. The restored configuration now enables PWM before the
+  PWM-on baseline instead of leaving the motor in observer mode.
+- Cover the measured `Uq=-0.627 V` with a `0.5 V` pulse ceiling and the post-observer checkpoint
+  transition with regression tests.
+
 ## 0.3.9
 
 - Reconcile the positioning and evidence-mode fixed-velocity Uq ceilings automatically before a

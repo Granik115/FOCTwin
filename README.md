@@ -21,7 +21,7 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.9 contains:
+Version 0.3.10 contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a typed SimpleFOC Commander encoder for device ID `A`;
@@ -81,6 +81,8 @@ Version 0.3.9 contains:
   in the confirmation dialog;
 - automatic reconciliation of the positioning and fixed-velocity Uq ceilings with the pulse
   ceiling and the global experiment voltage limit, reported once without blocking test startup;
+- PWM-off observations ignore inactive Uq/Ud telemetry while retaining current and travel safety,
+  and a checkpoint taken after that observation resumes with PWM-enabled actuator preflight;
 - temporary direct-voltage operation for actuator preflight followed by automatic restoration of
   phase resistance and the user's manual configuration with PWM left disabled;
 - rolling angle-slope speed and confirmed small-motion detection for experiment decisions, with
