@@ -59,6 +59,7 @@ from foctwin.domain import (
 from foctwin.friction import (
     FRICTION_DEFAULT_RECOVERY_ATTEMPTS,
     FRICTION_DIRECT_VOLTAGE_SENTINEL,
+    FRICTION_EVIDENCE_RECOMMENDED_PULSE_MAX_V,
     FRICTION_MAX_AUTOMATIC_POSITIONS,
     FRICTION_MAX_CURRENT_TRIP_A,
     FRICTION_MAX_MAP_PASSES,
@@ -722,7 +723,7 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Безопасный двухэтапный план")
         config_grid = QGridLayout(config_group)
         self.friction_evidence_mode = QCheckBox(
-            "Доказательный режим 0.3.10: PWM off/on, повторы, фиксированный ALC"
+            "Доказательный режим 0.3.11: PWM off/on, повторы, фиксированный ALC"
         )
         self.friction_evidence_mode.setChecked(True)
         config_grid.addWidget(self.friction_evidence_mode, 0, 0, 1, 4)
@@ -1289,12 +1290,16 @@ class MainWindow(QMainWindow):
         self.friction_residual_movement.setValue(0.005)
         self.friction_breakaway_verify.setValue(1.0)
         self.friction_velocity_travel.setValue(0.2)
-        self.friction_fixed_velocity_voltage.setValue(
-            min(3.0, self.friction_voltage_limit.value())
+        pulse_max = min(
+            max(
+                self.friction_pulse_max.value(),
+                FRICTION_EVIDENCE_RECOMMENDED_PULSE_MAX_V,
+            ),
+            self.friction_voltage_limit.value(),
         )
-        self.friction_position_voltage_max.setValue(
-            min(3.0, self.friction_voltage_limit.value())
-        )
+        self.friction_pulse_max.setValue(pulse_max)
+        self.friction_fixed_velocity_voltage.setValue(pulse_max)
+        self.friction_position_voltage_max.setValue(pulse_max)
         self.friction_adaptive_positioning.setChecked(False)
         self.friction_pole_pairs.setValue(self.profile.pole_pairs)
         self.friction_electrical_divisions.setValue(8)
@@ -1338,10 +1343,14 @@ class MainWindow(QMainWindow):
                 FrictionPointResult.from_dict(point)
                 for point in payload.get("completed_points", [])
             ]
-            actuator_attempts = [
+            restored_actuator_attempts = [
                 ActuatorPulseResult.from_dict(attempt)
                 for attempt in payload.get("actuator_attempts", [])
             ]
+            actuator_attempts = [
+                attempt for attempt in restored_actuator_attempts if attempt.has_measurement
+            ]
+            discarded_attempts = len(restored_actuator_attempts) - len(actuator_attempts)
             position_observations = [
                 PositionFrictionObservation.from_dict(observation)
                 for observation in payload.get("position_observations", [])
@@ -1360,6 +1369,16 @@ class MainWindow(QMainWindow):
             if not position_targets:
                 raise ValueError("Checkpoint не содержит автоматические координаты")
             config = FrictionTestConfig.from_dict(payload["config"])
+            previous_pulse_max = config.pulse_max_voltage_v
+            if (
+                config.evidence_mode
+                and payload.get("phase") == FrictionPhase.ABORTED.value
+                and str(payload.get("abort_reason", "")).startswith(
+                    "Страгивание не найдено до максимального Uq"
+                )
+            ):
+                config = config.with_recommended_evidence_pulse_ceiling()
+            raised_pulse_ceiling = config.pulse_max_voltage_v > previous_pulse_max
             position_validation_active = bool(
                 payload.get("position_validation_active", False)
             )
@@ -1377,10 +1396,31 @@ class MainWindow(QMainWindow):
             experiment_id = payload.get("experiment_id")
             telemetry_paths = [str(path) for path in payload.get("telemetry_paths", [])]
             position_index = int(payload.get("position_index", 0))
+            interruption_count = int(payload.get("interruption_count", 0))
+            rejected_angle_samples = int(payload.get("rejected_angle_samples", 0))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             QMessageBox.warning(self, "Checkpoint", str(exc))
             return
         self._set_friction_config_widgets(config)
+        checkpoint_adjustments: list[str] = []
+        if discarded_attempts:
+            checkpoint_adjustments.append(
+                f"• повторно выполнить импульсы без телеметрии: {discarded_attempts}"
+            )
+        if raised_pulse_ceiling:
+            checkpoint_adjustments.append(
+                f"• максимальный Uq preflight: {previous_pulse_max:g} → "
+                f"{config.pulse_max_voltage_v:g} В"
+            )
+        if checkpoint_adjustments:
+            QMessageBox.warning(
+                self,
+                "Автоматическое исправление checkpoint",
+                "FOCTwin исправил подтверждённые проблемы прерванного опыта:\n"
+                + "\n".join(checkpoint_adjustments)
+                + "\n\nОбщий предел напряжения не изменён. Новый максимум будет отдельно "
+                "показан в подтверждении перед продолжением.",
+            )
         self._prepare_friction_experiment(
             completed_points=points,
             actuator_attempts=actuator_attempts,
@@ -1393,6 +1433,8 @@ class MainWindow(QMainWindow):
             position_index=position_index,
             position_validation_active=position_validation_active,
             position_validation_index=position_validation_index,
+            interruption_count=interruption_count,
+            rejected_angle_samples=rejected_angle_samples,
             resumed=True,
         )
 
@@ -1411,6 +1453,8 @@ class MainWindow(QMainWindow):
         point_index: int | None = None,
         position_validation_active: bool = False,
         position_validation_index: int = -1,
+        interruption_count: int = 0,
+        rejected_angle_samples: int = 0,
         resumed: bool = False,
     ) -> None:
         if self._friction_running():
@@ -1544,6 +1588,8 @@ class MainWindow(QMainWindow):
             point_index=point_index,
             position_validation_active=position_validation_active,
             position_validation_index=position_validation_index,
+            interruption_count=interruption_count,
+            rejected_angle_samples=rejected_angle_samples,
         )
         self._friction_experiment.seed_angle(
             sample.angle_rad,
@@ -2076,6 +2122,11 @@ class MainWindow(QMainWindow):
                 )
                 self._queue_commands(commands, self._finish_friction_observer_configuration)
             elif action.kind == "safe_stop":
+                if experiment is not None and experiment.phase == FrictionPhase.RECOVERING:
+                    self._friction_last_sample_sequence = self._telemetry_sequence
+                    self._friction_recovery_started_at = time.monotonic()
+                    self._friction_recovery_alerted = False
+                    self._save_friction_checkpoint()
                 if experiment is not None and experiment.phase == FrictionPhase.ABORTED:
                     self._cancel_queued_commands()
                 sent = self.device.emergency_stop()
