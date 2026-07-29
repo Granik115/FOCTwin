@@ -26,7 +26,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Evidence diagnostic experiment (0.3.10)
+## Evidence diagnostic experiment (0.3.11)
 
 Evidence mode begins each position with an attended PWM-disabled observation. It does not issue an
 enable command until that observation is complete. The following PWM-enabled zero baseline uses
