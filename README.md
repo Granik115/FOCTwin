@@ -21,9 +21,40 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.3.11 contains:
+The home-test build 0.4.1b1 keeps the complete 0.4.0 current-trial implementation unchanged and
+adds:
+
+- a separate **Связь с GPT** window that opens without a project, COM port or motor;
+- direct Google Drive API authorization for a Desktop OAuth client; Google Drive Desktop is not
+  required;
+- a narrow `drive.file` workspace named `FOCTwin_Bridge_<ID>` with separate one-writer inbox and
+  outbox streams;
+- a locally durable outgoing queue, UUID deduplication, restart recovery, three-second polling,
+  visible delay/status information and an expandable technical log;
+- an explicit schema-1 safety boundary that accepts only human-readable `CHAT` messages and
+  rejects every incoming command kind before it can reach any motor code.
+
+First-time OAuth setup and the exact file protocol are documented in
+[`docs/drive-bridge.md`](docs/drive-bridge.md).
+
+The preserved 0.4.0 milestone contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
+- a one-button guarded current-step trial in the real-motor tuning workspace: it captures the
+  current shaft coordinate, settles there through the accepted `Angle + Voltage` transport
+  controller, switches with PWM disabled to `Torque + FOC Current`, records a bounded step and
+  returns to the captured coordinate;
+- conservative first-run defaults (`0.1 A`, current Q/D `P=8.4222`, `I=814`, `1–2–1 s`,
+  approximately `100 Hz`) with independent working and absolute envelopes up to
+  `24 V / 5 A / ±4 rad`;
+- durable restart of the whole unfinished current trial after stale telemetry, Serial loss,
+  board reset, application restart or physical power interruption, never scoring a partial
+  attempt as successful;
+- an alert while recovery has remained impossible for more than five seconds, up to 50 recovery
+  attempts, safe reconnect beginning with `AE0`, and automatic restoration of the user's manual
+  configuration with PWM disabled;
+- a single `*_SEND_ME.zip` export containing the result JSON and every CSV segment required for
+  remote diagnosis;
 - a typed SimpleFOC Commander encoder for device ID `A`;
 - a serial transport with paced Commander writes, transparent DTR recovery and a best-effort
   emergency stop;
@@ -97,8 +128,9 @@ Version 0.3.11 contains:
 - JSON-file MATLAB simulation and checkpointed `surrogateopt` tuning APIs for R2022b;
 - tests for protocol encoding, scenarios, safety checks and project recovery.
 
-Hardware execution and MATLAB simulations are deliberately not started automatically.
-They become active only after a user opens a project and explicitly connects/enables them.
+Hardware execution and MATLAB simulations are deliberately not started on application launch.
+The guarded current trial starts only after a user opens a project, connects the motor and
+explicitly confirms the one-button run.
 
 ## Download for Windows
 

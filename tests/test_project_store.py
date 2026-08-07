@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from contextlib import closing
 from pathlib import Path
 
@@ -52,3 +53,23 @@ class ProjectStoreTests(unittest.TestCase):
                     "SELECT status FROM experiments WHERE id = ?", (experiment_id,)
                 ).fetchone()
             self.assertEqual(result, ("completed",))
+
+    def test_save_bundle_collects_existing_evidence_files_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ProjectStore(Path(temporary) / "project.foctwin")
+            store.initialize()
+            report = store.save_export("current_trial_1", {"status": "completed"})
+            telemetry = store.new_telemetry_path("current_trial_1")
+            telemetry.write_text("timestamp_s,current_q_a\n0.0,0.0\n", encoding="utf-8")
+
+            bundle = store.save_bundle(
+                "current_trial_1_send_me",
+                [report, telemetry, telemetry],
+            )
+
+            self.assertTrue(bundle.is_file())
+            with zipfile.ZipFile(bundle) as archive:
+                self.assertEqual(
+                    sorted(archive.namelist()),
+                    sorted([report.name, telemetry.name]),
+                )

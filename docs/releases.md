@@ -19,6 +19,45 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.1b1
+
+- Keep the guarded current experiment from 0.4.0 unchanged on a separate Drive Bridge test
+  branch.
+- Add a non-modal `Связь с GPT` diagnostics window that does not open a COM port or require a
+  project/motor.
+- Authorize a user-owned Google Desktop OAuth client through the browser and store the refresh
+  token in Windows Credential Manager; Google Drive Desktop is not required.
+- Request only the per-file `drive.file` scope and create a uniquely identified
+  `FOCTwin_Bridge_<ID>` folder with manifest, status and two single-writer JSONL channels.
+- Save each outgoing chat locally before network I/O, merge by UUID and retain the queue across
+  application termination, network loss and power interruption.
+- Poll the one inbound file every three seconds with conditional ETags, resume automatically after
+  transient network failures and expose account, queue, last-sync and technical-log status.
+- Accept only schema-1 `chat` records from ChatGPT. Unknown/command records are logged and ignored;
+  no Drive code imports or invokes Serial, Commander or current-trial actions.
+
+## 0.4.0
+
+- Add the first direct real-motor tuning building block: one guarded current step with automatic
+  transport to and return from the freshly captured shaft coordinate.
+- Switch only with PWM disabled: `Angle + Voltage` transport, neutral target, then
+  `Torque + FOC Current`, neutral verification, one `0.1 A` step and a recorded zero tail.
+- Start from conservative current Q/D values `P=8.4222`, `I=814`, `D=0`, LPF `0.005 s`, an
+  output ramp of `3000 V/s`, a `0.5 A` command ceiling and `12 V` working voltage.
+- Enforce independent stop envelopes: `1 A` during the experimental current section,
+  `5 A / 24 V / 0.5 rad/s / ±4 rad` absolute limits, with the normal experiment kept within
+  `±3 rad` and stopped before `±3.5 rad`.
+- Record roughly `100 Hz` full-mask telemetry, compute baseline/step/post current, voltage,
+  motion and rate statistics, and explicitly flag a missing measured-Iq response instead of
+  treating it as a valid tuning result.
+- On stale telemetry, Serial loss, a board reset or physical power interruption, send the
+  best-effort stop, checkpoint immediately, discard the partial attempt and repeat the whole
+  trial after fresh telemetry returns. Reconnect always begins with `AE0` even if manual safe
+  connect is disabled.
+- Sound the selected recovery alert as soon as the stream has remained unavailable for more
+  than five seconds, rather than waiting until recovery has already succeeded.
+- Export one `current_trial_<id>_SEND_ME.zip` with the JSON report and every CSV segment.
+
 ## 0.3.11
 
 - Raise the explicit two-electrical-period preset to a 3 V direct-Uq preflight ceiling (or the

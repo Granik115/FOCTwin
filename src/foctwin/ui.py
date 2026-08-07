@@ -48,6 +48,14 @@ from PySide6.QtWidgets import (
 )
 
 from foctwin import __version__
+from foctwin.current_trial import (
+    CURRENT_TRIAL_CHECKPOINT_SCHEMA,
+    CURRENT_TRIAL_MONITOR_MASK,
+    CurrentTrialAction,
+    CurrentTrialConfig,
+    CurrentTrialExperiment,
+    CurrentTrialPhase,
+)
 from foctwin.domain import (
     MotionMode,
     MotorProfile,
@@ -202,6 +210,18 @@ class MainWindow(QMainWindow):
         self.telemetry_statistics = TelemetryStatistics()
         self.telemetry_recorder = TelemetryRecorder()
         self.friction_recorder = TelemetryRecorder()
+        self.current_trial_recorder = TelemetryRecorder()
+        self._current_trial_experiment: CurrentTrialExperiment | None = None
+        self._current_trial_experiment_id: int | None = None
+        self._current_trial_telemetry_paths: list[str] = []
+        self._current_trial_restore_commands: list[str] = []
+        self._current_trial_restore_mask = self.monitor_mask
+        self._current_trial_last_sample_sequence = 0
+        self._current_trial_recovery_started_at: float | None = None
+        self._current_trial_recovery_sound_enabled = True
+        self._current_trial_recovery_alerted = False
+        self._current_trial_resume_pending = False
+        self._current_trial_last_bundle: Path | None = None
         self._friction_experiment: FrictionExperiment | None = None
         self._friction_experiment_id: int | None = None
         self._friction_telemetry_paths: list[str] = []
@@ -234,6 +254,7 @@ class MainWindow(QMainWindow):
         self._pwm_requested = False
         self._safety_latched = False
         self._configuration_apply_in_progress = False
+        self._drive_bridge_dialog: QDialog | None = None
         self._device_limit_copy_pending: set[str] = set()
         self._command_queue: deque[str | Callable[[], None]] = deque()
         self._started_at = time.monotonic()
@@ -266,6 +287,10 @@ class MainWindow(QMainWindow):
         self._friction_timer.setInterval(50)
         self._friction_timer.timeout.connect(self._advance_friction_experiment)
         self._friction_timer.start()
+        self._current_trial_timer = QTimer(self)
+        self._current_trial_timer.setInterval(20)
+        self._current_trial_timer.timeout.connect(self._advance_current_trial)
+        self._current_trial_timer.start()
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -281,6 +306,9 @@ class MainWindow(QMainWindow):
         toolbar.addActions((new_project, open_project))
         toolbar.addSeparator()
         toolbar.addAction(matlab)
+        drive_bridge = QAction("Связь с GPT", self)
+        drive_bridge.triggered.connect(self._open_drive_bridge)
+        toolbar.addAction(drive_bridge)
         toolbar.addSeparator()
         emergency = QAction("АВАРИЙНЫЙ СТОП", self)
         emergency.triggered.connect(self._emergency_stop)
@@ -1460,6 +1488,13 @@ class MainWindow(QMainWindow):
         if self._friction_running():
             QMessageBox.information(self, "Тест трения", "Тест уже выполняется")
             return
+        if self._current_trial_running():
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Сначала завершите выполняющийся токовый опыт",
+            )
+            return
         if self.project is None:
             QMessageBox.warning(self, "Тест трения", "Сначала создайте или откройте проект FOCTwin")
             return
@@ -1971,6 +2006,7 @@ class MainWindow(QMainWindow):
         experiment = self._friction_experiment
         if experiment is None or experiment.phase != FrictionPhase.RECOVERING:
             return
+        self._alert_slow_friction_recovery(now)
         if not self.device.connected or self._friction_resume_pending:
             return
         if self._command_queue or self._command_timer.isActive():
@@ -1987,7 +2023,6 @@ class MainWindow(QMainWindow):
         if not experiment.config.angle_min_rad <= sample.angle_rad <= experiment.config.angle_max_rad:
             self._abort_friction_experiment("После восстановления координата вне границ опыта")
             return
-        self._alert_slow_friction_recovery(now)
         self._friction_resume_pending = True
         self.monitor_mask = FRICTION_MONITOR_MASK
         self._prepare_monitor_configuration(
@@ -2800,17 +2835,25 @@ class MainWindow(QMainWindow):
         self._log("FRICTION_ACCEPT", json.dumps(parameters, ensure_ascii=False))
 
     def _active_monitor_downsample(self) -> int:
+        current_trial = self._current_trial_experiment
+        if current_trial is not None and self._current_trial_running():
+            return current_trial.config.monitor_downsample
         experiment = self._friction_experiment
         if experiment is not None and self._friction_running():
             return experiment.config.monitor_downsample
         return self.monitor_downsample_spin.value()
 
     def _manual_control_blocked_by_friction(self, operation: str) -> bool:
-        if not self._friction_running():
+        if not self._friction_running() and not self._current_trial_running():
             return False
+        title = (
+            "Выполняется токовый опыт"
+            if self._current_trial_running()
+            else "Выполняется тест трения"
+        )
         QMessageBox.warning(
             self,
-            "Выполняется тест трения",
+            title,
             f"{operation.capitalize()} заблокировано до завершения опыта. "
             "Для немедленной остановки используйте «СТОП И ОТКЛЮЧИТЬ PWM».",
         )
@@ -2881,40 +2924,860 @@ class MainWindow(QMainWindow):
     def _real_tuning_page(self) -> QWidget:
         page, layout = titled_page(
             "Доводка на реальном моторе",
-            "Ограниченные изменения вокруг принятого виртуального результата с фиксацией каждой попытки.",
+            "FOCTwin 0.4.0: один полностью автоматический и возобновляемый токовый опыт.",
         )
         warning = QLabel(
-            "Каждый опыт начинается только из подтверждённого состояния. После обрыва связи текущая "
-            "попытка помечается незавершённой и выполняется заново."
+            "Можно физически отключить питание. FOCTwin сохранит checkpoint, будет подавать "
+            "звуковой сигнал при долгом восстановлении и после возврата платы повторит всю "
+            "незавершённую попытку. Программная остановка не заменяет физическое снятие питания."
         )
         warning.setObjectName("danger")
         warning.setWordWrap(True)
         layout.addWidget(warning)
-        settings = QGroupBox("Политика доводки")
+
+        settings = QGroupBox("Первый безопасный токовый опыт")
         settings_form = QFormLayout(settings)
-        approval = QComboBox()
-        approval.addItems(("Подтверждать каждый опыт", "Полностью автоматически", "Подтверждать только ухудшения"))
-        settings_form.addRow("Запуск опытов", approval)
-        settings_form.addRow("Максимальный шаг, %", spin(10.0, 0.01, 100.0))
-        settings_form.addRow("Максимум опытов", spin(200, 1, 100000, 0))
-        settings_form.addRow("Цель по координате, угл. сек", spin(30, 0.001, 3600, 3))
-        settings_form.addRow("Цель по скорости, угл. сек/с", spin(30, 0.001, 3600, 3))
-        rollback = QCheckBox("Автоматически откатывать ухудшение к последнему принятому набору")
-        rollback.setChecked(True)
-        settings_form.addRow(rollback)
+        self.current_trial_step = spin(0.1, -0.5, 0.5, 3, 0.01)
+        self.current_trial_kp = spin(self.profile.current_q.p, 0.0, 10000.0, 6, 0.1)
+        self.current_trial_ki = spin(self.profile.current_q.i, 0.0, 100000.0, 6, 1.0)
+        self.current_trial_baseline = spin(1.0, 0.5, 10.0, 1, 0.5)
+        self.current_trial_step_duration = spin(2.0, 0.5, 20.0, 1, 0.5)
+        self.current_trial_post = spin(1.0, 0.5, 10.0, 1, 0.5)
+        self.current_trial_recovery_sound = QCheckBox(
+            "Звуковой сигнал, если восстановление заняло больше 5 секунд"
+        )
+        self.current_trial_recovery_sound.setChecked(True)
+        settings_form.addRow("Токовая ступень, А", self.current_trial_step)
+        settings_form.addRow("Current Q/D P", self.current_trial_kp)
+        settings_form.addRow("Current Q/D I", self.current_trial_ki)
+        settings_form.addRow("Ноль до ступени, с", self.current_trial_baseline)
+        settings_form.addRow("Длительность ступени, с", self.current_trial_step_duration)
+        settings_form.addRow("Ноль после ступени, с", self.current_trial_post)
+        settings_form.addRow(self.current_trial_recovery_sound)
         layout.addWidget(settings)
-        self.real_results = table(("№", "Время", "Изменённые параметры", "Результат", "Score", "Решение"), 0)
-        layout.addWidget(self.real_results, 1)
-        controls = QHBoxLayout()
-        controls.addWidget(QPushButton("Начать доводку"))
-        controls.addWidget(QPushButton("Продолжить прерванную сессию"))
-        controls.addWidget(QPushButton("Принять результат"))
-        stop = QPushButton("СТОП И ОТКЛЮЧИТЬ PWM")
-        stop.setObjectName("dangerButton")
-        stop.clicked.connect(self._emergency_stop)
-        controls.addWidget(stop)
+
+        defaults = QLabel(
+            "Автоматические ограничения первого запуска: цель ≤ 0,5 А; остановка токового "
+            "участка при 1 А; абсолютный максимум 5 А; рабочее U ≤ 12 В; абсолютное U ≤ 24 В; "
+            "рабочая координата ±3 рад; остановка при ±3,5 рад; абсолютная граница ±4 рад; "
+            "скорость ≤ 0,5 рад/с; телеметрия около 100 Гц. Начальная координата берётся "
+            "из свежей телеметрии в момент нажатия кнопки."
+        )
+        defaults.setObjectName("hint")
+        defaults.setWordWrap(True)
+        layout.addWidget(defaults)
+
+        controls = QGridLayout()
+        self.current_trial_start_button = QPushButton(
+            "ЗАПУСТИТЬ ОДИН АВТОМАТИЧЕСКИЙ ТОКОВЫЙ ОПЫТ"
+        )
+        self.current_trial_start_button.clicked.connect(self._start_current_trial)
+        self.current_trial_resume_button = QPushButton("Продолжить из checkpoint")
+        self.current_trial_resume_button.clicked.connect(self._resume_current_trial_checkpoint)
+        self.current_trial_stop_button = QPushButton("СТОП И ОТКЛЮЧИТЬ PWM")
+        self.current_trial_stop_button.setObjectName("dangerButton")
+        self.current_trial_stop_button.setEnabled(False)
+        self.current_trial_stop_button.clicked.connect(self._stop_current_trial_by_user)
+        controls.addWidget(self.current_trial_start_button, 0, 0, 1, 2)
+        controls.addWidget(self.current_trial_resume_button, 1, 0)
+        controls.addWidget(self.current_trial_stop_button, 1, 1)
         layout.addLayout(controls)
+
+        self.current_trial_status_label = QLabel("Опыт не запущен")
+        self.current_trial_status_label.setWordWrap(True)
+        layout.addWidget(self.current_trial_status_label)
+
+        self.current_trial_results = table(
+            ["Метрика", "Значение", "Комментарий"],
+            8,
+        )
+        for row, name in enumerate(
+            (
+                "Статус данных",
+                "Частота телеметрии",
+                "Iq установившийся",
+                "Ошибка Iq",
+                "Пиковый Iq",
+                "RMS Id",
+                "Пиковый Uq",
+                "Дрейф угла",
+            )
+        ):
+            self.current_trial_results.setItem(row, 0, QTableWidgetItem(name))
+            self.current_trial_results.setItem(row, 1, QTableWidgetItem("—"))
+            self.current_trial_results.setItem(row, 2, QTableWidgetItem("—"))
+        layout.addWidget(self.current_trial_results)
+
+        self.current_trial_report = QPlainTextEdit()
+        self.current_trial_report.setReadOnly(True)
+        self.current_trial_report.setMaximumHeight(190)
+        self.current_trial_report.setPlainText(
+            "После завершения здесь появится короткий вывод и путь к одному ZIP, "
+            "который можно просто передать для разбора."
+        )
+        layout.addWidget(self.current_trial_report)
+        layout.addStretch(1)
         return page
+
+    def _current_trial_running(self) -> bool:
+        experiment = self._current_trial_experiment
+        return bool(
+            experiment
+            and experiment.phase
+            not in {CurrentTrialPhase.COMPLETE, CurrentTrialPhase.ABORTED}
+        )
+
+    def _current_trial_config_from_widgets(self) -> CurrentTrialConfig:
+        transport_pid = {
+            loop: self._pid_values(loop) for loop in ("angle", "velocity")
+        }
+        return CurrentTrialConfig(
+            step_current_a=self.current_trial_step.value(),
+            current_kp=self.current_trial_kp.value(),
+            current_ki=self.current_trial_ki.value(),
+            baseline_s=self.current_trial_baseline.value(),
+            step_s=self.current_trial_step_duration.value(),
+            post_s=self.current_trial_post.value(),
+            transport_angle_pid=transport_pid["angle"],
+            transport_velocity_pid=transport_pid["velocity"],
+        )
+
+    def _set_current_trial_config_widgets(self, config: CurrentTrialConfig) -> None:
+        self.current_trial_step.setValue(config.step_current_a)
+        self.current_trial_kp.setValue(config.current_kp)
+        self.current_trial_ki.setValue(config.current_ki)
+        self.current_trial_baseline.setValue(config.baseline_s)
+        self.current_trial_step_duration.setValue(config.step_s)
+        self.current_trial_post.setValue(config.post_s)
+
+    def _start_current_trial(self) -> None:
+        self._prepare_current_trial()
+
+    def _resume_current_trial_checkpoint(self) -> None:
+        if self.project is None:
+            QMessageBox.warning(self, "Токовый опыт", "Сначала откройте проект FOCTwin")
+            return
+        try:
+            payload = self.project.load_checkpoint("current_trial")
+            if payload is None:
+                raise ValueError("В проекте нет checkpoint токового опыта")
+            if int(payload.get("schema", 0)) != CURRENT_TRIAL_CHECKPOINT_SCHEMA:
+                raise ValueError("Checkpoint токового опыта создан несовместимой версией")
+            experiment = CurrentTrialExperiment.from_checkpoint(payload)
+            experiment_id = payload.get("experiment_id")
+            telemetry_paths = [
+                str(path) for path in payload.get("telemetry_paths", [])
+            ]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Токовый опыт", str(exc))
+            return
+        self._set_current_trial_config_widgets(experiment.config)
+        self._prepare_current_trial(
+            restored_experiment=experiment,
+            experiment_id=(
+                int(experiment_id) if experiment_id is not None else None
+            ),
+            telemetry_paths=telemetry_paths,
+            resumed=True,
+        )
+
+    def _prepare_current_trial(
+        self,
+        *,
+        restored_experiment: CurrentTrialExperiment | None = None,
+        experiment_id: int | None = None,
+        telemetry_paths: list[str] | None = None,
+        resumed: bool = False,
+    ) -> None:
+        if self._current_trial_running():
+            QMessageBox.information(self, "Токовый опыт", "Опыт уже выполняется")
+            return
+        if self._friction_running():
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Сначала завершите выполняющийся тест трения",
+            )
+            return
+        if self.project is None:
+            QMessageBox.warning(self, "Токовый опыт", "Сначала создайте или откройте проект")
+            return
+        if not self.device.connected:
+            QMessageBox.warning(self, "Токовый опыт", "Сначала подключите мотор")
+            return
+        if self._pwm_requested:
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Перед запуском вручную отключите PWM",
+            )
+            return
+        if (
+            self._configuration_apply_in_progress
+            or self._command_queue
+            or self._command_timer.isActive()
+        ):
+            QMessageBox.information(
+                self,
+                "Токовый опыт",
+                "Дождитесь завершения текущей отправки команд",
+            )
+            return
+        sample = self._last_sample
+        if sample is None or self._last_telemetry_received_at is None:
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Нет свежей распознанной телеметрии",
+            )
+            return
+        if time.monotonic() - self._last_telemetry_received_at > monitor_stale_timeout(
+            self._active_monitor_downsample()
+        ):
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Телеметрия устарела; дождитесь восстановления потока",
+            )
+            return
+        required_values = (
+            sample.angle_rad,
+            sample.current_q_a,
+            sample.current_d_a,
+            sample.voltage_q_v,
+            sample.voltage_d_v,
+        )
+        if any(value is None for value in required_values):
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Нужны угол, Iq, Id, Uq и Ud; включите все поля мониторинга",
+            )
+            return
+        try:
+            config = (
+                restored_experiment.config
+                if restored_experiment is not None
+                else self._current_trial_config_from_widgets()
+            )
+            config.validate()
+            if self.profile.phase_resistance_ohm <= 0:
+                raise ValueError(
+                    "Для безопасного транспортного режима нужно положительное "
+                    "сопротивление фазы"
+                )
+            start_angle = (
+                restored_experiment.start_angle_rad
+                if restored_experiment is not None
+                else float(sample.angle_rad)
+            )
+            if not config.working_angle_min_rad <= start_angle <= config.working_angle_max_rad:
+                raise ValueError(
+                    "Текущая/сохранённая координата вне рабочего коридора ±3 рад"
+                )
+            manual_pid_values = {
+                loop: self._pid_values(loop) for loop in self.pid_tables
+            }
+        except ValueError as exc:
+            QMessageBox.warning(self, "Токовый опыт", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Запуск одного токового опыта")
+        dialog.setMinimumWidth(650)
+        dialog_layout = QVBoxLayout(dialog)
+        confirmation = QLabel(
+            "FOCTwin зафиксирует текущую координату, включит проверенный "
+            "Angle + Voltage, затем с нулевой целью переключится на FOC Current и "
+            f"подаст одну ступень {config.step_current_a:g} А на {config.step_s:g} с.\n\n"
+            f"Коэффициенты Q/D: P={config.current_kp:g}, I={config.current_ki:g}, D=0; "
+            f"рабочее U≤{config.current_voltage_limit_v:g} В. При токе "
+            f"{config.current_trip_limit_a:g} А на токовом участке, скорости "
+            f"{config.velocity_trip_limit_rad_s:g} рад/с, координате ±3,5 рад или "
+            "потере телеметрии PWM будет снят best-effort.\n\n"
+            "При физическом отключении питания ничего не будет записано как успешный "
+            "результат: после возврата платы попытка начнётся заново. Держите питание "
+            "доступным. Запустить?"
+        )
+        confirmation.setWordWrap(True)
+        dialog_layout.addWidget(confirmation)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Запустить")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._current_trial_recovery_sound_enabled = (
+            self.current_trial_recovery_sound.isChecked()
+        )
+        self._save_user_settings()
+        manual_mask = self.monitor_mask
+        self._current_trial_restore_mask = manual_mask
+        self._current_trial_restore_commands = [
+            self.protocol.disable(),
+            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
+        ]
+        self._current_trial_restore_commands.extend(
+            self._full_configuration_commands(manual_pid_values, manual_mask)
+        )
+        experiment = restored_experiment or CurrentTrialExperiment(config, start_angle)
+        raw_angle = (
+            sample.raw_angle_rad
+            if sample.raw_angle_rad is not None
+            else float(sample.angle_rad)
+        )
+        experiment.seed_angle(
+            raw_angle,
+            continuous_reference_rad=(start_angle if resumed else float(sample.angle_rad)),
+        )
+        self._current_trial_experiment = experiment
+        self._current_trial_experiment_id = experiment_id
+        if self._current_trial_experiment_id is None:
+            self._current_trial_experiment_id = self.project.create_experiment(
+                "guarded_current_trial",
+                config.to_dict(),
+            )
+        self.project.update_experiment(
+            self._current_trial_experiment_id,
+            "running",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._current_trial_telemetry_paths = list(telemetry_paths or [])
+        telemetry_path = self.project.new_telemetry_path(
+            f"current_trial_{self._current_trial_experiment_id}_"
+            f"{len(self._current_trial_telemetry_paths) + 1}"
+        )
+        self.current_trial_recorder.start(telemetry_path)
+        self._current_trial_telemetry_paths.append(str(telemetry_path))
+        self._current_trial_last_sample_sequence = self._telemetry_sequence
+        self._current_trial_recovery_started_at = None
+        self._current_trial_recovery_alerted = False
+        self._current_trial_resume_pending = False
+        self._current_trial_last_bundle = None
+        self.monitor_mask = CURRENT_TRIAL_MONITOR_MASK
+        self._prepare_monitor_configuration(
+            CURRENT_TRIAL_MONITOR_MASK,
+            reset_statistics=True,
+            reset_recovery=True,
+        )
+        self._mark_monitor_configuration_started()
+        self.current_trial_start_button.setEnabled(False)
+        self.current_trial_resume_button.setEnabled(False)
+        self.current_trial_stop_button.setEnabled(True)
+        self.current_trial_status_label.setText(
+            "Опыт запускается: фиксируется безопасный транспортный режим…"
+        )
+        self._clear_current_trial_results()
+        self._log(
+            "CURRENT_TRIAL",
+            f"{'Продолжение' if resumed else 'Запуск'} опыта "
+            f"#{self._current_trial_experiment_id}: step={config.step_current_a:g} A, "
+            f"P={config.current_kp:g}, I={config.current_ki:g}",
+        )
+        self._save_current_trial_checkpoint()
+        self._process_current_trial_actions(experiment.start(time.monotonic()))
+
+    def _current_trial_positioning_commands(
+        self,
+        experiment: CurrentTrialExperiment,
+    ) -> list[str]:
+        config = experiment.config
+        transport_current_limit = min(
+            config.absolute_current_limit_a,
+            config.transport_voltage_equivalent_v / self.profile.phase_resistance_ohm,
+        )
+        commands = [
+            self.protocol.disable(),
+            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
+            self.protocol.current_limit(transport_current_limit),
+            self.protocol.voltage_limit(config.transport_voltage_limit_v),
+            self.protocol.velocity_limit(config.transport_velocity_limit_rad_s),
+        ]
+        for loop, values in (
+            ("angle", config.transport_angle_pid),
+            ("velocity", config.transport_velocity_pid),
+        ):
+            commands.extend(
+                self.protocol.pid(loop, field, values[field])
+                for field in self.PID_FIELDS
+            )
+        commands.extend(
+            (
+                self.protocol.torque_mode(TorqueMode.VOLTAGE),
+                self.protocol.motion_mode(MotionMode.ANGLE),
+                self.protocol.target(
+                    experiment.board_target_for_continuous(
+                        experiment.start_angle_rad
+                    )
+                ),
+                self.protocol.monitor_clear(),
+                self.protocol.monitor_downsample(config.monitor_downsample),
+                self.protocol.monitor_variables(CURRENT_TRIAL_MONITOR_MASK),
+                self.protocol.enable(),
+            )
+        )
+        return commands
+
+    def _current_trial_current_commands(
+        self,
+        experiment: CurrentTrialExperiment,
+    ) -> list[str]:
+        config = experiment.config
+        commands = [
+            self.protocol.disable(),
+            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
+            self.protocol.current_limit(config.current_target_limit_a),
+            self.protocol.voltage_limit(config.current_voltage_limit_v),
+            self.protocol.velocity_limit(config.velocity_trip_limit_rad_s),
+        ]
+        values = {
+            "p": config.current_kp,
+            "i": config.current_ki,
+            "d": config.current_kd,
+            "ramp": config.current_output_ramp_v_s,
+            "lpf": config.current_lpf_tf_s,
+        }
+        for loop in ("current_q", "current_d"):
+            commands.extend(
+                self.protocol.pid(loop, field, values[field])
+                for field in self.PID_FIELDS
+            )
+        commands.extend(
+            (
+                self.protocol.torque_mode(TorqueMode.FOC_CURRENT),
+                self.protocol.motion_mode(MotionMode.TORQUE),
+                self.protocol.target(0.0),
+                self.protocol.monitor_clear(),
+                self.protocol.monitor_downsample(config.monitor_downsample),
+                self.protocol.monitor_variables(CURRENT_TRIAL_MONITOR_MASK),
+                self.protocol.enable(),
+            )
+        )
+        return commands
+
+    def _process_current_trial_actions(
+        self,
+        actions: list[CurrentTrialAction],
+    ) -> None:
+        experiment = self._current_trial_experiment
+        for action in actions:
+            if action.kind == "target" and action.value is not None:
+                self._send(self.protocol.target(action.value))
+            elif action.kind == "position_target" and action.value is not None:
+                if experiment is not None:
+                    self._send(
+                        self.protocol.target(
+                            experiment.board_target_for_continuous(action.value)
+                        )
+                    )
+            elif action.kind in {"configure_position", "configure_return"}:
+                if experiment is None:
+                    continue
+                returning = action.kind == "configure_return"
+                self.current_trial_status_label.setText(
+                    "PWM отключается; установка возвращается к исходной координате…"
+                    if returning
+                    else "PWM отключается; включается безопасный Angle + Voltage…"
+                )
+                commands = self._current_trial_positioning_commands(experiment)
+                callback = (
+                    self._finish_current_trial_return_configuration
+                    if returning
+                    else self._finish_current_trial_position_configuration
+                )
+                self._queue_commands(commands, callback)
+            elif action.kind == "configure_current":
+                if experiment is None:
+                    continue
+                self.current_trial_status_label.setText(
+                    "PWM отключается; задаются FOC Current, экспериментальные P/I и нулевая цель…"
+                )
+                self._queue_commands(
+                    self._current_trial_current_commands(experiment),
+                    self._finish_current_trial_current_configuration,
+                )
+            elif action.kind == "checkpoint":
+                self._save_current_trial_checkpoint()
+            elif action.kind == "safe_stop":
+                self._cancel_queued_commands()
+                sent = self.device.emergency_stop()
+                self._pwm_requested = False
+                self.pwm_state_label.setText("PWM: отключён токовым опытом")
+                self._log(
+                    "CURRENT_TRIAL_STOP",
+                    f"Best-effort stop: {sent or 'нет связи'}",
+                )
+                if (
+                    experiment is not None
+                    and experiment.phase == CurrentTrialPhase.ABORTED
+                ):
+                    self._finalize_current_trial("failed", experiment.abort_reason)
+                    return
+            elif action.kind == "finish":
+                self._finalize_current_trial("completed")
+                return
+
+    def _finish_current_trial_position_configuration(self) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        self._pwm_requested = True
+        self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
+        self._process_current_trial_actions(
+            experiment.position_configuration_applied(time.monotonic())
+        )
+
+    def _finish_current_trial_return_configuration(self) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        self._pwm_requested = True
+        self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
+        self._process_current_trial_actions(
+            experiment.position_configuration_applied(
+                time.monotonic(),
+                returning=True,
+            )
+        )
+
+    def _finish_current_trial_current_configuration(self) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        self._pwm_requested = True
+        self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
+        self._process_current_trial_actions(
+            experiment.current_configuration_applied(time.monotonic())
+        )
+
+    def _advance_current_trial(self) -> None:
+        experiment = self._current_trial_experiment
+        if (
+            experiment is None
+            or experiment.phase
+            in {CurrentTrialPhase.COMPLETE, CurrentTrialPhase.ABORTED}
+        ):
+            return
+        now = time.monotonic()
+        if experiment.phase in {
+            CurrentTrialPhase.IDLE,
+            CurrentTrialPhase.CONFIGURING_POSITION,
+            CurrentTrialPhase.CONFIGURING_CURRENT,
+            CurrentTrialPhase.CONFIGURING_RETURN,
+        }:
+            self._update_current_trial_status(now)
+            return
+        if experiment.phase == CurrentTrialPhase.RECOVERING:
+            self._advance_current_trial_recovery(now)
+            return
+        reference = self._last_telemetry_received_at or self._monitor_configured_at
+        timeout = monitor_stale_timeout(experiment.config.monitor_downsample)
+        if reference is None or now - reference > timeout:
+            self._current_trial_last_sample_sequence = self._telemetry_sequence
+            self._current_trial_recovery_started_at = now
+            self._current_trial_recovery_alerted = False
+            self._process_current_trial_actions(
+                experiment.enter_recovery("Телеметрия остановилась")
+            )
+            self._save_current_trial_checkpoint()
+            return
+        self._process_current_trial_actions(experiment.tick(now))
+        self._update_current_trial_status(now)
+
+    def _advance_current_trial_recovery(self, now: float) -> None:
+        experiment = self._current_trial_experiment
+        if (
+            experiment is None
+            or experiment.phase != CurrentTrialPhase.RECOVERING
+        ):
+            return
+        self._alert_slow_current_trial_recovery(now)
+        if not self.device.connected or self._current_trial_resume_pending:
+            return
+        if self._command_queue or self._command_timer.isActive():
+            return
+        if self._telemetry_sequence <= self._current_trial_last_sample_sequence:
+            started = self._current_trial_recovery_started_at or now
+            self.current_trial_status_label.setText(
+                f"Ожидание платы/телеметрии: {now - started:.1f} с. "
+                "После возврата опыт повторится автоматически…"
+            )
+            return
+        sample = self._last_sample
+        if sample is None:
+            return
+        raw_angle = (
+            sample.raw_angle_rad
+            if sample.raw_angle_rad is not None
+            else sample.angle_rad
+        )
+        if raw_angle is None:
+            return
+        experiment.reseed_after_recovery(float(raw_angle))
+        continuous_angle = experiment.continuous_angle_for_raw(float(raw_angle))
+        if not (
+            experiment.config.absolute_angle_min_rad
+            <= continuous_angle
+            <= experiment.config.absolute_angle_max_rad
+        ):
+            self._abort_current_trial(
+                "После восстановления координата оказалась вне ±4 рад"
+            )
+            return
+        self._current_trial_resume_pending = True
+        self.monitor_mask = CURRENT_TRIAL_MONITOR_MASK
+        self._prepare_monitor_configuration(
+            CURRENT_TRIAL_MONITOR_MASK,
+            reset_statistics=False,
+            reset_recovery=False,
+        )
+        self._mark_monitor_configuration_started()
+        actions = experiment.resume_after_recovery(now)
+        self.current_trial_status_label.setText(
+            "Поток восстановлен; незавершённый опыт повторяется с безопасного возврата…"
+        )
+        self._current_trial_resume_pending = False
+        self._current_trial_recovery_started_at = None
+        self._current_trial_recovery_alerted = False
+        self._process_current_trial_actions(actions)
+        self._save_current_trial_checkpoint()
+
+    def _alert_slow_current_trial_recovery(self, now: float) -> bool:
+        started = self._current_trial_recovery_started_at
+        duration = 0.0 if started is None else max(0.0, now - started)
+        if (
+            duration <= 5.0
+            or not self._current_trial_recovery_sound_enabled
+            or self._current_trial_recovery_alerted
+        ):
+            return False
+        QApplication.beep()
+        self._current_trial_recovery_alerted = True
+        self._log(
+            "CURRENT_TRIAL_RECOVERY",
+            f"Звуковой сигнал: питание/телеметрия отсутствовали {duration:.1f} с",
+        )
+        return True
+
+    def _update_current_trial_status(self, now: float) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        phase_names = {
+            CurrentTrialPhase.CONFIGURING_POSITION: "настройка транспортного режима",
+            CurrentTrialPhase.POSITIONING: "выход в исходную координату",
+            CurrentTrialPhase.POSITION_SETTLING: "проверка остановки",
+            CurrentTrialPhase.CONFIGURING_CURRENT: "переключение на FOC Current",
+            CurrentTrialPhase.CURRENT_BASELINE: "запись нуля до ступени",
+            CurrentTrialPhase.CURRENT_STEP: "запись токовой ступени",
+            CurrentTrialPhase.CURRENT_POST: "запись нуля после ступени",
+            CurrentTrialPhase.CONFIGURING_RETURN: "возврат конфигурации положения",
+            CurrentTrialPhase.RETURNING: "возврат к исходной координате",
+            CurrentTrialPhase.RETURN_SETTLING: "проверка остановки после возврата",
+            CurrentTrialPhase.RECOVERING: "восстановление после обрыва",
+        }
+        self.current_trial_status_label.setText(
+            f"{phase_names.get(experiment.phase, experiment.phase.value)} · "
+            f"{max(0.0, now - experiment.phase_started_s):.1f} с · "
+            f"цель {experiment.current_target:g} А · "
+            f"восстановлений {experiment.recovery_attempts}/"
+            f"{experiment.config.max_recovery_attempts}"
+        )
+
+    def _stop_current_trial_by_user(self) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None or not self._current_trial_running():
+            return
+        experiment.abort("Остановлено пользователем")
+        self._cancel_queued_commands()
+        self.device.emergency_stop()
+        self._pwm_requested = False
+        self._finalize_current_trial("interrupted", experiment.abort_reason)
+
+    def _abort_current_trial(self, reason: str) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        experiment.abort(reason)
+        self._cancel_queued_commands()
+        self.device.emergency_stop()
+        self._pwm_requested = False
+        self._finalize_current_trial("failed", reason)
+
+    def _save_current_trial_checkpoint(self) -> None:
+        experiment = self._current_trial_experiment
+        if self.project is None or experiment is None:
+            return
+        payload = experiment.checkpoint_payload(
+            self._current_trial_experiment_id
+        )
+        payload["telemetry_paths"] = list(self._current_trial_telemetry_paths)
+        self.project.save_checkpoint("current_trial", payload)
+
+    def _finalize_current_trial(self, status: str, error: str = "") -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        recorder_path = self.current_trial_recorder.stop()
+        if (
+            recorder_path is not None
+            and str(recorder_path) not in self._current_trial_telemetry_paths
+        ):
+            self._current_trial_telemetry_paths.append(str(recorder_path))
+        result = experiment.result(status, error=error)
+        result["telemetry_paths"] = list(self._current_trial_telemetry_paths)
+        export_path: Path | None = None
+        bundle_path: Path | None = None
+        if self.project is not None and self._current_trial_experiment_id is not None:
+            fields: dict[str, object] = {
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result_json": json.dumps(result, ensure_ascii=False),
+            }
+            if error:
+                fields["error"] = error
+            self.project.update_experiment(
+                self._current_trial_experiment_id,
+                status,
+                **fields,
+            )
+            export_path = self.project.save_export(
+                f"current_trial_{self._current_trial_experiment_id}",
+                result,
+            )
+            try:
+                bundle_path = self.project.save_bundle(
+                    f"current_trial_{self._current_trial_experiment_id}_SEND_ME",
+                    [export_path, *self._current_trial_telemetry_paths],
+                )
+            except (OSError, ValueError) as exc:
+                self._log(
+                    "ERROR",
+                    f"Не удалось собрать ZIP токового опыта: {exc}",
+                )
+            else:
+                self._current_trial_last_bundle = bundle_path
+                self._log(
+                    "CURRENT_TRIAL",
+                    f"Готов единый диагностический ZIP: {bundle_path}",
+                )
+        self._render_current_trial_result(result, bundle_path)
+        self._save_current_trial_checkpoint()
+        self.current_trial_start_button.setEnabled(True)
+        self.current_trial_resume_button.setEnabled(True)
+        self.current_trial_stop_button.setEnabled(False)
+        if status == "completed":
+            self.current_trial_status_label.setText(
+                "Опыт завершён; PWM отключён, ручная конфигурация восстанавливается."
+            )
+        else:
+            self.current_trial_status_label.setText(
+                f"Опыт остановлен: {error or status}. PWM отключён; checkpoint сохранён."
+            )
+        restore_commands = list(self._current_trial_restore_commands)
+        restore_mask = self._current_trial_restore_mask
+        self._log(
+            "CURRENT_TRIAL",
+            f"Опыт завершён со статусом {status}: {error or result['note']}",
+        )
+        self._current_trial_experiment = None
+        self._current_trial_resume_pending = False
+        self.monitor_mask = restore_mask
+        if self.device.connected and restore_commands:
+            self._prepare_monitor_configuration(
+                restore_mask,
+                reset_statistics=False,
+                reset_recovery=True,
+            )
+            self._mark_monitor_configuration_started()
+            self._queue_commands(restore_commands)
+
+    def _clear_current_trial_results(self) -> None:
+        for row in range(self.current_trial_results.rowCount()):
+            self.current_trial_results.setItem(row, 1, QTableWidgetItem("—"))
+            self.current_trial_results.setItem(row, 2, QTableWidgetItem("—"))
+        self.current_trial_report.setPlainText(
+            "Идёт автоматический опыт. Все сырые отсчёты сразу записываются на диск."
+        )
+
+    def _render_current_trial_result(
+        self,
+        result: dict[str, object],
+        bundle_path: Path | None,
+    ) -> None:
+        metrics = result.get("metrics", {})
+        stages = result.get("stages", {})
+        step = stages.get("step", {}) if isinstance(stages, dict) else {}
+
+        def number(value: object, suffix: str = "") -> str:
+            return "—" if not isinstance(value, (int, float)) else f"{value:.6g}{suffix}"
+
+        rows = (
+            (
+                "пригодны" if result.get("valid") else "нужна проверка",
+                "Одиночный тест, не оптимизация",
+            ),
+            (
+                number(step.get("sample_rate_hz") if isinstance(step, dict) else None, " Гц"),
+                "Фактически полученная частота",
+            ),
+            (
+                number(metrics.get("steady_current_q_a") if isinstance(metrics, dict) else None, " А"),
+                "Среднее второй половины ступени",
+            ),
+            (
+                number(metrics.get("steady_error_a") if isinstance(metrics, dict) else None, " А"),
+                "Цель минус измеренный Iq",
+            ),
+            (
+                number(metrics.get("peak_abs_current_q_a") if isinstance(metrics, dict) else None, " А"),
+                "Максимальный модуль Iq",
+            ),
+            (
+                number(metrics.get("rms_current_d_a") if isinstance(metrics, dict) else None, " А"),
+                "Поперечная составляющая",
+            ),
+            (
+                number(metrics.get("peak_abs_voltage_q_v") if isinstance(metrics, dict) else None, " В"),
+                "Максимальный модуль Uq",
+            ),
+            (
+                number(metrics.get("angle_span_during_step_rad") if isinstance(metrics, dict) else None, " рад"),
+                "Размах координаты во время ступени",
+            ),
+        )
+        for row, (value, comment) in enumerate(rows):
+            self.current_trial_results.setItem(row, 1, QTableWidgetItem(value))
+            self.current_trial_results.setItem(row, 2, QTableWidgetItem(comment))
+        report_lines = [str(result.get("note", ""))]
+        telemetry = result.get("telemetry")
+        if isinstance(telemetry, dict):
+            report_lines.append(
+                "Прерывания: "
+                f"{telemetry.get('interruption_count', 0)}; "
+                f"восстановления: {telemetry.get('recovery_attempts', 0)}; "
+                f"отброшенные углы: {telemetry.get('rejected_angle_samples', 0)}."
+            )
+        if bundle_path is not None:
+            report_lines.append(
+                "Для передачи нужен только этот файл:\n"
+                f"{bundle_path}"
+            )
+        else:
+            report_lines.append(
+                "Единый ZIP не собран; передайте JSON и CSV из папки проекта."
+            )
+        self.current_trial_report.setPlainText("\n\n".join(report_lines))
 
     def _analysis_page(self) -> QWidget:
         page, layout = titled_page(
@@ -3078,6 +3941,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Проект открыт: {root}", 5000)
         self._log("INFO", f"Проект открыт: {root}")
 
+    def _open_drive_bridge(self) -> None:
+        if self._drive_bridge_dialog is None:
+            from foctwin.drive_bridge_ui import DriveBridgeDialog
+
+            self._drive_bridge_dialog = DriveBridgeDialog(self)
+        self._drive_bridge_dialog.show()
+        self._drive_bridge_dialog.raise_()
+        self._drive_bridge_dialog.activateWindow()
+
     def _connect_settings_persistence(self) -> None:
         spin_boxes = [
             self.target_spin,
@@ -3113,6 +3985,12 @@ class MainWindow(QMainWindow):
             self.friction_position_bin,
             self.friction_automatic_positions,
             self.friction_automatic_position_step,
+            self.current_trial_step,
+            self.current_trial_kp,
+            self.current_trial_ki,
+            self.current_trial_baseline,
+            self.current_trial_step_duration,
+            self.current_trial_post,
         ]
         for widget in spin_boxes:
             widget.valueChanged.connect(self._schedule_user_settings_save)
@@ -3133,6 +4011,7 @@ class MainWindow(QMainWindow):
             self.friction_evidence_mode,
             self.friction_adaptive_positioning,
             self.friction_position_validation,
+            self.current_trial_recovery_sound,
             *self.device_limit_checks.values(),
             *self.monitor_checks.values(),
             *self.plot_checks.values(),
@@ -3197,6 +4076,15 @@ class MainWindow(QMainWindow):
                 "follow": self.plot_follow_checkbox.isChecked(),
             },
             "friction": self._friction_config_from_widgets().to_dict(),
+            "current_trial": {
+                "step_current_a": self.current_trial_step.value(),
+                "current_kp": self.current_trial_kp.value(),
+                "current_ki": self.current_trial_ki.value(),
+                "baseline_s": self.current_trial_baseline.value(),
+                "step_s": self.current_trial_step_duration.value(),
+                "post_s": self.current_trial_post.value(),
+                "recovery_sound": self.current_trial_recovery_sound.isChecked(),
+            },
         }
 
     def _save_user_settings(self) -> None:
@@ -3281,6 +4169,29 @@ class MainWindow(QMainWindow):
                     self._log("ERROR", "Настройки теста трения не восстановлены: значения некорректны")
                 else:
                     self._set_friction_config_widgets(config)
+            current_trial = payload.get("current_trial")
+            if isinstance(current_trial, dict):
+                self.current_trial_step.setValue(
+                    float(current_trial.get("step_current_a", 0.1))
+                )
+                self.current_trial_kp.setValue(
+                    float(current_trial.get("current_kp", self.profile.current_q.p))
+                )
+                self.current_trial_ki.setValue(
+                    float(current_trial.get("current_ki", self.profile.current_q.i))
+                )
+                self.current_trial_baseline.setValue(
+                    float(current_trial.get("baseline_s", 1.0))
+                )
+                self.current_trial_step_duration.setValue(
+                    float(current_trial.get("step_s", 2.0))
+                )
+                self.current_trial_post.setValue(
+                    float(current_trial.get("post_s", 1.0))
+                )
+                self.current_trial_recovery_sound.setChecked(
+                    bool(current_trial.get("recovery_sound", True))
+                )
             self._sync_profile_from_widgets()
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._log("ERROR", f"Последние настройки не восстановлены: {exc}")
@@ -3411,10 +4322,33 @@ class MainWindow(QMainWindow):
     def _initialize_connection(self) -> None:
         if not self.device.connected:
             return
-        if self.safe_connect_checkbox.isChecked():
+        current_trial = self._current_trial_experiment
+        friction_experiment = self._friction_experiment
+        recovering_experiment = (
+            current_trial is not None
+            and current_trial.phase == CurrentTrialPhase.RECOVERING
+        ) or (
+            friction_experiment is not None
+            and friction_experiment.phase == FrictionPhase.RECOVERING
+        )
+        if self.safe_connect_checkbox.isChecked() or recovering_experiment:
             self._send(self.protocol.disable())
             self._send(self.protocol.phase_resistance(self.profile.phase_resistance_ohm))
-        experiment = self._friction_experiment
+        if (
+            current_trial is not None
+            and current_trial.phase == CurrentTrialPhase.RECOVERING
+        ):
+            self.monitor_mask = CURRENT_TRIAL_MONITOR_MASK
+            self._prepare_monitor_configuration(
+                CURRENT_TRIAL_MONITOR_MASK,
+                reset_statistics=False,
+                reset_recovery=False,
+            )
+            self._send_monitor_configuration(
+                "восстанавливается для токового опыта"
+            )
+            return
+        experiment = friction_experiment
         if experiment is not None and experiment.phase == FrictionPhase.RECOVERING:
             self.monitor_mask = FRICTION_MONITOR_MASK
             self._prepare_monitor_configuration(
@@ -3881,6 +4815,13 @@ class MainWindow(QMainWindow):
         self.pwm_state_label.setText("PWM: отключён (best-effort)")
         self._log("EMERGENCY", f"Best-effort stop; sent: {sent or 'nothing (not connected)'}")
         self.statusBar().showMessage("Аварийный стоп отправлен; при сомнениях отключите питание", 10000)
+        current_trial = self._current_trial_experiment
+        if current_trial is not None and self._current_trial_running():
+            current_trial.abort("Аварийный стоп FOCTwin")
+            self._finalize_current_trial(
+                "interrupted",
+                current_trial.abort_reason,
+            )
         experiment = self._friction_experiment
         if experiment is not None and self._friction_running():
             experiment.abort("Аварийный стоп FOCTwin")
@@ -3947,6 +4888,19 @@ class MainWindow(QMainWindow):
         self.side_connection.setText("● Мотор подключён" if connected else "● Мотор отключён")
         self.dashboard_motor.setText("Подключён" if connected else "Отключён")
         self._log("SERIAL", message)
+        current_trial = self._current_trial_experiment
+        if (
+            not connected
+            and current_trial is not None
+            and self._current_trial_running()
+        ):
+            self._current_trial_last_sample_sequence = self._telemetry_sequence
+            self._current_trial_recovery_started_at = time.monotonic()
+            self._current_trial_recovery_alerted = False
+            self._process_current_trial_actions(
+                current_trial.enter_recovery("Serial/питание отключены")
+            )
+            self._save_current_trial_checkpoint()
         experiment = self._friction_experiment
         if not connected and experiment is not None and self._friction_running():
             self._friction_last_sample_sequence = self._telemetry_sequence
@@ -3989,8 +4943,11 @@ class MainWindow(QMainWindow):
             raw=line,
             **parsed,
         )
+        current_trial = self._current_trial_experiment
         experiment = self._friction_experiment
-        if experiment is not None and self._friction_running():
+        if current_trial is not None and self._current_trial_running():
+            sample = current_trial.prepare_sample(sample)
+        elif experiment is not None and self._friction_running():
             sample = experiment.prepare_sample(sample)
         self._last_sample = sample
         self._last_telemetry_received_at = received_at
@@ -4003,6 +4960,7 @@ class MainWindow(QMainWindow):
         self.telemetry_statistics.add(timestamp_s)
         self.telemetry_recorder.append(sample)
         self.friction_recorder.append(sample)
+        self.current_trial_recorder.append(sample)
         for name in MONITOR_FIELDS:
             value = getattr(sample, name)
             if value is None:
@@ -4014,7 +4972,17 @@ class MainWindow(QMainWindow):
                 del times[:-60000]
                 del values[:-60000]
 
-        if experiment is not None and self._friction_running():
+        if current_trial is not None and self._current_trial_running():
+            violation, actions = current_trial.add_sample(
+                sample,
+                received_at,
+                angle_prepared=True,
+            )
+            self._process_current_trial_actions(actions)
+            if violation:
+                self._abort_current_trial(violation)
+                return
+        elif experiment is not None and self._friction_running():
             violation, actions = experiment.add_sample(
                 sample,
                 received_at,
@@ -4032,7 +5000,11 @@ class MainWindow(QMainWindow):
         )
         violations = (
             self.guard.check(sample, ignored_signals=ignored)
-            if self._pwm_requested and self.software_guard_enabled.isChecked()
+            if (
+                self._pwm_requested
+                and self.software_guard_enabled.isChecked()
+                and not self._current_trial_running()
+            )
             else []
         )
         if self._pwm_requested and violations and not self._safety_latched:
@@ -4067,6 +5039,11 @@ class MainWindow(QMainWindow):
         friction_error = self.friction_recorder.last_error
         if friction_error and self._friction_running():
             self._abort_friction_experiment(f"Ошибка записи данных опыта: {friction_error}")
+        current_trial_error = self.current_trial_recorder.last_error
+        if current_trial_error and self._current_trial_running():
+            self._abort_current_trial(
+                f"Ошибка записи данных токового опыта: {current_trial_error}"
+            )
 
     def _refresh_live_plot(self) -> None:
         if self.live_plot is None:
@@ -4193,6 +5170,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_user_settings()
+        current_trial = self._current_trial_experiment
+        if current_trial is not None and self._current_trial_running():
+            current_trial.enter_recovery("Приложение закрыто во время опыта")
+            self._save_current_trial_checkpoint()
+            if self.project is not None and self._current_trial_experiment_id is not None:
+                self.project.update_experiment(
+                    self._current_trial_experiment_id,
+                    "interrupted",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    error="Приложение закрыто во время опыта",
+                )
         experiment = self._friction_experiment
         if experiment is not None and self._friction_running():
             experiment.abort("Приложение закрыто во время опыта")
@@ -4212,8 +5200,10 @@ class MainWindow(QMainWindow):
         self._telemetry_ui_timer.stop()
         self._telemetry_watchdog_timer.stop()
         self._friction_timer.stop()
+        self._current_trial_timer.stop()
         self.telemetry_recorder.stop()
         self.friction_recorder.stop()
+        self.current_trial_recorder.stop()
         self.device.emergency_stop()
         if self.device.connected:
             try:

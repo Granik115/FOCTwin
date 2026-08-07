@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -9,6 +10,8 @@ try:
     from PySide6.QtCore import QSettings, Qt
     from PySide6.QtWidgets import QApplication
 
+    from foctwin.current_trial import CurrentTrialExperiment
+    from foctwin.drive_bridge_ui import DriveBridgeDialog
     from foctwin.protocol import CommanderResponse
     from foctwin.ui import MainWindow
 except ImportError:
@@ -67,11 +70,37 @@ class UiSmokeTests(unittest.TestCase):
             self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
             self.assertGreater(window.friction_angle_max.maximum(), 3.0)
             self.assertFalse(window.friction_stop_button.isEnabled())
+            self.assertEqual(window.current_trial_step.value(), 0.1)
+            self.assertEqual(window.current_trial_kp.value(), 8.4222)
+            self.assertEqual(window.current_trial_ki.value(), 814.0)
+            self.assertEqual(window.current_trial_baseline.value(), 1.0)
+            self.assertEqual(window.current_trial_step_duration.value(), 2.0)
+            self.assertEqual(window.current_trial_post.value(), 1.0)
+            self.assertTrue(window.current_trial_recovery_sound.isChecked())
+            self.assertFalse(window.current_trial_stop_button.isEnabled())
+            self.assertEqual(window.current_trial_results.rowCount(), 8)
             self.assertEqual(
                 window.manual_scroll.horizontalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded,
             )
             window.close()
+
+    def test_drive_bridge_window_queues_chat_without_project_or_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dialog = DriveBridgeDialog(state_root=Path(temporary) / "bridge")
+            self.assertEqual(dialog.engine.snapshot().pending_count, 0)
+            self.assertFalse(dialog.open_folder_button.isEnabled())
+            self.assertIn("команды мотору", dialog.safety_label.text().lower())
+
+            dialog.message_input.setPlainText("Домашний тест без мотора")
+            dialog._queue_message()
+
+            snapshot = dialog.engine.snapshot()
+            self.assertEqual(snapshot.pending_count, 1)
+            self.assertEqual(snapshot.messages[-1].kind, "chat")
+            self.assertEqual(snapshot.messages[-1].text, "Домашний тест без мотора")
+            self.assertEqual(snapshot.credentials_path, "")
+            dialog.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,6 +128,86 @@ class UiSmokeTests(unittest.TestCase):
                 "21.5",
             )
             second.close()
+
+    def test_current_trial_settings_are_restored_between_program_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = f"{temporary}/settings.ini"
+            first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+            first.current_trial_step.setValue(-0.12)
+            first.current_trial_kp.setValue(7.5)
+            first.current_trial_ki.setValue(700.0)
+            first.current_trial_baseline.setValue(1.5)
+            first.current_trial_step_duration.setValue(3.0)
+            first.current_trial_post.setValue(2.0)
+            first.current_trial_recovery_sound.setChecked(False)
+            first._save_user_settings()
+            first.close()
+
+            second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+            self.assertEqual(second.current_trial_step.value(), -0.12)
+            self.assertEqual(second.current_trial_kp.value(), 7.5)
+            self.assertEqual(second.current_trial_ki.value(), 700.0)
+            self.assertEqual(second.current_trial_baseline.value(), 1.5)
+            self.assertEqual(second.current_trial_step_duration.value(), 3.0)
+            self.assertEqual(second.current_trial_post.value(), 2.0)
+            self.assertFalse(second.current_trial_recovery_sound.isChecked())
+            second.close()
+
+    def test_current_trial_commands_force_neutral_bounded_mode_switches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            config = window._current_trial_config_from_widgets()
+            experiment = CurrentTrialExperiment(config, 0.0)
+            experiment.seed_angle(0.0)
+
+            position_commands = window._current_trial_positioning_commands(experiment)
+            current_commands = window._current_trial_current_commands(experiment)
+
+            self.assertEqual(
+                position_commands[:5],
+                ["AE0", "AR0.675", "ALC4.44444444444", "ALU12", "ALV0.2"],
+            )
+            self.assertIn("AAP35", position_commands)
+            self.assertIn("AVP20.4", position_commands)
+            self.assertEqual(
+                position_commands[-7:],
+                ["AT0", "AC2", "A0", "AMC", "AMD10", "AMS1111111", "AE1"],
+            )
+            self.assertEqual(
+                current_commands[:5],
+                ["AE0", "AR0.675", "ALC0.5", "ALU12", "ALV0.5"],
+            )
+            self.assertIn("AQP8.4222", current_commands)
+            self.assertIn("AQI814", current_commands)
+            self.assertIn("ADP8.4222", current_commands)
+            self.assertIn("ADI814", current_commands)
+            self.assertEqual(
+                current_commands[-7:],
+                ["AT2", "AC0", "A0", "AMC", "AMD10", "AMS1111111", "AE1"],
+            )
+            window.close()
+
+    def test_current_trial_slow_recovery_beeps_once_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window._current_trial_recovery_started_at = 100.0
+            window._current_trial_recovery_sound_enabled = True
+            window._current_trial_recovery_alerted = False
+
+            with patch("foctwin.ui.QApplication.beep") as beep:
+                self.assertFalse(window._alert_slow_current_trial_recovery(105.0))
+                self.assertTrue(window._alert_slow_current_trial_recovery(105.1))
+                self.assertFalse(window._alert_slow_current_trial_recovery(110.0))
+                beep.assert_called_once_with()
+
+            window._current_trial_recovery_sound_enabled = False
+            window._current_trial_recovery_alerted = False
+            with patch("foctwin.ui.QApplication.beep") as beep:
+                self.assertFalse(window._alert_slow_current_trial_recovery(110.0))
+                beep.assert_not_called()
+            window.close()
 
     def test_friction_configuration_is_persisted(self):
         with tempfile.TemporaryDirectory() as temporary:
