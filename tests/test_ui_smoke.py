@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,6 +11,7 @@ try:
     from PySide6.QtWidgets import QApplication
 
     from foctwin.current_trial import CurrentTrialExperiment
+    from foctwin.drive_bridge_ui import DriveBridgeDialog
     from foctwin.protocol import CommanderResponse
     from foctwin.ui import MainWindow
 except ImportError:
@@ -82,6 +84,23 @@ class UiSmokeTests(unittest.TestCase):
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded,
             )
             window.close()
+
+    def test_drive_bridge_window_queues_chat_without_project_or_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dialog = DriveBridgeDialog(state_root=Path(temporary) / "bridge")
+            self.assertEqual(dialog.engine.snapshot().pending_count, 0)
+            self.assertFalse(dialog.open_folder_button.isEnabled())
+            self.assertIn("команды мотору", dialog.safety_label.text().lower())
+
+            dialog.message_input.setPlainText("Домашний тест без мотора")
+            dialog._queue_message()
+
+            snapshot = dialog.engine.snapshot()
+            self.assertEqual(snapshot.pending_count, 1)
+            self.assertEqual(snapshot.messages[-1].kind, "chat")
+            self.assertEqual(snapshot.messages[-1].text, "Домашний тест без мотора")
+            self.assertEqual(snapshot.credentials_path, "")
+            dialog.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:

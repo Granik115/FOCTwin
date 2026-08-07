@@ -6,11 +6,13 @@ state directly.
 ```mermaid
 flowchart TD
     UI["PySide6 control surface"] --> ORCH["Experiment orchestrator"]
+    UI --> BRIDGE["Chat-only Drive Bridge"]
     ORCH --> DEVICE["Serial device service"]
     ORCH --> MATLAB["MATLAB R2022b adapter"]
     ORCH --> STORE["Project store"]
     DEVICE --> FW["Existing SimpleFOC firmware"]
     MATLAB --> MODELS["Current / Voltage models"]
+    BRIDGE --> DRIVE["Google Drive API"]
 ```
 
 ## Boundaries
@@ -38,6 +40,18 @@ starts at a checkpoint boundary; it never tries to continue the middle of a phys
 Encodes the existing SimpleFOC Commander grammar, reads monitor lines and executes the
 best-effort emergency sequence. It remains independent from Qt so it can later move into a
 separate watchdog process without changing protocol code.
+
+### Drive Bridge
+
+The optional home-test Drive Bridge is parallel to the experiment orchestrator, not inside it. It
+owns only OAuth, a local atomic queue and four small Drive files. FOCTwin and ChatGPT write to
+different JSONL streams, so neither side overwrites the other side's newly appended messages.
+Schema 1 accepts `chat` only: records with any other kind are discarded before they reach the UI,
+and the module has no dependency on Serial, Commander or a motor experiment state machine.
+
+The refresh token is stored through Windows Credential Manager. Local state contains file IDs,
+ETags, cached chat and unsent messages but no OAuth refresh token. Google Drive Desktop is not a
+dependency.
 
 ### MATLAB adapter
 

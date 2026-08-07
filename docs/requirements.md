@@ -10,7 +10,8 @@ the first implementation; every safety value remains editable in a project profi
 - MATLAB R2022b with MATLAB, Simulink, Simscape, Simscape Electrical, Motor Control
   Blockset, Global Optimization Toolbox, MATLAB Compiler and Simulink Compiler available.
 - Full MATLAB is installed on the work computer.
-- The application works offline except for release updates.
+- Core motor, project and MATLAB workspaces remain offline-capable. The optional Drive Bridge
+  requires Internet only while its separate chat window is connected.
 - Both source/development mode and an installed application are required.
 - Python 3.10 is selected because it is compatible with MATLAB Engine R2022b.
 
@@ -84,4 +85,3 @@ the first implementation; every safety value remains editable in a project profi
 - Raw Commander console plus a FOCTwin scenario language.
 - Detailed diagnostic logging can include all available working data.
 - Stable/beta update channels, GitHub Releases, hash/signature verification and rollback.
-

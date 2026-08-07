@@ -21,7 +21,23 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-Version 0.4.0 contains:
+The home-test build 0.4.1b1 keeps the complete 0.4.0 current-trial implementation unchanged and
+adds:
+
+- a separate **Связь с GPT** window that opens without a project, COM port or motor;
+- direct Google Drive API authorization for a Desktop OAuth client; Google Drive Desktop is not
+  required;
+- a narrow `drive.file` workspace named `FOCTwin_Bridge_<ID>` with separate one-writer inbox and
+  outbox streams;
+- a locally durable outgoing queue, UUID deduplication, restart recovery, three-second polling,
+  visible delay/status information and an expandable technical log;
+- an explicit schema-1 safety boundary that accepts only human-readable `CHAT` messages and
+  rejects every incoming command kind before it can reach any motor code.
+
+First-time OAuth setup and the exact file protocol are documented in
+[`docs/drive-bridge.md`](docs/drive-bridge.md).
+
+The preserved 0.4.0 milestone contains:
 
 - a runnable PySide6 desktop shell with full-control workspaces;
 - a one-button guarded current-step trial in the real-motor tuning workspace: it captures the

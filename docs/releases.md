@@ -19,6 +19,23 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.1b1
+
+- Keep the guarded current experiment from 0.4.0 unchanged on a separate Drive Bridge test
+  branch.
+- Add a non-modal `Связь с GPT` diagnostics window that does not open a COM port or require a
+  project/motor.
+- Authorize a user-owned Google Desktop OAuth client through the browser and store the refresh
+  token in Windows Credential Manager; Google Drive Desktop is not required.
+- Request only the per-file `drive.file` scope and create a uniquely identified
+  `FOCTwin_Bridge_<ID>` folder with manifest, status and two single-writer JSONL channels.
+- Save each outgoing chat locally before network I/O, merge by UUID and retain the queue across
+  application termination, network loss and power interruption.
+- Poll the one inbound file every three seconds with conditional ETags, resume automatically after
+  transient network failures and expose account, queue, last-sync and technical-log status.
+- Accept only schema-1 `chat` records from ChatGPT. Unknown/command records are logged and ignored;
+  no Drive code imports or invokes Serial, Commander or current-trial actions.
+
 ## 0.4.0
 
 - Add the first direct real-motor tuning building block: one guarded current step with automatic

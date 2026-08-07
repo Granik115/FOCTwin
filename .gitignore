@@ -18,6 +18,11 @@ logs/
 checkpoints/
 telemetry/
 
+# Local Google OAuth files must never enter the repository
+client_secret*.json
+credentials*.json
+token.json
+
 # MATLAB generated files
 slprj/
 *.slxc
@@ -30,4 +35,3 @@ surrogate_tuning_checkpoint.mat
 .vscode/
 .DS_Store
 Thumbs.db
-
