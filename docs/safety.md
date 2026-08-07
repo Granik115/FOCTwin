@@ -11,6 +11,8 @@
 - Stop immediately on travel violation or a twofold current, voltage or angle-speed excursion.
 - Require three consecutive samples for a smaller working-limit excess.
 - On stop: command target zero, send `AE0` repeatedly and restore phase resistance.
+- For the 0.4.0 current trial, repeat the entire unfinished attempt after any telemetry or
+  connection interruption instead of joining measurements across an unknown PWM interval.
 
 Streamed SimpleFOC current values are expressed in mA by the bundled firmware. FOCTwin
 normalizes them to A before applying thresholds or calculating torque.
@@ -25,6 +27,30 @@ normalizes them to A before applying thresholds or calculating torque.
 
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
+
+## Guarded current trial (0.4.0)
+
+The first direct-tuning release captures the current coordinate only when it is inside `±3 rad`.
+The return controller uses the already loaded angle and velocity PID values in
+`Angle + Voltage`, limited to the equivalent of `3 V` Uq and `0.2 rad/s`. PWM is disabled before
+the program writes `FOC Current`, Q/D PI values, limits or a neutral target.
+
+The first profile is deliberately small: a `0.1 A` target for `2 s`, with a `1 s` zero before and
+after it. The firmware target is clipped to `0.5 A`, current-loop working voltage to `12 V`, and
+the host stops the experimental section after two confirmed samples above `1 A`. Independent
+absolute envelopes remain `5 A`, `24 V`, `0.5 rad/s` and `±4 rad`; reaching `±3.5 rad` stops the
+trial before the final travel boundary.
+
+If telemetry becomes stale or Serial disappears, FOCTwin immediately attempts target zero and
+repeated `AE0`, atomically saves a checkpoint and marks all baseline/step/post samples of that
+attempt invalid. If the board is still unreachable after five seconds, the selected alert sounds
+while recovery is pending. After connection returns, FOCTwin sends `AE0` before any other active
+configuration, restores the board-angle reference and restarts from transport positioning.
+
+Removing only motor supply while the controller remains connected may leave telemetry running.
+In that case the trial can finish with “measured Iq response not observed”; it is retained as
+diagnostic evidence but is not marked valid. The software cannot detect or control energy that is
+not represented by the existing firmware telemetry.
 
 ## Evidence diagnostic experiment (0.3.11)
 

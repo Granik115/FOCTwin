@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -176,6 +177,48 @@ class ProjectStore:
         path = self.export_dir / f"{timestamp}_{safe_label or 'result'}.json"
         self.atomic_json(path, payload)
         return path
+
+    def save_bundle(self, label: str, paths: list[str | Path]) -> Path:
+        """Create one durable ZIP containing the selected experiment evidence files."""
+
+        safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in label)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        destination = self.export_dir / f"{timestamp}_{safe_label or 'bundle'}.zip"
+        unique_paths: list[Path] = []
+        seen: set[Path] = set()
+        for raw_path in paths:
+            path = Path(raw_path).expanduser().resolve()
+            if path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            unique_paths.append(path)
+        if not unique_paths:
+            raise ValueError("Для диагностического ZIP не найдено ни одного файла")
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".zip",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        try:
+            with zipfile.ZipFile(
+                temporary,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                used_names: set[str] = set()
+                for index, path in enumerate(unique_paths, start=1):
+                    archive_name = path.name
+                    if archive_name in used_names:
+                        archive_name = f"{index}_{archive_name}"
+                    used_names.add(archive_name)
+                    archive.write(path, arcname=archive_name)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return destination
 
     def accept_parameters(
         self,
