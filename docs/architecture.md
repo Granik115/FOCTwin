@@ -22,7 +22,12 @@ checkpoint or accepted parameter set.
 
 ### Experiment orchestrator
 
-The first real state machine is the two-stage actuator/friction experiment. It has explicit
+The direct-tuning workspace now has a separate guarded current-trial state machine. It owns the
+transport, PWM-off reconfiguration, neutral baseline, current step, post-step zero, return,
+recovery, complete and aborted phases. Its checkpoint rule is intentionally simple: after any
+interruption, discard the partial in-memory measurement and repeat the whole physical trial.
+
+The identification state machine remains the two-stage actuator/friction experiment. It has explicit
 baseline, direct-Uq pulse, pulse pause, velocity reconfiguration, zero, settling, measuring,
 recovery, complete and aborted phases. A telemetry/Serial interruption commands a best-effort
 stop and repeats the interrupted pulse or point after the stream is fresh again. Durable resume
@@ -47,7 +52,7 @@ shares gains.
 - `telemetry/`: complete raw samples.
 - `profiles/`: versioned motor/setup profiles.
 - `checkpoints/`: atomically replaced orchestration state.
-- `exports/`: user-created JSON/Excel output.
+- `exports/`: user-created JSON/Excel output and self-contained experiment ZIP bundles.
 - `logs/`: verbose diagnostic logs.
 
 The user's chosen project folder is portable; the application installation contains no
