@@ -21,8 +21,25 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The home-test build 0.4.1b1 keeps the complete 0.4.0 current-trial implementation unchanged and
-adds:
+The home-test build 0.4.2b1 adds the first executable but hardware-free local instruction runner:
+
+- a separate **Инструкции** window that opens without a project, COM port or motor;
+- FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
+  user-selected exchange root;
+- strict schema-1 command envelopes, UUID/filename checks, expiry and size limits, target Instance
+  IDs, SHA-256 conflict detection and a durable SQLite journal outside the synchronized folders;
+- immutable `accepted → running → completed` event chains, explicit rejection events and recovery
+  of journaled diagnostic commands after application or power interruption;
+- five side-effect-free capabilities: `ping`, `get_status`, `list_capabilities`, `self_test` and
+  `dry_run`, plus buttons that generate local examples for testing the complete loop;
+- an enforced hardware boundary: motor, PWM, Serial, Commander, arbitrary code and process launch
+  have no handler and cannot be reached by this module.
+
+The FolderBridge setup, exact JSON schema and home-test procedure are documented in
+[`docs/instruction-runner.md`](docs/instruction-runner.md).
+
+The preserved 0.4.1b1 milestone keeps the complete 0.4.0 current-trial implementation unchanged
+and adds:
 
 - a separate **Связь с GPT** window that opens without a project, COM port or motor;
 - direct Google Drive API authorization for a Desktop OAuth client; Google Drive Desktop is not

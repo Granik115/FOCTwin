@@ -12,6 +12,9 @@ the first implementation; every safety value remains editable in a project profi
 - Full MATLAB is installed on the work computer.
 - Core motor, project and MATLAB workspaces remain offline-capable. The optional Drive Bridge
   requires Internet only while its separate chat window is connected.
+- The local instruction runner remains offline-capable. FolderBridge may independently transport
+  its files through Drive, but FOCTwin requires neither FolderBridge nor Google authorization for
+  local command tests.
 - Both source/development mode and an installed application are required.
 - Python 3.10 is selected because it is compatible with MATLAB Engine R2022b.
 

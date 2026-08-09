@@ -255,6 +255,7 @@ class MainWindow(QMainWindow):
         self._safety_latched = False
         self._configuration_apply_in_progress = False
         self._drive_bridge_dialog: QDialog | None = None
+        self._instruction_runner_dialog: QDialog | None = None
         self._device_limit_copy_pending: set[str] = set()
         self._command_queue: deque[str | Callable[[], None]] = deque()
         self._started_at = time.monotonic()
@@ -309,6 +310,9 @@ class MainWindow(QMainWindow):
         drive_bridge = QAction("Связь с GPT", self)
         drive_bridge.triggered.connect(self._open_drive_bridge)
         toolbar.addAction(drive_bridge)
+        instruction_runner = QAction("Инструкции", self)
+        instruction_runner.triggered.connect(self._open_instruction_runner)
+        toolbar.addAction(instruction_runner)
         toolbar.addSeparator()
         emergency = QAction("АВАРИЙНЫЙ СТОП", self)
         emergency.triggered.connect(self._emergency_stop)
@@ -3949,6 +3953,15 @@ class MainWindow(QMainWindow):
         self._drive_bridge_dialog.show()
         self._drive_bridge_dialog.raise_()
         self._drive_bridge_dialog.activateWindow()
+
+    def _open_instruction_runner(self) -> None:
+        if self._instruction_runner_dialog is None:
+            from foctwin.instruction_runner_ui import InstructionRunnerDialog
+
+            self._instruction_runner_dialog = InstructionRunnerDialog(self)
+        self._instruction_runner_dialog.show()
+        self._instruction_runner_dialog.raise_()
+        self._instruction_runner_dialog.activateWindow()
 
     def _connect_settings_persistence(self) -> None:
         spin_boxes = [

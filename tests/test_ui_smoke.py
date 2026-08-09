@@ -12,6 +12,7 @@ try:
 
     from foctwin.current_trial import CurrentTrialExperiment
     from foctwin.drive_bridge_ui import DriveBridgeDialog
+    from foctwin.instruction_runner_ui import InstructionRunnerDialog
     from foctwin.protocol import CommanderResponse
     from foctwin.ui import MainWindow
 except ImportError:
@@ -100,6 +101,28 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(snapshot.messages[-1].kind, "chat")
             self.assertEqual(snapshot.messages[-1].text, "Домашний тест без мотора")
             self.assertEqual(snapshot.credentials_path, "")
+            dialog.close()
+
+    def test_instruction_window_executes_ping_without_project_or_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dialog = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+            self.assertIn("модуль не подключён к com-порту", dialog.safety_label.text().lower())
+            self.assertFalse(dialog.auto_scan_checkbox.isChecked())
+            self.assertTrue(dialog.runner.status_path.is_file())
+
+            dialog.runner.create_sample_command("ping")
+            result = dialog.runner.scan_once()
+            dialog._render_snapshot(dialog.runner.snapshot())
+
+            self.assertEqual(result.completed, 1)
+            self.assertEqual(dialog.history_table.rowCount(), 1)
+            self.assertEqual(dialog.history_table.item(0, 1).text(), "ping")
+            self.assertEqual(dialog.history_table.item(0, 2).text(), "completed")
             dialog.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):

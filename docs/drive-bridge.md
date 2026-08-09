@@ -1,5 +1,10 @@
 # FOCTwin Drive Bridge 0.4.1b1
 
+FOCTwin 0.4.2b1 preserves this chat-only direct Drive bridge unchanged. Executable diagnostic
+instructions use the separate FolderBridge-backed local protocol documented in
+[`instruction-runner.md`](instruction-runner.md); command records placed in this legacy chat
+inbox continue to be ignored.
+
 This beta is a home-only communications test. It preserves the complete 0.4.0 guarded current
 trial but does not connect Google Drive to that trial. The bridge can be opened with no project,
 COM port or motor.

@@ -28,6 +28,25 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
+## Local instruction runner (0.4.2b1)
+
+This release cannot issue a hardware instruction. The runner lives in a separate module with no
+imports from Serial, Commander, friction or current-trial code and accepts only five diagnostic
+types from an in-code allowlist. Arbitrary Python, PowerShell, raw Commander text and executable
+launch are not protocol features. Hardware-like types are recorded as
+`hardware_commands_disabled` and never enter `running`.
+
+Incoming files are bounded to 256 KiB, must be UTF-8 JSON, have a filename matching their UUID,
+include timezone-aware creation/expiry values and remain valid for no more than seven days. A
+SQLite journal outside the synchronized tree binds each UUID to its first SHA-256. Replaying an
+unchanged file has no effect; replacing it with different content produces a conflict event rather
+than another execution.
+
+The `dry_run` capability reports whether a nested type is in the diagnostic allowlist but never
+dispatches it. In particular, a dry run of `run_current_trial` returns
+`hardware_commands_disabled` and `executed: false`. A later release must introduce a shared
+button/remote safety controller and a local arming policy before any motor capability is added.
+
 ## Guarded current trial (0.4.0)
 
 The first direct-tuning release captures the current coordinate only when it is inside `±3 rad`.

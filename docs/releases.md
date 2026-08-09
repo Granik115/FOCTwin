@@ -19,6 +19,28 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b1
+
+- Add a non-modal `Инструкции` window that can be tested without a project, COM port, motor,
+  FolderBridge or Internet.
+- Create FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json`
+  directories below a user-selected exchange root, while retaining the existing direct Drive chat
+  unchanged for comparison.
+- Accept one immutable schema-1 UTF-8 JSON file per command with strict UUID/filename, target,
+  timezone, expiry, lifetime, depth and 256 KiB size validation.
+- Persist command UUID/SHA-256, state and events in a power-safe local SQLite journal outside the
+  synchronized tree. Repeated copy-mode downloads are deduplicated and changed reuse of a UUID is
+  rejected as a conflict.
+- Publish immutable `accepted`, `running`, `completed`, `rejected`, `ignored` and `failed` event
+  files plus one atomically replaced status file. Resume journaled side-effect-free commands after
+  an interrupted application run.
+- Expose only `ping`, `get_status`, `list_capabilities`, `self_test` and `dry_run`; include UI
+  buttons that generate valid local examples for the home test.
+- Keep the backend free of Qt, Serial, Commander and experiment imports. Motor/PWM/raw command,
+  shell and arbitrary-code paths do not exist; known hardware-like types are explicitly rejected.
+- Document the two one-way FolderBridge jobs, exact envelope/event formats and interruption test
+  procedure in `docs/instruction-runner.md`.
+
 ## 0.4.1b1
 
 - Keep the guarded current experiment from 0.4.0 unchanged on a separate Drive Bridge test
