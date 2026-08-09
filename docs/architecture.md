@@ -8,6 +8,9 @@ flowchart TD
     UI["PySide6 control surface"] --> ORCH["Experiment orchestrator"]
     UI --> BRIDGE["Chat-only Drive Bridge"]
     UI --> RUNNER["Local instruction runner"]
+    UI --> ADMISSION["Current-trial admission"]
+    RUNNER --> ADMISSION
+    ADMISSION --> ORCH
     ORCH --> DEVICE["Serial device service"]
     ORCH --> MATLAB["MATLAB R2022b adapter"]
     ORCH --> STORE["Project store"]
@@ -57,22 +60,26 @@ The refresh token is stored through Windows Credential Manager. Local state cont
 ETags, cached chat and unsent messages but no OAuth refresh token. Google Drive Desktop is not a
 dependency.
 
-### Local instruction runner
+### Local instruction runner and shared admission controller
 
-The 0.4.2b1 instruction runner is a second parallel communication path. FolderBridge owns all
+The instruction runner is a second parallel communication path. FolderBridge owns all
 network delivery; FOCTwin sees ordinary files below a user-selected exchange root. The runner
 accepts one immutable JSON file per command and writes one immutable JSON file per event. Its
 SQLite journal is outside the synchronized tree and stores UUID/content-hash deduplication,
 command state and event payloads across process or power interruption.
 
-Schema 1 exposes only `ping`, `get_status`, `list_capabilities`, `self_test` and `dry_run`. The
-backend imports neither Qt nor Serial, Commander, friction or current-trial modules. It has no
-generic dispatch, interpreter, shell or executable-launch path. Unsupported hardware-like names
-are rejected before a running state is entered.
+In 0.4.2b2 schema 1 also exposes `run_current_trial` and `cancel_current_trial`. The instruction
+backend still imports neither Qt nor Serial, Commander, friction or current-trial modules. It has
+no generic dispatch, interpreter, shell or executable-launch path. A narrow callback reaches a
+new admission controller which owns only validated current-trial requests and its own SQLite
+journal; the controller itself has no Serial, Commander or Qt dependency.
 
-The future hardware runner will not call UI methods. First the button-driven guarded current trial
-must move behind one controller shared by local UI and remote instructions; arming, immutable
-limits and abort policy will be added around that controller in a later schema/capability version.
+The local button and file instruction now use the same configuration validation and admission
+states. A local button can become `ready` only after the visible confirmation and a second fresh
+environment check. A file instruction can simulate the plan, wait for a motor, wait for future
+permission or be cancelled, but the controller contains no remote transition to `ready`. Real
+arming, immutable permission envelopes and abort routing will be added around this boundary in a
+later beta.
 
 ### MATLAB adapter
 

@@ -1,8 +1,9 @@
-"""Non-modal local instruction window for the 0.4.2b1 home test."""
+"""Non-modal instruction window for the 0.4.2b2 shared-controller test."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -28,6 +30,11 @@ from PySide6.QtWidgets import (
 )
 
 from foctwin import __version__
+from foctwin.current_trial_controller import (
+    CurrentTrialController,
+    CurrentTrialControllerError,
+    CurrentTrialEnvironment,
+)
 from foctwin.instruction_runner import (
     InstructionRunner,
     InstructionRunnerError,
@@ -55,6 +62,9 @@ class InstructionRunnerDialog(QDialog):
         state_root: Path | None = None,
         exchange_root: Path | None = None,
         auto_scan: bool = True,
+        current_trial_controller: CurrentTrialController | None = None,
+        current_trial_environment_factory: Callable[[], CurrentTrialEnvironment]
+        | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"FOCTwin {__version__} — локальные инструкции")
@@ -66,6 +76,12 @@ class InstructionRunnerDialog(QDialog):
             QStandardPaths.StandardLocation.AppLocalDataLocation
         )
         data_root = state_root or Path(local_data or str(Path.home())) / "instruction_runner"
+        self.current_trial_controller = current_trial_controller or CurrentTrialController(
+            data_root / "current_trial_controller"
+        )
+        self.current_trial_environment_factory = (
+            current_trial_environment_factory or CurrentTrialEnvironment
+        )
         self.store = InstructionStore(data_root)
         saved_root = self.store.get_metadata("exchange_root")
         selected_root = exchange_root or (Path(saved_root) if saved_root else _default_exchange_root())
@@ -73,6 +89,8 @@ class InstructionRunnerDialog(QDialog):
             self.store,
             selected_root,
             app_version=__version__,
+            current_trial_gateway=self._current_trial_gateway,
+            context_factory=lambda: self.current_trial_environment_factory().to_dict(),
         )
         self._last_history_signature = ""
 
@@ -90,8 +108,9 @@ class InstructionRunnerDialog(QDialog):
         root = QVBoxLayout(self)
 
         self.safety_label = QLabel(
-            "БЕЗОПАСНАЯ БЕТА: доступны только PING, GET_STATUS, LIST_CAPABILITIES, "
-            "SELF_TEST и DRY_RUN. Модуль не подключён к COM-порту, PWM или опытам мотора."
+            "БЕЗОПАСНАЯ БЕТА: токовый опыт можно имитировать или поставить в очередь. "
+            "Удалённое включение PWM отключено: аппаратный запрос остановится на "
+            "waiting_for_motor / waiting_for_permission."
         )
         self.safety_label.setObjectName("danger")
         self.safety_label.setWordWrap(True)
@@ -160,22 +179,27 @@ class InstructionRunnerDialog(QDialog):
         root.addWidget(layout_group)
 
         samples_group = QGroupBox("Локальная проверка без Google Drive и мотора")
-        samples_layout = QHBoxLayout(samples_group)
+        samples_layout = QGridLayout(samples_group)
         sample_buttons = (
             ("Создать PING", "ping"),
             ("Запросить статус", "get_status"),
             ("Список возможностей", "list_capabilities"),
             ("Самопроверка", "self_test"),
             ("DRY_RUN мотора", "dry_run"),
+            ("Имитировать токовый опыт", "run_current_trial"),
+            ("Поставить опыт в очередь", "queue_current_trial"),
         )
         self.sample_buttons: list[QPushButton] = []
-        for title, command_type in sample_buttons:
+        for index, (title, command_type) in enumerate(sample_buttons):
             button = QPushButton(title)
             button.clicked.connect(
                 lambda checked=False, value=command_type: self._create_sample(value)
             )
-            samples_layout.addWidget(button)
+            samples_layout.addWidget(button, index // 4, index % 4)
             self.sample_buttons.append(button)
+        self.cancel_sample_button = QPushButton("Отменить выбранный ожидающий опыт")
+        self.cancel_sample_button.clicked.connect(self._cancel_selected_request)
+        samples_layout.addWidget(self.cancel_sample_button, 1, 3)
         root.addWidget(samples_group)
 
         history_group = QGroupBox("Последние инструкции")
@@ -250,8 +274,35 @@ class InstructionRunnerDialog(QDialog):
         return (
             f"проверка завершена: принято {result.accepted}, выполнено {result.completed}, "
             f"отклонено {result.rejected}, не этому экземпляру {result.ignored}, "
-            f"уже известно {result.duplicates}, отложено {result.deferred}"
+            f"уже известно {result.duplicates}, отложено {result.deferred}, "
+            f"ожидает {result.waiting}"
         )
+
+    def _current_trial_gateway(
+        self,
+        action: str,
+        command_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        environment = self.current_trial_environment_factory()
+        try:
+            if action == "submit":
+                decision = self.current_trial_controller.submit_instruction(
+                    command_id, arguments, environment
+                )
+            elif action == "refresh":
+                decision = self.current_trial_controller.refresh_instruction(
+                    command_id, environment
+                )
+            elif action == "cancel":
+                decision = self.current_trial_controller.cancel_instruction(command_id)
+            else:
+                raise CurrentTrialControllerError(
+                    "unsupported_action", f"Неизвестное действие контроллера: {action}"
+                )
+        except CurrentTrialControllerError as exc:
+            raise InstructionRunnerError(f"{exc.code}: {exc}") from exc
+        return decision.to_dict()
 
     def _create_sample(self, command_type: str) -> None:
         try:
@@ -261,6 +312,39 @@ class InstructionRunnerDialog(QDialog):
             self._append_log("ERROR", str(exc))
             return
         self._append_log("INFO", f"создан {path.name}")
+        self._scan_now()
+
+    def _cancel_selected_request(self, checked: bool = False) -> None:
+        del checked
+        row = self.history_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self,
+                "Отмена инструкции",
+                "Сначала выберите строку ожидающего run_current_trial",
+            )
+            return
+        command_type = self.history_table.item(row, 1).text()
+        state = self.history_table.item(row, 2).text()
+        command_id = self.history_table.item(row, 3).text()
+        if command_type != "run_current_trial" or state not in {
+            "waiting_for_motor",
+            "waiting_for_permission",
+        }:
+            QMessageBox.information(
+                self,
+                "Отмена инструкции",
+                "Выбранная строка не является ожидающим токовым опытом",
+            )
+            return
+        try:
+            path = self.runner.create_sample_command(
+                "cancel_current_trial", target_command_id=command_id
+            )
+        except InstructionRunnerError as exc:
+            QMessageBox.critical(self, "Отмена не создана", str(exc))
+            return
+        self._append_log("INFO", f"создан {path.name} для отмены {command_id}")
         self._scan_now()
 
     def _choose_root(self) -> None:

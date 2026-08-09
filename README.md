@@ -21,7 +21,8 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The home-test build 0.4.2b1 adds the first executable but hardware-free local instruction runner:
+The home-test build 0.4.2b2 adds the shared current-trial admission layer while keeping remote PWM
+execution disabled:
 
 - a separate **Инструкции** window that opens without a project, COM port or motor;
 - FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
@@ -30,10 +31,14 @@ The home-test build 0.4.2b1 adds the first executable but hardware-free local in
   IDs, SHA-256 conflict detection and a durable SQLite journal outside the synchronized folders;
 - immutable `accepted → running → completed` event chains, explicit rejection events and recovery
   of journaled diagnostic commands after application or power interruption;
-- five side-effect-free capabilities: `ping`, `get_status`, `list_capabilities`, `self_test` and
-  `dry_run`, plus buttons that generate local examples for testing the complete loop;
-- an enforced hardware boundary: motor, PWM, Serial, Commander, arbitrary code and process launch
-  have no handler and cannot be reached by this module.
+- the same durable controller validates requests from both the attended current-trial button and
+  FolderBridge instructions, with restart-safe request states in a separate SQLite journal;
+- `run_current_trial` can complete a hardware-free simulation and export its JSON plan, or retain
+  a hardware request as `waiting_for_motor` / `waiting_for_permission`;
+- `cancel_current_trial` safely terminates an awaiting request, while the window supplies local
+  buttons for simulation, queue and cancellation tests;
+- an enforced remote hardware boundary: an instruction has no transition to `ready`, even when a
+  motor appears; Serial, PWM and Commander remain unreachable from the runner and controller.
 
 The FolderBridge setup, exact JSON schema and home-test procedure are documented in
 [`docs/instruction-runner.md`](docs/instruction-runner.md).

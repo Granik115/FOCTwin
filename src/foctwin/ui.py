@@ -56,6 +56,12 @@ from foctwin.current_trial import (
     CurrentTrialExperiment,
     CurrentTrialPhase,
 )
+from foctwin.current_trial_controller import (
+    CurrentTrialController,
+    CurrentTrialControllerError,
+    CurrentTrialEnvironment,
+    CurrentTrialRequestState,
+)
 from foctwin.domain import (
     MotionMode,
     MotorProfile,
@@ -197,6 +203,10 @@ class MainWindow(QMainWindow):
             "FOCTwin",
             "FOCTwin",
         )
+        settings_path = Path(self.settings.fileName()).expanduser().resolve(strict=False)
+        self.current_trial_controller = CurrentTrialController(
+            settings_path.parent / "current_trial_controller"
+        )
         self._settings_loading = False
         self.project: ProjectStore | None = None
         self.matlab = MatlabBackend(Path(__file__).resolve().parents[3] / "matlab")
@@ -213,6 +223,7 @@ class MainWindow(QMainWindow):
         self.current_trial_recorder = TelemetryRecorder()
         self._current_trial_experiment: CurrentTrialExperiment | None = None
         self._current_trial_experiment_id: int | None = None
+        self._current_trial_request_id: str | None = None
         self._current_trial_telemetry_paths: list[str] = []
         self._current_trial_restore_commands: list[str] = []
         self._current_trial_restore_mask = self.monitor_mask
@@ -3031,6 +3042,47 @@ class MainWindow(QMainWindow):
             not in {CurrentTrialPhase.COMPLETE, CurrentTrialPhase.ABORTED}
         )
 
+    def _current_trial_environment(
+        self,
+        *,
+        local_permission: bool = False,
+    ) -> CurrentTrialEnvironment:
+        sample = self._last_sample
+        telemetry_fresh = bool(
+            sample is not None
+            and self._last_telemetry_received_at is not None
+            and time.monotonic() - self._last_telemetry_received_at
+            <= monitor_stale_timeout(self._active_monitor_downsample())
+        )
+        telemetry_complete = bool(
+            sample is not None
+            and all(
+                value is not None
+                for value in (
+                    sample.angle_rad,
+                    sample.current_q_a,
+                    sample.current_d_a,
+                    sample.voltage_q_v,
+                    sample.voltage_d_v,
+                )
+            )
+        )
+        return CurrentTrialEnvironment(
+            project_open=self.project is not None,
+            motor_connected=self.device.connected,
+            pwm_disabled=not self._pwm_requested,
+            telemetry_fresh=telemetry_fresh,
+            telemetry_complete=telemetry_complete,
+            friction_idle=not self._friction_running(),
+            command_channel_idle=not (
+                self._configuration_apply_in_progress
+                or self._command_queue
+                or self._command_timer.isActive()
+            ),
+            phase_resistance_valid=self.profile.phase_resistance_ohm > 0,
+            local_permission=local_permission,
+        )
+
     def _current_trial_config_from_widgets(self) -> CurrentTrialConfig:
         transport_pid = {
             loop: self._pid_values(loop) for loop in ("angle", "velocity")
@@ -3069,6 +3121,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("Checkpoint токового опыта создан несовместимой версией")
             experiment = CurrentTrialExperiment.from_checkpoint(payload)
             experiment_id = payload.get("experiment_id")
+            controller_request_id = payload.get("controller_request_id")
             telemetry_paths = [
                 str(path) for path in payload.get("telemetry_paths", [])
             ]
@@ -3083,6 +3136,9 @@ class MainWindow(QMainWindow):
             ),
             telemetry_paths=telemetry_paths,
             resumed=True,
+            controller_request_id=(
+                str(controller_request_id) if controller_request_id else None
+            ),
         )
 
     def _prepare_current_trial(
@@ -3092,71 +3148,10 @@ class MainWindow(QMainWindow):
         experiment_id: int | None = None,
         telemetry_paths: list[str] | None = None,
         resumed: bool = False,
+        controller_request_id: str | None = None,
     ) -> None:
         if self._current_trial_running():
             QMessageBox.information(self, "Токовый опыт", "Опыт уже выполняется")
-            return
-        if self._friction_running():
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                "Сначала завершите выполняющийся тест трения",
-            )
-            return
-        if self.project is None:
-            QMessageBox.warning(self, "Токовый опыт", "Сначала создайте или откройте проект")
-            return
-        if not self.device.connected:
-            QMessageBox.warning(self, "Токовый опыт", "Сначала подключите мотор")
-            return
-        if self._pwm_requested:
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                "Перед запуском вручную отключите PWM",
-            )
-            return
-        if (
-            self._configuration_apply_in_progress
-            or self._command_queue
-            or self._command_timer.isActive()
-        ):
-            QMessageBox.information(
-                self,
-                "Токовый опыт",
-                "Дождитесь завершения текущей отправки команд",
-            )
-            return
-        sample = self._last_sample
-        if sample is None or self._last_telemetry_received_at is None:
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                "Нет свежей распознанной телеметрии",
-            )
-            return
-        if time.monotonic() - self._last_telemetry_received_at > monitor_stale_timeout(
-            self._active_monitor_downsample()
-        ):
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                "Телеметрия устарела; дождитесь восстановления потока",
-            )
-            return
-        required_values = (
-            sample.angle_rad,
-            sample.current_q_a,
-            sample.current_d_a,
-            sample.voltage_q_v,
-            sample.voltage_d_v,
-        )
-        if any(value is None for value in required_values):
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                "Нужны угол, Iq, Id, Uq и Ud; включите все поля мониторинга",
-            )
             return
         try:
             config = (
@@ -3164,11 +3159,17 @@ class MainWindow(QMainWindow):
                 if restored_experiment is not None
                 else self._current_trial_config_from_widgets()
             )
-            config.validate()
-            if self.profile.phase_resistance_ohm <= 0:
-                raise ValueError(
-                    "Для безопасного транспортного режима нужно положительное "
-                    "сопротивление фазы"
+            preview = self.current_trial_controller.preview_local(
+                config,
+                self._current_trial_environment(),
+            )
+            if preview.state != CurrentTrialRequestState.WAITING_FOR_PERMISSION:
+                raise CurrentTrialControllerError(preview.reason_code, preview.message)
+            sample = self._last_sample
+            if sample is None or sample.angle_rad is None:
+                raise CurrentTrialControllerError(
+                    "telemetry_incomplete",
+                    "Контроллер не получил текущую координату",
                 )
             start_angle = (
                 restored_experiment.start_angle_rad
@@ -3182,7 +3183,7 @@ class MainWindow(QMainWindow):
             manual_pid_values = {
                 loop: self._pid_values(loop) for loop in self.pid_tables
             }
-        except ValueError as exc:
+        except (CurrentTrialControllerError, ValueError) as exc:
             QMessageBox.warning(self, "Токовый опыт", str(exc))
             return
 
@@ -3215,6 +3216,24 @@ class MainWindow(QMainWindow):
         dialog_layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+
+        try:
+            controller_decision = self.current_trial_controller.submit_local(
+                config,
+                self._current_trial_environment(local_permission=True),
+                request_id=controller_request_id,
+            )
+            controller_decision = self.current_trial_controller.mark_running(
+                controller_decision.request_id
+            )
+        except CurrentTrialControllerError as exc:
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                f"Условия изменились до запуска: {exc}",
+            )
+            return
+        self._current_trial_request_id = controller_decision.request_id
 
         self._current_trial_recovery_sound_enabled = (
             self.current_trial_recovery_sound.isChecked()
@@ -3626,6 +3645,7 @@ class MainWindow(QMainWindow):
         payload = experiment.checkpoint_payload(
             self._current_trial_experiment_id
         )
+        payload["controller_request_id"] = self._current_trial_request_id
         payload["telemetry_paths"] = list(self._current_trial_telemetry_paths)
         self.project.save_checkpoint("current_trial", payload)
 
@@ -3641,6 +3661,19 @@ class MainWindow(QMainWindow):
             self._current_trial_telemetry_paths.append(str(recorder_path))
         result = experiment.result(status, error=error)
         result["telemetry_paths"] = list(self._current_trial_telemetry_paths)
+        if self._current_trial_request_id is not None:
+            try:
+                self.current_trial_controller.finish_local(
+                    self._current_trial_request_id,
+                    status=status,
+                    result=result,
+                    error=error,
+                )
+            except CurrentTrialControllerError as exc:
+                self._log(
+                    "ERROR",
+                    f"Не удалось завершить запись общего контроллера: {exc}",
+                )
         export_path: Path | None = None
         bundle_path: Path | None = None
         if self.project is not None and self._current_trial_experiment_id is not None:
@@ -3695,6 +3728,7 @@ class MainWindow(QMainWindow):
             f"Опыт завершён со статусом {status}: {error or result['note']}",
         )
         self._current_trial_experiment = None
+        self._current_trial_request_id = None
         self._current_trial_resume_pending = False
         self.monitor_mask = restore_mask
         if self.device.connected and restore_commands:
@@ -3958,7 +3992,11 @@ class MainWindow(QMainWindow):
         if self._instruction_runner_dialog is None:
             from foctwin.instruction_runner_ui import InstructionRunnerDialog
 
-            self._instruction_runner_dialog = InstructionRunnerDialog(self)
+            self._instruction_runner_dialog = InstructionRunnerDialog(
+                self,
+                current_trial_controller=self.current_trial_controller,
+                current_trial_environment_factory=self._current_trial_environment,
+            )
         self._instruction_runner_dialog.show()
         self._instruction_runner_dialog.raise_()
         self._instruction_runner_dialog.activateWindow()

@@ -28,13 +28,14 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Local instruction runner (0.4.2b1)
+## Shared instruction admission (0.4.2b2)
 
-This release cannot issue a hardware instruction. The runner lives in a separate module with no
-imports from Serial, Commander, friction or current-trial code and accepts only five diagnostic
-types from an in-code allowlist. Arbitrary Python, PowerShell, raw Commander text and executable
-launch are not protocol features. Hardware-like types are recorded as
-`hardware_commands_disabled` and never enter `running`.
+This release still cannot issue a remote hardware instruction. The runner lives in a separate
+module with no imports from Serial, Commander, friction or current-trial code. A narrow callback
+can ask the shared admission controller to validate and simulate `run_current_trial`, or journal
+it as `waiting_for_motor` / `waiting_for_permission`. Neither module owns a Serial or Commander
+object. Arbitrary Python, PowerShell, raw Commander text and executable launch are not protocol
+features.
 
 Incoming files are bounded to 256 KiB, must be UTF-8 JSON, have a filename matching their UUID,
 include timezone-aware creation/expiry values and remain valid for no more than seven days. A
@@ -42,10 +43,15 @@ SQLite journal outside the synchronized tree binds each UUID to its first SHA-25
 unchanged file has no effect; replacing it with different content produces a conflict event rather
 than another execution.
 
-The `dry_run` capability reports whether a nested type is in the diagnostic allowlist but never
-dispatches it. In particular, a dry run of `run_current_trial` returns
-`hardware_commands_disabled` and `executed: false`. A later release must introduce a shared
-button/remote safety controller and a local arming policy before any motor capability is added.
+The controller validates the same `CurrentTrialConfig` used by the attended button and rejects
+unknown fields or invalid limit relationships. Simulation exports a plan with `executed: false`
+without opening Serial. A hardware instruction cannot transition to `ready`, even after a motor
+appears. Only the local button can become ready after its visible confirmation and a second live
+check; restarting FOCTwin demotes an unfinished local request back to permission waiting.
+
+The `dry_run` capability reports the fixed `simulate_or_wait_for_local_permission` policy but
+never dispatches the nested command. `cancel_current_trial` can terminate only a waiting request.
+Remote arming and actual PWM routing do not exist in this beta.
 
 ## Guarded current trial (0.4.0)
 

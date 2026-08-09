@@ -19,6 +19,27 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b2
+
+- Add one durable current-trial admission controller shared by the existing attended button and
+  FolderBridge instructions. It validates the same `CurrentTrialConfig` for both callers and owns
+  no Qt, Serial or Commander object.
+- Persist request source, immutable config, environment, state and result in a separate SQLite
+  journal. Demote a locally `ready` or `running` request to `waiting_for_permission` after process
+  restart instead of resuming hardware automatically.
+- Accept `run_current_trial` in `simulation` mode, complete a deterministic hardware-free plan and
+  export `outbox/artifacts/<command_id>/current_trial_simulation.json` with `executed: false`.
+- Accept hardware-mode requests only into `waiting_for_motor` or `waiting_for_permission`. Even
+  after a motor appears, a remote request has no transition to `ready` and cannot issue PWM,
+  Commander or Serial operations in this beta.
+- Add `cancel_current_trial` for waiting requests, immutable waiting/cancelled events, accurate
+  waiting counts in `status.json`, and UI buttons for simulation, queue and selected cancellation.
+- Route the real local current-trial button through the same controller before the existing
+  confirmation-driven executor, record the controller request ID in checkpoints and close the
+  request with the physical experiment result.
+- Extend tests for invalid configurations, queue transitions, restart recovery, cancellation,
+  simulation artifacts and the permanent remote-PWM lock.
+
 ## 0.4.2b1
 
 - Add a non-modal `Инструкции` window that can be tested without a project, COM port, motor,

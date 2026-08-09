@@ -111,7 +111,7 @@ class UiSmokeTests(unittest.TestCase):
                 exchange_root=root / "exchange",
                 auto_scan=False,
             )
-            self.assertIn("модуль не подключён к com-порту", dialog.safety_label.text().lower())
+            self.assertIn("удалённое включение pwm отключено", dialog.safety_label.text().lower())
             self.assertFalse(dialog.auto_scan_checkbox.isChecked())
             self.assertTrue(dialog.runner.status_path.is_file())
 
@@ -124,6 +124,49 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(dialog.history_table.item(0, 1).text(), "ping")
             self.assertEqual(dialog.history_table.item(0, 2).text(), "completed")
             dialog.close()
+
+    def test_instruction_window_simulates_and_queues_current_trial_without_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dialog = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+
+            dialog.runner.create_sample_command("run_current_trial")
+            simulated = dialog.runner.scan_once()
+            dialog.runner.create_sample_command("queue_current_trial")
+            queued = dialog.runner.scan_once()
+            snapshot = dialog.runner.snapshot()
+
+            self.assertEqual(simulated.completed, 1)
+            self.assertEqual(queued.waiting, 1)
+            states = {record.state for record in snapshot.recent_commands}
+            self.assertIn("completed", states)
+            self.assertIn("waiting_for_motor", states)
+            self.assertFalse(
+                dialog.runner._status_payload()["remote_hardware_execution_enabled"]
+            )
+            dialog.close()
+
+    def test_main_window_and_instruction_window_share_current_trial_controller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+
+            window._open_instruction_runner()
+            dialog = window._instruction_runner_dialog
+
+            self.assertIsNotNone(dialog)
+            self.assertIs(
+                dialog.current_trial_controller,
+                window.current_trial_controller,
+            )
+            environment = dialog.current_trial_environment_factory()
+            self.assertFalse(environment.motor_connected)
+            self.assertFalse(environment.local_permission)
+            window.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:

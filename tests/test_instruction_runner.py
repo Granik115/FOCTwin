@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from foctwin.current_trial_controller import (
+    CurrentTrialController,
+    CurrentTrialEnvironment,
+)
 from foctwin.instruction_runner import (
     INSTRUCTION_PROTOCOL,
     InstructionRunner,
@@ -31,13 +35,51 @@ class InstructionRunnerTests(unittest.TestCase):
         self.state_root = root / "state"
         self.exchange_root = root / "exchange"
         self.clock = Clock()
+        self.motor_connected = False
+        self.controller = CurrentTrialController(
+            root / "controller", now_factory=self.clock
+        )
         self.store = InstructionStore(self.state_root)
         self.runner = InstructionRunner(
             self.store,
             self.exchange_root,
             app_version="test-version",
             now_factory=self.clock,
+            current_trial_gateway=self._gateway,
+            context_factory=lambda: self._environment().to_dict(),
         )
+
+    def _environment(self) -> CurrentTrialEnvironment:
+        return CurrentTrialEnvironment(
+            project_open=self.motor_connected,
+            motor_connected=self.motor_connected,
+            pwm_disabled=True,
+            telemetry_fresh=self.motor_connected,
+            telemetry_complete=self.motor_connected,
+            friction_idle=True,
+            command_channel_idle=True,
+            phase_resistance_valid=self.motor_connected,
+        )
+
+    def _gateway(
+        self,
+        action: str,
+        command_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        if action == "submit":
+            decision = self.controller.submit_instruction(
+                command_id, arguments, self._environment()
+            )
+        elif action == "refresh":
+            decision = self.controller.refresh_instruction(
+                command_id, self._environment()
+            )
+        elif action == "cancel":
+            decision = self.controller.cancel_instruction(command_id)
+        else:  # pragma: no cover - test gateway contract
+            raise AssertionError(action)
+        return decision.to_dict()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -89,9 +131,18 @@ class InstructionRunnerTests(unittest.TestCase):
         self.assertEqual(status["instance_id"], self.runner.instance_id)
         self.assertFalse(status["motor_connected"])
         self.assertFalse(status["hardware_commands_enabled"])
+        self.assertFalse(status["remote_hardware_execution_enabled"])
         self.assertEqual(
             status["accepted_command_types"],
-            ["ping", "get_status", "list_capabilities", "self_test", "dry_run"],
+            [
+                "ping",
+                "get_status",
+                "list_capabilities",
+                "self_test",
+                "dry_run",
+                "run_current_trial",
+                "cancel_current_trial",
+            ],
         )
         self.assertNotIn(str(self.exchange_root), json.dumps(status))
 
@@ -158,7 +209,7 @@ class InstructionRunnerTests(unittest.TestCase):
         self.assertEqual(repeated.rejected, 0)
         self.assertEqual(len(self._events(command_id)), len(events))
 
-    def test_expired_and_hardware_commands_are_rejected_without_running(self):
+    def test_expired_command_is_rejected_and_hardware_request_waits_without_execution(self):
         expired_id = str(uuid.uuid4())
         expired = self._payload(
             "ping",
@@ -172,13 +223,19 @@ class InstructionRunnerTests(unittest.TestCase):
         self._write(hardware)
 
         result = self.runner.scan_once()
-        self.assertEqual(result.rejected, 2)
+        self.assertEqual(result.rejected, 1)
+        self.assertEqual(result.waiting, 1)
         expired_event = self._events(expired_id)[-1]
         hardware_event = self._events(hardware_id)[-1]
         self.assertEqual(expired_event["details"]["code"], "expired")
-        self.assertEqual(hardware_event["details"]["code"], "hardware_commands_disabled")
+        self.assertEqual(hardware_event["type"], "waiting_for_motor")
+        self.assertEqual(
+            hardware_event["details"]["result"]["reason"],
+            "motor_not_connected",
+        )
         self.assertNotIn("running", [event["type"] for event in self._events(expired_id)])
         self.assertNotIn("running", [event["type"] for event in self._events(hardware_id)])
+        self.assertNotIn("completed", [event["type"] for event in self._events(hardware_id)])
 
     def test_dry_run_reports_hardware_command_but_does_not_execute_it(self):
         payload = self._payload(
@@ -191,10 +248,94 @@ class InstructionRunnerTests(unittest.TestCase):
         result = self.runner.scan_once()
         self.assertEqual(result.completed, 1)
         dry_result = self._events(command_id)[-1]["details"]["result"]
-        self.assertFalse(dry_result["allowed"])
+        self.assertTrue(dry_result["allowed"])
         self.assertFalse(dry_result["executed"])
         self.assertTrue(dry_result["would_access_hardware"])
-        self.assertEqual(dry_result["reason"], "hardware_commands_disabled")
+        self.assertEqual(
+            dry_result["execution_policy"],
+            "simulate_or_wait_for_local_permission",
+        )
+        self.assertFalse(dry_result["remote_hardware_execution_enabled"])
+
+    def test_current_trial_simulation_completes_and_exports_artifact(self):
+        payload = self._payload(
+            "run_current_trial",
+            arguments={
+                "mode": "simulation",
+                "config": {"step_current_a": 0.12, "step_s": 2.5},
+            },
+        )
+        command_id = str(payload["command_id"])
+        self._write(payload)
+
+        result = self.runner.scan_once()
+        record = self.store.get_command(command_id)
+        events = self._events(command_id)
+
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(record.state, "completed")
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["accepted", "evaluating", "completed"],
+        )
+        self.assertTrue(record.result["result"]["simulated"])
+        self.assertFalse(record.result["result"]["executed"])
+        artifact = self.exchange_root / "outbox" / record.result["artifact"]
+        self.assertTrue(artifact.is_file())
+        artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(artifact_payload["config"]["step_current_a"], 0.12)
+
+    def test_waiting_request_moves_to_permission_but_never_runs_when_motor_appears(self):
+        payload = self._payload(
+            "run_current_trial",
+            arguments={"mode": "hardware", "config": {}},
+        )
+        command_id = str(payload["command_id"])
+        self._write(payload)
+        first = self.runner.scan_once()
+        self.assertEqual(first.waiting, 1)
+
+        self.motor_connected = True
+        second = self.runner.scan_once()
+        record = self.store.get_command(command_id)
+        event_types = [event["type"] for event in self._events(command_id)]
+
+        self.assertEqual(second.waiting, 1)
+        self.assertEqual(record.state, "waiting_for_permission")
+        self.assertEqual(
+            event_types,
+            ["accepted", "evaluating", "waiting_for_motor", "waiting_for_permission"],
+        )
+        self.assertNotIn("completed", event_types)
+
+    def test_cancel_instruction_terminates_waiting_request_once(self):
+        target = self._payload(
+            "run_current_trial",
+            command_id="00000000-0000-4000-8000-000000000010",
+            arguments={"mode": "hardware", "config": {}},
+        )
+        target_id = str(target["command_id"])
+        self._write(target)
+        self.runner.scan_once()
+
+        cancel = self._payload(
+            "cancel_current_trial",
+            arguments={"command_id": target_id},
+        )
+        cancel_id = str(cancel["command_id"])
+        self._write(cancel)
+        result = self.runner.scan_once()
+
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(result.waiting, 0)
+        self.assertEqual(self.store.get_command(target_id).state, "cancelled")
+        self.assertEqual(self.store.get_command(cancel_id).state, "completed")
+        self.assertEqual(self._events(target_id)[-1]["type"], "cancelled")
+
+        event_count = len(self._events(target_id))
+        repeated = self.runner.scan_once()
+        self.assertEqual(repeated.completed, 0)
+        self.assertEqual(len(self._events(target_id)), event_count)
 
     def test_command_for_another_instance_is_ignored(self):
         payload = self._payload("ping", target=str(uuid.uuid4()))
