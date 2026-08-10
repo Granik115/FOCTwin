@@ -19,6 +19,100 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b6
+
+- Add a `0.3 s` passive current-sense baseline before the first motor configuration command.
+- Record Iq/Id during PWM OFF as diagnostic sensor data without mistaking it for proven physical
+  current. A peak full-current signal above `0.05 A` or non-zero Uq/Ud fails before PWM enable.
+- Export passive axis statistics, full-current RMS/peak, full-voltage peak and explicit problems in
+  the result JSON and UI report.
+- Add a regression using all ten raw trial-63 samples and verify the `1.01052 A` signal stops the
+  new state machine without ever requesting transport or PWM.
+
+## 0.4.2b5
+
+- Preserve SimpleFOC monitor Q/D currents in their native ampere units instead of dividing them by
+  1000. The old conversion weakened all host-side measured-current protection by three orders of
+  magnitude.
+- Add a regression test for the exact trial-61 packet (`Iq=-5.8088 A`, `Id=-29.9526 A`) and prove
+  that both values reach the immediate emergency guard.
+- Keep remote hardware execution disabled until the corrected build is installed and a fresh
+  PWM-off baseline establishes whether the board current-sense itself is usable.
+
+## 0.4.2b4
+
+- Keep an exact locally approved remote plan armed without a timer. The permission remains
+  one-shot, is consumed only by a separate `start_current_trial`, and is still revoked by process
+  restart, cancellation or any changed motor/telemetry/PWM prerequisite.
+- Replace the oversized message box with a bounded confirmation dialog: the immutable JSON plan
+  is scrollable, the action buttons always remain visible, and Enter activates the explicit
+  `Разрешить план` button instead of cancelling.
+- Treat a physically impossible single coordinate jump as a candidate damaged packet. Its angle
+  and firmware-derived velocity are ignored for that packet only; a repeated coordinate on the
+  next packet is accepted as real and immediately reaches the existing emergency checks.
+- Add regression coverage for the exact `0.0588 → 0.0000 rad`, `-5.6167 rad/s` packet observed in
+  remote trial 59, for persistent jumps, no-timeout arms and restart revocation.
+
+## 0.4.2b3
+
+- Reduce the guarded current step from `0.1 A` to `0.01 A`; start current Q/D at `P=0.4`, `I=40`,
+  ramp `50 V/s`, target ceiling `0.1 A` and working voltage `2 V`.
+- Add a `0, +0.01, 0, -0.01 V` direct-voltage current-sense preflight. FOC Current is never enabled
+  unless Iq follows both voltage signs and the Q response dominates Id.
+- Stop the trial immediately on a first telemetry-speed sample above twice the `0.5 rad/s` working
+  limit, while retaining confirmed working-limit and independent angle-slope checks.
+- Replace front-deleted 60,000-element plot lists with bounded deques, cap each rendered window at
+  4,000 points and expose current/maximum Qt processing backlog in the UI and `status.json`.
+- Stage status, event and artifact files outside the synchronized `outbox`, then atomically rename
+  them into place. Automatically publish every `_SEND_ME.zip` under `outbox/artifacts`.
+- Add a two-minute, exact-command local arm for hardware instructions. A separate
+  `start_current_trial` consumes it once; restart, expiry and changed prerequisites revoke it.
+- Route cancellation of a running instruction through the attended executor's emergency stop,
+  preserve full-trial retry after genuine power/telemetry loss, and cover the new states with tests.
+
+## 0.4.2b2
+
+- Add one durable current-trial admission controller shared by the existing attended button and
+  FolderBridge instructions. It validates the same `CurrentTrialConfig` for both callers and owns
+  no Qt, Serial or Commander object.
+- Persist request source, immutable config, environment, state and result in a separate SQLite
+  journal. Demote a locally `ready` or `running` request to `waiting_for_permission` after process
+  restart instead of resuming hardware automatically.
+- Accept `run_current_trial` in `simulation` mode, complete a deterministic hardware-free plan and
+  export `outbox/artifacts/<command_id>/current_trial_simulation.json` with `executed: false`.
+- Accept hardware-mode requests only into `waiting_for_motor` or `waiting_for_permission`. Even
+  after a motor appears, a remote request has no transition to `ready` and cannot issue PWM,
+  Commander or Serial operations in this beta.
+- Add `cancel_current_trial` for waiting requests, immutable waiting/cancelled events, accurate
+  waiting counts in `status.json`, and UI buttons for simulation, queue and selected cancellation.
+- Route the real local current-trial button through the same controller before the existing
+  confirmation-driven executor, record the controller request ID in checkpoints and close the
+  request with the physical experiment result.
+- Extend tests for invalid configurations, queue transitions, restart recovery, cancellation,
+  simulation artifacts and the permanent remote-PWM lock.
+
+## 0.4.2b1
+
+- Add a non-modal `Инструкции` window that can be tested without a project, COM port, motor,
+  FolderBridge or Internet.
+- Create FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json`
+  directories below a user-selected exchange root, while retaining the existing direct Drive chat
+  unchanged for comparison.
+- Accept one immutable schema-1 UTF-8 JSON file per command with strict UUID/filename, target,
+  timezone, expiry, lifetime, depth and 256 KiB size validation.
+- Persist command UUID/SHA-256, state and events in a power-safe local SQLite journal outside the
+  synchronized tree. Repeated copy-mode downloads are deduplicated and changed reuse of a UUID is
+  rejected as a conflict.
+- Publish immutable `accepted`, `running`, `completed`, `rejected`, `ignored` and `failed` event
+  files plus one atomically replaced status file. Resume journaled side-effect-free commands after
+  an interrupted application run.
+- Expose only `ping`, `get_status`, `list_capabilities`, `self_test` and `dry_run`; include UI
+  buttons that generate valid local examples for the home test.
+- Keep the backend free of Qt, Serial, Commander and experiment imports. Motor/PWM/raw command,
+  shell and arbitrary-code paths do not exist; known hardware-like types are explicitly rejected.
+- Document the two one-way FolderBridge jobs, exact envelope/event formats and interruption test
+  procedure in `docs/instruction-runner.md`.
+
 ## 0.4.1b1
 
 - Keep the guarded current experiment from 0.4.0 unchanged on a separate Drive Bridge test

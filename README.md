@@ -21,8 +21,45 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The home-test build 0.4.1b1 keeps the complete 0.4.0 current-trial implementation unchanged and
-adds:
+The attended hardware build 0.4.2b6 keeps the small diagnostic current trial, corrects the
+current-unit contract exposed by remote trial 61 and classifies the trial-63 PWM-off noise before
+any power-stage command:
+
+- a separate **Инструкции** window that opens without a project, COM port or motor;
+- FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
+  user-selected exchange root;
+- strict schema-1 command envelopes, UUID/filename checks, expiry and size limits, target Instance
+  IDs, SHA-256 conflict detection and a durable SQLite journal outside the synchronized folders;
+- immutable `accepted → running → completed` event chains, explicit rejection events and recovery
+  of journaled diagnostic commands after application or power interruption;
+- the same durable controller validates requests from both the attended current-trial button and
+  FolderBridge instructions, with restart-safe request states in a separate SQLite journal;
+- the experimental step is `0.01 A`; current Q/D starts at `P=0.4`, `I=40`, ramp `50 V/s`, with a
+  `0.1 A` command ceiling and `2 V` working voltage;
+- before FOC Current is enabled, a direct-voltage `±0.01 V` preflight checks that Iq follows the
+  commanded sign and that Id does not dominate; failure stops without entering the current PI;
+- every attempt begins with a `0.3 s` passive PWM-off baseline. Iq/Id are recorded as a sensor
+  signal, not mistaken for physical current; a peak above `0.05 A` or non-zero Uq/Ud stops the
+  attempt before transport configuration or PWM enable;
+- SimpleFOC monitor currents are handled in their native ampere units; the real trial-61 packet
+  `Iq=-5.8088`, `Id=-29.9526` now reaches the emergency guard without a `/1000` rescale;
+- firmware speed participates in the current-trial stop path, while a single coordinate packet
+  that resets to zero is held for one sample and must persist before its derived velocity can stop
+  the trial; real or persistent twofold excursions still stop immediately;
+- live plot history uses bounded constant-time buffers and renders a decimated window; the status
+  reports UI processing lag so long telemetry sessions no longer degrade after 60,000 points;
+- each completed or failed current-trial ZIP is copied atomically into
+  `outbox/artifacts/<command-id-or-local-trial>/`, ready for FolderBridge without a manual copy;
+- `run_current_trial` still only queues an immutable plan. A person must select that exact plan in
+  FOCTwin and arm it without a timer; a separate `start_current_trial` consumes the permission once;
+- restart or changed hardware conditions revoke the arm, and
+  `cancel_current_trial` can also route an attended emergency stop for a running trial.
+
+The FolderBridge setup, exact JSON schema and home-test procedure are documented in
+[`docs/instruction-runner.md`](docs/instruction-runner.md).
+
+The preserved 0.4.1b1 milestone keeps the complete 0.4.0 current-trial implementation unchanged
+and adds:
 
 - a separate **Связь с GPT** window that opens without a project, COM port or motor;
 - direct Google Drive API authorization for a Desktop OAuth client; Google Drive Desktop is not
@@ -60,7 +97,7 @@ The preserved 0.4.0 milestone contains:
   emergency stop;
 - verified read/apply controls for the linked device limits and every firmware PID/LPF loop;
 - fragmentation-safe monitoring with staged stream recovery, rejection/counters for damaged USB
-  rows, stable live plots, correct mA-to-A conversion, live rate/jitter and non-blocking durable
+  rows, stable live plots, native ampere current values, live rate/jitter and non-blocking durable
   CSV recording;
 - safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - persistent manual-control values and one paced action for limits, PID/LPF, modes, target and

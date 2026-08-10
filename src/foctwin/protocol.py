@@ -136,11 +136,14 @@ class CommanderProtocol:
 
 
 def parse_monitor_line(line: str, mask: str = "1111111") -> dict[str, float] | None:
-    """Parse an intact SimpleFOC monitor row and normalize streamed currents from mA to A.
+    """Parse an intact SimpleFOC monitor row using SimpleFOC's native SI units.
 
     The bundled firmware prints every monitor value with four decimal places. Requiring that
     exact shape is intentional: USB CDC corruption observed on hardware can remove one symbol
     while leaving a syntactically valid but dangerously wrong number (``1.0000`` -> ``10000``).
+
+    SimpleFOC stores and streams ``current.q`` and ``current.d`` in amperes.  Do not rescale those
+    fields: doing so would weaken every host-side current limit by a factor of one thousand.
     """
 
     if len(mask) != 7 or any(bit not in "01" for bit in mask):
@@ -157,11 +160,7 @@ def parse_monitor_line(line: str, mask: str = "1111111") -> dict[str, float] | N
         return None
     if any(not math.isfinite(value) for value in values):
         return None
-    parsed = dict(zip(names, values, strict=True))
-    for current_name in ("current_q_a", "current_d_a"):
-        if current_name in parsed:
-            parsed[current_name] /= 1000.0
-    return parsed
+    return dict(zip(names, values, strict=True))
 
 
 def is_monitor_candidate(line: str, mask: str = "1111111") -> bool:

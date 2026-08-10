@@ -11,15 +11,21 @@ from typing import Any
 from foctwin.domain import TelemetrySample
 
 CURRENT_TRIAL_MONITOR_MASK = "1111111"
-CURRENT_TRIAL_CHECKPOINT_SCHEMA = 1
-CURRENT_TRIAL_RESULT_SCHEMA = 1
+CURRENT_TRIAL_CHECKPOINT_SCHEMA = 3
+CURRENT_TRIAL_RESULT_SCHEMA = 3
 
 
 class CurrentTrialPhase(str, Enum):
     IDLE = "idle"
+    PWM_OFF_BASELINE = "pwm_off_baseline"
     CONFIGURING_POSITION = "configuring_position"
     POSITIONING = "positioning"
     POSITION_SETTLING = "position_settling"
+    CONFIGURING_CURRENT_SENSE = "configuring_current_sense"
+    CURRENT_SENSE_BASELINE = "current_sense_baseline"
+    CURRENT_SENSE_POSITIVE = "current_sense_positive"
+    CURRENT_SENSE_ZERO = "current_sense_zero"
+    CURRENT_SENSE_NEGATIVE = "current_sense_negative"
     CONFIGURING_CURRENT = "configuring_current"
     CURRENT_BASELINE = "current_baseline"
     CURRENT_STEP = "current_step"
@@ -50,15 +56,23 @@ def _default_velocity_pid() -> dict[str, float]:
 class CurrentTrialConfig:
     """Conservative defaults for the first guarded real-motor current trial."""
 
-    step_current_a: float = 0.1
-    current_kp: float = 8.4222
-    current_ki: float = 814.0
+    step_current_a: float = 0.01
+    current_kp: float = 0.4
+    current_ki: float = 40.0
     current_kd: float = 0.0
     current_lpf_tf_s: float = 0.005
-    current_output_ramp_v_s: float = 3000.0
-    current_target_limit_a: float = 0.5
-    current_trip_limit_a: float = 1.0
-    current_voltage_limit_v: float = 12.0
+    current_output_ramp_v_s: float = 50.0
+    current_target_limit_a: float = 0.1
+    current_trip_limit_a: float = 0.5
+    current_voltage_limit_v: float = 2.0
+    current_sense_voltage_v: float = 0.01
+    current_sense_voltage_limit_v: float = 0.05
+    current_sense_current_trip_a: float = 0.1
+    current_sense_phase_s: float = 0.3
+    current_sense_min_response_a: float = 0.002
+    pwm_off_baseline_s: float = 0.3
+    pwm_off_current_noise_limit_a: float = 0.05
+    pwm_off_voltage_noise_limit_v: float = 0.01
     baseline_s: float = 1.0
     step_s: float = 2.0
     post_s: float = 1.0
@@ -99,11 +113,48 @@ class CurrentTrialConfig:
             raise ValueError(
                 "Нужен порядок: лимит цели ≤ аварийный ток опыта ≤ абсолютный ток ≤ 5 А"
             )
+        if not 0 < self.current_sense_current_trip_a <= self.current_trip_limit_a:
+            raise ValueError(
+                "Предел тока диагностики должен быть положительным и не выше предела опыта"
+            )
         if not (
             0 < self.current_voltage_limit_v <= self.absolute_voltage_limit_v <= 24.0
         ):
             raise ValueError(
                 "Рабочее напряжение должно быть не выше абсолютного предела 24 В"
+            )
+        if not (
+            0
+            < abs(self.current_sense_voltage_v)
+            <= self.current_sense_voltage_limit_v
+            <= self.current_voltage_limit_v
+        ):
+            raise ValueError(
+                "Диагностическое Uq должно быть не выше своего и рабочего пределов напряжения"
+            )
+        if not 0.2 <= self.current_sense_phase_s <= 2.0:
+            raise ValueError("Фаза диагностики датчика тока должна длиться от 0,2 до 2 с")
+        if not 0 < self.current_sense_min_response_a <= self.current_sense_current_trip_a:
+            raise ValueError("Порог отклика диагностики датчика тока некорректен")
+        if not 0.2 <= self.pwm_off_baseline_s <= 2.0:
+            raise ValueError("Пассивная фаза PWM OFF должна длиться от 0,2 до 2 с")
+        if not (
+            0
+            < self.pwm_off_current_noise_limit_a
+            <= self.absolute_current_limit_a
+        ):
+            raise ValueError(
+                "Предел шума тока при PWM OFF должен быть положительным и не выше "
+                "абсолютного предела"
+            )
+        if not (
+            0
+            < self.pwm_off_voltage_noise_limit_v
+            <= self.absolute_voltage_limit_v
+        ):
+            raise ValueError(
+                "Предел напряжения при PWM OFF должен быть положительным и не выше "
+                "абсолютного предела"
             )
         if not (
             0
@@ -155,6 +206,10 @@ class CurrentTrialConfig:
         ):
             if value < 0 or not math.isfinite(value):
                 raise ValueError(f"Токовый {name} должен быть конечным неотрицательным числом")
+        if self.current_kp > 2.0 or self.current_ki > 200.0:
+            raise ValueError("В диагностической бете нужны Current P ≤ 2 и I ≤ 200")
+        if self.current_output_ramp_v_s > 500.0:
+            raise ValueError("В диагностической бете output ramp должен быть не выше 500 В/с")
         for loop_name, values in (
             ("позиционный", self.transport_angle_pid),
             ("скоростной", self.transport_velocity_pid),
@@ -170,6 +225,8 @@ class CurrentTrialConfig:
         return (
             command_overhead_s
             + 2.0 * (self.position_settle_s + min(2.0, self.position_timeout_s))
+            + self.pwm_off_baseline_s
+            + 4.0 * self.current_sense_phase_s
             + self.baseline_s
             + self.step_s
             + self.post_s
@@ -215,6 +272,25 @@ def _rms(values: list[float]) -> float | None:
 
 def _peak_abs(values: list[float]) -> float | None:
     return max((abs(value) for value in values), default=None)
+
+
+def _vector_magnitudes(
+    samples: list[TelemetrySample],
+    first_name: str,
+    second_name: str,
+) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        first = getattr(sample, first_name)
+        second = getattr(sample, second_name)
+        if (
+            first is not None
+            and second is not None
+            and math.isfinite(first)
+            and math.isfinite(second)
+        ):
+            values.append(math.hypot(float(first), float(second)))
+    return values
 
 
 def _sample_rate_hz(samples: list[TelemetrySample]) -> float | None:
@@ -285,6 +361,14 @@ class CurrentTrialExperiment:
             CurrentTrialPhase.CURRENT_POST,
         }
     )
+    CURRENT_SENSE_PHASES = frozenset(
+        {
+            CurrentTrialPhase.CURRENT_SENSE_BASELINE,
+            CurrentTrialPhase.CURRENT_SENSE_POSITIVE,
+            CurrentTrialPhase.CURRENT_SENSE_ZERO,
+            CurrentTrialPhase.CURRENT_SENSE_NEGATIVE,
+        }
+    )
     POSITION_PHASES = frozenset(
         {
             CurrentTrialPhase.POSITIONING,
@@ -323,11 +407,17 @@ class CurrentTrialExperiment:
         self.baseline_samples: list[TelemetrySample] = []
         self.step_samples: list[TelemetrySample] = []
         self.post_samples: list[TelemetrySample] = []
+        self.pwm_off_baseline_samples: list[TelemetrySample] = []
+        self.current_sense_baseline_samples: list[TelemetrySample] = []
+        self.current_sense_positive_samples: list[TelemetrySample] = []
+        self.current_sense_zero_samples: list[TelemetrySample] = []
+        self.current_sense_negative_samples: list[TelemetrySample] = []
         self.total_sample_count = int(total_sample_count)
         self.rejected_angle_samples = int(rejected_angle_samples)
         self._position_window: deque[tuple[float, float]] = deque()
         self._limit_counts: dict[str, int] = {}
         self._last_accepted_angle_rad: float | None = None
+        self._last_accepted_angle_timestamp_s: float | None = None
         self._pending_angle_rad: float | None = None
         self._board_angle_offset_rad = 0.0
         self._continuous_reference_rad = self.start_angle_rad
@@ -342,6 +432,11 @@ class CurrentTrialExperiment:
 
     @property
     def configuration_mode(self) -> str:
+        if (
+            self.phase in self.CURRENT_SENSE_PHASES
+            or self.phase == CurrentTrialPhase.CONFIGURING_CURRENT_SENSE
+        ):
+            return "current_sense"
         if self.phase in self.CURRENT_PHASES or self.phase == CurrentTrialPhase.CONFIGURING_CURRENT:
             return "current"
         return "position"
@@ -349,6 +444,14 @@ class CurrentTrialExperiment:
     @property
     def current_target(self) -> float:
         return self.config.step_current_a if self.phase == CurrentTrialPhase.CURRENT_STEP else 0.0
+
+    @property
+    def current_sense_voltage_target(self) -> float:
+        if self.phase == CurrentTrialPhase.CURRENT_SENSE_POSITIVE:
+            return abs(self.config.current_sense_voltage_v)
+        if self.phase == CurrentTrialPhase.CURRENT_SENSE_NEGATIVE:
+            return -abs(self.config.current_sense_voltage_v)
+        return 0.0
 
     def _event(self, kind: str, message: str) -> None:
         self.events.append(
@@ -373,6 +476,7 @@ class CurrentTrialExperiment:
         )
         self._board_angle_offset_rad = reference - float(raw_angle_rad)
         self._last_accepted_angle_rad = reference
+        self._last_accepted_angle_timestamp_s = None
         self._continuous_reference_rad = reference
         self._pending_angle_rad = None
         self._position_window.clear()
@@ -405,7 +509,23 @@ class CurrentTrialExperiment:
             return sample
         continuous_angle = float(raw_angle) + self._board_angle_offset_rad
         previous = self._last_accepted_angle_rad
-        if previous is not None and abs(continuous_angle - previous) > 0.5:
+        previous_timestamp = self._last_accepted_angle_timestamp_s
+        discontinuity_limit = 0.5
+        if previous_timestamp is not None:
+            interval_s = float(sample.timestamp_s) - previous_timestamp
+            if not math.isfinite(interval_s) or interval_s < 0.0:
+                interval_s = 0.0
+            # A single board packet may transiently report angle 0 while changing
+            # control modes.  Anything implying more than twice the configured
+            # trip speed is held for one packet and must persist before it can be
+            # accepted as real motion.  The 0.02 rad floor tolerates encoder
+            # quantisation and duplicate timestamps at the ~64 Hz monitor rate;
+            # longer stream gaps are capped because recovery owns stale telemetry.
+            discontinuity_limit = max(
+                0.02,
+                self.config.velocity_trip_limit_rad_s * min(interval_s, 0.1) * 2.0,
+            )
+        if previous is not None and abs(continuous_angle - previous) > discontinuity_limit:
             pending = self._pending_angle_rad
             if pending is None or abs(continuous_angle - pending) > 0.05:
                 self._pending_angle_rad = continuous_angle
@@ -418,6 +538,8 @@ class CurrentTrialExperiment:
                 )
         self._pending_angle_rad = None
         self._last_accepted_angle_rad = continuous_angle
+        if math.isfinite(float(sample.timestamp_s)):
+            self._last_accepted_angle_timestamp_s = float(sample.timestamp_s)
         self._continuous_reference_rad = continuous_angle
         return replace(
             sample,
@@ -429,16 +551,14 @@ class CurrentTrialExperiment:
     def start(self, now_s: float) -> list[CurrentTrialAction]:
         if self.phase != CurrentTrialPhase.IDLE:
             raise RuntimeError("Токовый опыт уже запущен")
-        self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+        self.phase = CurrentTrialPhase.PWM_OFF_BASELINE
         self.phase_started_s = now_s
         self._event(
             "start",
-            f"Начальная координата зафиксирована: {self.start_angle_rad:.6g} рад",
+            f"PWM выключен; начата пассивная проверка current-sense в координате "
+            f"{self.start_angle_rad:.6g} рад",
         )
-        return [
-            CurrentTrialAction("configure_position"),
-            CurrentTrialAction("checkpoint"),
-        ]
+        return [CurrentTrialAction("checkpoint")]
 
     def position_configuration_applied(
         self,
@@ -480,6 +600,19 @@ class CurrentTrialExperiment:
         self._event("current_enabled", "FOC Current включён с нулевой целью")
         return [CurrentTrialAction("target", 0.0)]
 
+    def current_sense_configuration_applied(self, now_s: float) -> list[CurrentTrialAction]:
+        if self.phase != CurrentTrialPhase.CONFIGURING_CURRENT_SENSE:
+            return []
+        self.phase = CurrentTrialPhase.CURRENT_SENSE_BASELINE
+        self.phase_started_s = now_s
+        self._limit_counts.clear()
+        self._position_window.clear()
+        self._event(
+            "current_sense_enabled",
+            "Включена низковольтная диагностика датчика тока с нулевой целью",
+        )
+        return [CurrentTrialAction("voltage_target", 0.0)]
+
     def add_sample(
         self,
         sample: TelemetrySample,
@@ -508,17 +641,60 @@ class CurrentTrialExperiment:
         violation = self._violation(sample)
         if violation:
             return violation, []
-        if self.phase == CurrentTrialPhase.CURRENT_BASELINE:
+        if self.phase == CurrentTrialPhase.PWM_OFF_BASELINE:
+            self.pwm_off_baseline_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_BASELINE:
             self.baseline_samples.append(sample)
         elif self.phase == CurrentTrialPhase.CURRENT_STEP:
             self.step_samples.append(sample)
         elif self.phase == CurrentTrialPhase.CURRENT_POST:
             self.post_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_BASELINE:
+            self.current_sense_baseline_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_POSITIVE:
+            self.current_sense_positive_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_ZERO:
+            self.current_sense_zero_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_NEGATIVE:
+            self.current_sense_negative_samples.append(sample)
         return None, []
 
     def tick(self, now_s: float) -> list[CurrentTrialAction]:
         elapsed = now_s - self.phase_started_s
-        if self.phase in {CurrentTrialPhase.POSITIONING, CurrentTrialPhase.RETURNING}:
+        if self.phase == CurrentTrialPhase.PWM_OFF_BASELINE:
+            if self._phase_ready(
+                elapsed,
+                self.config.pwm_off_baseline_s,
+                self.pwm_off_baseline_samples,
+            ):
+                diagnostic = self.pwm_off_diagnostic()
+                if not diagnostic["valid"]:
+                    problems = "; ".join(str(item) for item in diagnostic["problems"])
+                    return self.abort(
+                        "Пассивная проверка current-sense при PWM OFF не пройдена; "
+                        "PWM не включён: "
+                        + problems
+                    )
+                self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+                self.phase_started_s = now_s
+                self._event(
+                    "pwm_off_baseline_passed",
+                    "Пассивный сигнал current-sense достаточно тихий; разрешена "
+                    "настройка транспортного режима",
+                )
+                return [
+                    CurrentTrialAction("configure_position"),
+                    CurrentTrialAction("checkpoint"),
+                ]
+            if self._phase_data_timeout(
+                elapsed,
+                self.config.pwm_off_baseline_s,
+                self.pwm_off_baseline_samples,
+            ):
+                return self.abort(
+                    "Недостаточно пассивной телеметрии current-sense при PWM OFF"
+                )
+        elif self.phase in {CurrentTrialPhase.POSITIONING, CurrentTrialPhase.RETURNING}:
             if elapsed >= self.config.position_timeout_s:
                 return self.abort("Транспортный позиционный режим не достиг цели до таймаута")
             if self._position_in_tolerance():
@@ -552,12 +728,67 @@ class CurrentTrialExperiment:
                         CurrentTrialAction("finish"),
                         CurrentTrialAction("checkpoint"),
                     ]
-                self.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+                self.phase = CurrentTrialPhase.CONFIGURING_CURRENT_SENSE
                 self.phase_started_s = now_s
                 return [
+                    CurrentTrialAction("configure_current_sense"),
+                    CurrentTrialAction("checkpoint"),
+                ]
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_BASELINE:
+            return self._advance_current_sense_phase(
+                now_s,
+                self.current_sense_baseline_samples,
+                next_phase=CurrentTrialPhase.CURRENT_SENSE_POSITIVE,
+                next_voltage=abs(self.config.current_sense_voltage_v),
+                event_message="Подано малое положительное Uq для проверки датчика тока",
+            )
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_POSITIVE:
+            return self._advance_current_sense_phase(
+                now_s,
+                self.current_sense_positive_samples,
+                next_phase=CurrentTrialPhase.CURRENT_SENSE_ZERO,
+                next_voltage=0.0,
+                event_message="Положительное диагностическое Uq снято",
+            )
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_ZERO:
+            return self._advance_current_sense_phase(
+                now_s,
+                self.current_sense_zero_samples,
+                next_phase=CurrentTrialPhase.CURRENT_SENSE_NEGATIVE,
+                next_voltage=-abs(self.config.current_sense_voltage_v),
+                event_message="Подано малое отрицательное Uq для проверки датчика тока",
+            )
+        elif self.phase == CurrentTrialPhase.CURRENT_SENSE_NEGATIVE:
+            elapsed = now_s - self.phase_started_s
+            if self._phase_ready(
+                elapsed,
+                self.config.current_sense_phase_s,
+                self.current_sense_negative_samples,
+            ):
+                diagnostic = self.current_sense_diagnostic()
+                if not diagnostic["valid"]:
+                    problems = "; ".join(str(item) for item in diagnostic["problems"])
+                    return self.abort(
+                        "Диагностика датчика тока не пройдена; FOC Current не включён: "
+                        + problems
+                    )
+                self.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+                self.phase_started_s = now_s
+                self._event(
+                    "current_sense_passed",
+                    "Знаки Iq и развязка Q/D прошли низковольтную проверку",
+                )
+                return [
+                    CurrentTrialAction("voltage_target", 0.0),
                     CurrentTrialAction("configure_current"),
                     CurrentTrialAction("checkpoint"),
                 ]
+            if self._phase_data_timeout(
+                elapsed,
+                self.config.current_sense_phase_s,
+                self.current_sense_negative_samples,
+            ):
+                return self.abort("Недостаточно данных низковольтной диагностики датчика тока")
         elif self.phase == CurrentTrialPhase.CURRENT_BASELINE:
             return self._advance_measured_phase(
                 now_s,
@@ -587,6 +818,28 @@ class CurrentTrialExperiment:
                 ]
             if self._phase_data_timeout(elapsed, self.config.post_s, self.post_samples):
                 return self.abort("Недостаточно телеметрии после снятия токовой ступени")
+        return []
+
+    def _advance_current_sense_phase(
+        self,
+        now_s: float,
+        samples: list[TelemetrySample],
+        *,
+        next_phase: CurrentTrialPhase,
+        next_voltage: float,
+        event_message: str,
+    ) -> list[CurrentTrialAction]:
+        elapsed = now_s - self.phase_started_s
+        if self._phase_ready(elapsed, self.config.current_sense_phase_s, samples):
+            self.phase = next_phase
+            self.phase_started_s = now_s
+            self._event("voltage_target", event_message)
+            return [
+                CurrentTrialAction("voltage_target", next_voltage),
+                CurrentTrialAction("checkpoint"),
+            ]
+        if self._phase_data_timeout(elapsed, self.config.current_sense_phase_s, samples):
+            return self.abort("Недостаточно данных низковольтной диагностики датчика тока")
         return []
 
     def _advance_measured_phase(
@@ -654,6 +907,11 @@ class CurrentTrialExperiment:
         self.baseline_samples.clear()
         self.step_samples.clear()
         self.post_samples.clear()
+        self.pwm_off_baseline_samples.clear()
+        self.current_sense_baseline_samples.clear()
+        self.current_sense_positive_samples.clear()
+        self.current_sense_zero_samples.clear()
+        self.current_sense_negative_samples.clear()
         self._position_window.clear()
         self._limit_counts.clear()
         if self.recovery_attempts > self.config.max_recovery_attempts:
@@ -667,16 +925,14 @@ class CurrentTrialExperiment:
     def resume_after_recovery(self, now_s: float) -> list[CurrentTrialAction]:
         if self.phase != CurrentTrialPhase.RECOVERING:
             return []
-        self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+        self.phase = CurrentTrialPhase.PWM_OFF_BASELINE
         self.phase_started_s = now_s
         self._event(
             "recovery",
-            "Связь восстановлена; весь незавершённый токовый опыт начинается заново",
+            "Связь восстановлена; весь незавершённый токовый опыт начинается заново "
+            "с пассивной проверки PWM OFF",
         )
-        return [
-            CurrentTrialAction("configure_position"),
-            CurrentTrialAction("checkpoint"),
-        ]
+        return [CurrentTrialAction("checkpoint")]
 
     def abort(self, reason: str) -> list[CurrentTrialAction]:
         self.abort_reason = reason
@@ -733,16 +989,31 @@ class CurrentTrialExperiment:
                 )
         iq = sample.current_q_a
         id_ = sample.current_d_a
-        if iq is not None and id_ is not None:
+        if (
+            self.phase != CurrentTrialPhase.PWM_OFF_BASELINE
+            and iq is not None
+            and id_ is not None
+        ):
             current = math.hypot(iq, id_)
             if current > self.config.absolute_current_limit_a * 2.0:
                 return f"Резкий выброс полного тока {current:.6g} А"
-            current_limit = (
-                self.config.current_trip_limit_a
-                if self.phase in self.CURRENT_PHASES
+            if (
+                self.phase in self.CURRENT_SENSE_PHASES
+                or self.phase == CurrentTrialPhase.CONFIGURING_CURRENT_SENSE
+            ):
+                current_limit = self.config.current_sense_current_trip_a
+            elif (
+                self.phase in self.CURRENT_PHASES
                 or self.phase == CurrentTrialPhase.CONFIGURING_CURRENT
-                else self.config.absolute_current_limit_a
-            )
+            ):
+                current_limit = self.config.current_trip_limit_a
+            else:
+                current_limit = self.config.absolute_current_limit_a
+            if current > current_limit * 2.0:
+                return (
+                    f"Резкий выброс полного тока {current:.6g} А при лимите "
+                    f"{current_limit:g} А"
+                )
             if self._confirmed_limit("current", current > current_limit):
                 return (
                     f"Полный ток {current:.6g} А устойчиво выше "
@@ -754,14 +1025,49 @@ class CurrentTrialExperiment:
             voltage = math.hypot(uq, ud)
             if voltage > self.config.absolute_voltage_limit_v * 2.0:
                 return f"Резкий выброс полного напряжения {voltage:.6g} В"
+            if self.phase in self.CURRENT_SENSE_PHASES:
+                working_voltage_limit = self.config.current_sense_voltage_limit_v
+            elif self.phase in self.CURRENT_PHASES:
+                working_voltage_limit = self.config.current_voltage_limit_v
+            else:
+                working_voltage_limit = self.config.absolute_voltage_limit_v
+            if voltage > working_voltage_limit * 2.0:
+                return (
+                    f"Резкий выброс полного напряжения {voltage:.6g} В при лимите "
+                    f"{working_voltage_limit:g} В"
+                )
             if self._confirmed_limit(
                 "voltage",
-                voltage > self.config.absolute_voltage_limit_v,
+                voltage > working_voltage_limit,
             ):
                 return (
                     f"Полное напряжение {voltage:.6g} В устойчиво выше "
-                    f"{self.config.absolute_voltage_limit_v:g} В"
+                    f"{working_voltage_limit:g} В"
                 )
+        telemetry_velocity = sample.velocity_rad_s
+        if (
+            not sample.angle_rejected
+            and telemetry_velocity is not None
+            and math.isfinite(telemetry_velocity)
+        ):
+            if abs(telemetry_velocity) > self.config.velocity_trip_limit_rad_s * 2.0:
+                return (
+                    "НЕМЕДЛЕННАЯ ОСТАНОВКА: телеметрическая скорость "
+                    f"{telemetry_velocity:.6g} рад/с"
+                )
+            if self._confirmed_limit(
+                "telemetry_velocity",
+                abs(telemetry_velocity) > self.config.velocity_trip_limit_rad_s,
+            ):
+                return (
+                    f"Телеметрическая скорость {telemetry_velocity:.6g} рад/с устойчиво выше "
+                    f"{self.config.velocity_trip_limit_rad_s:g} рад/с"
+                )
+        elif sample.angle_rejected:
+            # The firmware velocity is derived from the same angle packet.  Do not
+            # let one rejected coordinate reset bypass the persistence check by
+            # tripping on its equally invalid derivative.
+            self._limit_counts["telemetry_velocity"] = 0
         angle_velocity = self._estimated_angle_velocity()
         if angle_velocity is not None:
             if abs(angle_velocity) > self.config.velocity_trip_limit_rad_s * 2.0:
@@ -775,6 +1081,141 @@ class CurrentTrialExperiment:
                     f"{self.config.velocity_trip_limit_rad_s:g} рад/с"
                 )
         return None
+
+    def pwm_off_diagnostic(self) -> dict[str, Any]:
+        samples = self.pwm_off_baseline_samples
+        stage = _stage_statistics(samples)
+        full_currents = _vector_magnitudes(
+            samples,
+            "current_q_a",
+            "current_d_a",
+        )
+        full_voltages = _vector_magnitudes(
+            samples,
+            "voltage_q_v",
+            "voltage_d_v",
+        )
+        peak_current = max(full_currents, default=None)
+        peak_voltage = max(full_voltages, default=None)
+        enough_data = (
+            len(samples) >= self.config.minimum_phase_samples
+            and len(full_currents) >= self.config.minimum_phase_samples
+            and len(full_voltages) >= self.config.minimum_phase_samples
+        )
+        current_quiet = bool(
+            peak_current is not None
+            and peak_current <= self.config.pwm_off_current_noise_limit_a
+        )
+        voltage_quiet = bool(
+            peak_voltage is not None
+            and peak_voltage <= self.config.pwm_off_voltage_noise_limit_v
+        )
+        problems: list[str] = []
+        if not enough_data:
+            problems.append("недостаточно полных пассивных отсчётов")
+        if not current_quiet:
+            value = "нет данных" if peak_current is None else f"{peak_current:.6g} А"
+            problems.append(
+                f"пик сигнала полного тока {value} выше допустимого шума "
+                f"{self.config.pwm_off_current_noise_limit_a:g} А"
+            )
+        if not voltage_quiet:
+            value = "нет данных" if peak_voltage is None else f"{peak_voltage:.6g} В"
+            problems.append(
+                f"пик телеметрического напряжения {value} выше нулевого предела "
+                f"{self.config.pwm_off_voltage_noise_limit_v:g} В"
+            )
+        return {
+            "valid": enough_data and current_quiet and voltage_quiet,
+            "pwm_enabled": False,
+            "current_noise_limit_a": self.config.pwm_off_current_noise_limit_a,
+            "voltage_noise_limit_v": self.config.pwm_off_voltage_noise_limit_v,
+            "peak_full_current_a": peak_current,
+            "rms_full_current_a": _rms(full_currents),
+            "peak_full_voltage_v": peak_voltage,
+            "problems": problems,
+            "stage": stage,
+        }
+
+    def current_sense_diagnostic(self) -> dict[str, Any]:
+        stages = {
+            "baseline": _stage_statistics(self.current_sense_baseline_samples),
+            "positive": _stage_statistics(self.current_sense_positive_samples),
+            "zero_between": _stage_statistics(self.current_sense_zero_samples),
+            "negative": _stage_statistics(self.current_sense_negative_samples),
+        }
+
+        def steady_mean(samples: list[TelemetrySample], name: str) -> float | None:
+            values = _values(samples, name)
+            return _mean(values[len(values) // 2 :])
+
+        baseline_iq = steady_mean(self.current_sense_baseline_samples, "current_q_a")
+        positive_iq = steady_mean(self.current_sense_positive_samples, "current_q_a")
+        zero_iq = steady_mean(self.current_sense_zero_samples, "current_q_a")
+        negative_iq = steady_mean(self.current_sense_negative_samples, "current_q_a")
+        positive_id = steady_mean(self.current_sense_positive_samples, "current_d_a")
+        zero_id = steady_mean(self.current_sense_zero_samples, "current_d_a")
+        negative_id = steady_mean(self.current_sense_negative_samples, "current_d_a")
+        baseline_id = steady_mean(self.current_sense_baseline_samples, "current_d_a")
+        positive_q_delta = (
+            None if baseline_iq is None or positive_iq is None else positive_iq - baseline_iq
+        )
+        negative_q_delta = (
+            None if zero_iq is None or negative_iq is None else negative_iq - zero_iq
+        )
+        positive_d_delta = (
+            None if baseline_id is None or positive_id is None else positive_id - baseline_id
+        )
+        negative_d_delta = (
+            None if zero_id is None or negative_id is None else negative_id - zero_id
+        )
+        response_span = (
+            None
+            if positive_q_delta is None or negative_q_delta is None
+            else abs(positive_q_delta - negative_q_delta)
+        )
+        d_span = (
+            None
+            if positive_d_delta is None or negative_d_delta is None
+            else abs(positive_d_delta - negative_d_delta)
+        )
+        axis_ratio = (
+            None
+            if response_span is None or response_span <= 1e-12 or d_span is None
+            else d_span / response_span
+        )
+        enough_data = all(
+            stage["sample_count"] >= self.config.minimum_phase_samples
+            for stage in stages.values()
+        )
+        sign_consistent = bool(
+            positive_q_delta is not None
+            and negative_q_delta is not None
+            and positive_q_delta >= self.config.current_sense_min_response_a
+            and negative_q_delta <= -self.config.current_sense_min_response_a
+        )
+        q_axis_dominant = axis_ratio is not None and axis_ratio <= 1.5
+        problems: list[str] = []
+        if not enough_data:
+            problems.append("недостаточно полных отсчётов")
+        if not sign_consistent:
+            problems.append("Iq не меняет знак вместе с ±Uq")
+        if not q_axis_dominant:
+            problems.append("отклик Id слишком велик относительно Iq")
+        return {
+            "valid": enough_data and sign_consistent and q_axis_dominant,
+            "command_voltage_v": abs(self.config.current_sense_voltage_v),
+            "minimum_response_a": self.config.current_sense_min_response_a,
+            "positive_q_delta_a": positive_q_delta,
+            "negative_q_delta_a": negative_q_delta,
+            "positive_d_delta_a": positive_d_delta,
+            "negative_d_delta_a": negative_d_delta,
+            "d_to_q_span_ratio": axis_ratio,
+            "sign_consistent": sign_consistent,
+            "q_axis_dominant": q_axis_dominant,
+            "problems": problems,
+            "stages": stages,
+        }
 
     def checkpoint_payload(self, experiment_id: int | None) -> dict[str, Any]:
         return {
@@ -818,6 +1259,7 @@ class CurrentTrialExperiment:
         return experiment
 
     def result(self, status: str, *, error: str = "") -> dict[str, Any]:
+        pwm_off = self.pwm_off_diagnostic()
         baseline = _stage_statistics(self.baseline_samples)
         step = _stage_statistics(self.step_samples)
         post = _stage_statistics(self.post_samples)
@@ -832,7 +1274,7 @@ class CurrentTrialExperiment:
             if steady_mean is None or baseline_mean is None
             else (steady_mean - baseline_mean) * math.copysign(1.0, self.config.step_current_a)
         )
-        response_threshold = max(0.02, abs(self.config.step_current_a) * 0.2)
+        response_threshold = max(0.002, abs(self.config.step_current_a) * 0.2)
         current_response_observed = (
             signed_response is not None and signed_response >= response_threshold
         )
@@ -854,7 +1296,14 @@ class CurrentTrialExperiment:
             stage["sample_count"] >= self.config.minimum_phase_samples
             for stage in (baseline, step, post)
         )
-        valid = status == "completed" and enough_data and current_response_observed
+        current_sense = self.current_sense_diagnostic()
+        valid = (
+            status == "completed"
+            and bool(pwm_off["valid"])
+            and bool(current_sense["valid"])
+            and enough_data
+            and current_response_observed
+        )
         notes: list[str] = []
         if not enough_data:
             notes.append("В одной или нескольких фазах недостаточно телеметрии.")
@@ -877,11 +1326,13 @@ class CurrentTrialExperiment:
             "valid": valid,
             "config": self.config.to_dict(),
             "start_angle_rad": self.start_angle_rad,
+            "pwm_off_diagnostic": pwm_off,
             "stages": {
                 "baseline": baseline,
                 "step": step,
                 "post": post,
             },
+            "current_sense_diagnostic": current_sense,
             "metrics": {
                 "steady_current_q_a": steady_mean,
                 "steady_error_a": steady_error,

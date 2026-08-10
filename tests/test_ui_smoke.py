@@ -8,10 +8,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QPlainTextEdit
 
     from foctwin.current_trial import CurrentTrialExperiment
     from foctwin.drive_bridge_ui import DriveBridgeDialog
+    from foctwin.instruction_runner_ui import InstructionRunnerDialog
     from foctwin.protocol import CommanderResponse
     from foctwin.ui import MainWindow
 except ImportError:
@@ -70,9 +71,9 @@ class UiSmokeTests(unittest.TestCase):
             self.assertGreater(window.friction_velocity_limit.maximum(), 0.3)
             self.assertGreater(window.friction_angle_max.maximum(), 3.0)
             self.assertFalse(window.friction_stop_button.isEnabled())
-            self.assertEqual(window.current_trial_step.value(), 0.1)
-            self.assertEqual(window.current_trial_kp.value(), 8.4222)
-            self.assertEqual(window.current_trial_ki.value(), 814.0)
+            self.assertEqual(window.current_trial_step.value(), 0.01)
+            self.assertEqual(window.current_trial_kp.value(), 0.4)
+            self.assertEqual(window.current_trial_ki.value(), 40.0)
             self.assertEqual(window.current_trial_baseline.value(), 1.0)
             self.assertEqual(window.current_trial_step_duration.value(), 2.0)
             self.assertEqual(window.current_trial_post.value(), 1.0)
@@ -101,6 +102,110 @@ class UiSmokeTests(unittest.TestCase):
             self.assertEqual(snapshot.messages[-1].text, "Домашний тест без мотора")
             self.assertEqual(snapshot.credentials_path, "")
             dialog.close()
+
+    def test_instruction_window_executes_ping_without_project_or_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dialog = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+            self.assertIn("отдельная команда start", dialog.safety_label.text().lower())
+            self.assertIn("без таймера", dialog.safety_label.text().lower())
+            self.assertEqual(
+                dialog.arm_sample_button.text(),
+                "Разрешить выбранный план",
+            )
+            self.assertFalse(dialog.auto_scan_checkbox.isChecked())
+            self.assertTrue(dialog.runner.status_path.is_file())
+
+            dialog.runner.create_sample_command("ping")
+            result = dialog.runner.scan_once()
+            dialog._render_snapshot(dialog.runner.snapshot())
+
+            self.assertEqual(result.completed, 1)
+            self.assertEqual(dialog.history_table.rowCount(), 1)
+            self.assertEqual(dialog.history_table.item(0, 1).text(), "ping")
+            self.assertEqual(dialog.history_table.item(0, 2).text(), "completed")
+            dialog.close()
+
+    def test_instruction_window_simulates_and_queues_current_trial_without_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dialog = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+
+            dialog.runner.create_sample_command("run_current_trial")
+            simulated = dialog.runner.scan_once()
+            dialog.runner.create_sample_command("queue_current_trial")
+            queued = dialog.runner.scan_once()
+            snapshot = dialog.runner.snapshot()
+
+            self.assertEqual(simulated.completed, 1)
+            self.assertEqual(queued.waiting, 1)
+            states = {record.state for record in snapshot.recent_commands}
+            self.assertIn("completed", states)
+            self.assertIn("waiting_for_motor", states)
+            self.assertFalse(
+                dialog.runner._status_payload()["remote_hardware_execution_enabled"]
+            )
+            dialog.close()
+
+    def test_instruction_arm_dialog_keeps_scrollable_details_and_visible_default_action(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            window = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+
+            with patch.object(
+                QDialog,
+                "exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ):
+                accepted = window._confirm_current_trial_arm(
+                    "00000000-0000-4000-8000-000000000001",
+                    {"step_current_a": 0.01, "current_kp": 0.4},
+                )
+
+            confirmation = window.findChild(QDialog, "currentTrialArmDialog")
+            details = confirmation.findChild(QPlainTextEdit, "currentTrialArmDetails")
+            buttons = confirmation.findChild(QDialogButtonBox, "currentTrialArmButtons")
+            allow = buttons.button(QDialogButtonBox.StandardButton.Yes)
+            cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+
+            self.assertTrue(accepted)
+            self.assertIsNotNone(details)
+            self.assertTrue(details.isReadOnly())
+            self.assertIn('"step_current_a": 0.01', details.toPlainText())
+            self.assertTrue(allow.isDefault())
+            self.assertFalse(cancel.isDefault())
+            self.assertLessEqual(confirmation.height(), 540)
+            window.close()
+
+    def test_main_window_and_instruction_window_share_current_trial_controller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+
+            window._open_instruction_runner()
+            dialog = window._instruction_runner_dialog
+
+            self.assertIsNotNone(dialog)
+            self.assertIs(
+                dialog.current_trial_controller,
+                window.current_trial_controller,
+            )
+            environment = dialog.current_trial_environment_factory()
+            self.assertFalse(environment.motor_connected)
+            self.assertFalse(environment.local_permission)
+            window.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -133,9 +238,9 @@ class UiSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = f"{temporary}/settings.ini"
             first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
-            first.current_trial_step.setValue(-0.12)
-            first.current_trial_kp.setValue(7.5)
-            first.current_trial_ki.setValue(700.0)
+            first.current_trial_step.setValue(-0.02)
+            first.current_trial_kp.setValue(1.5)
+            first.current_trial_ki.setValue(120.0)
             first.current_trial_baseline.setValue(1.5)
             first.current_trial_step_duration.setValue(3.0)
             first.current_trial_post.setValue(2.0)
@@ -144,9 +249,9 @@ class UiSmokeTests(unittest.TestCase):
             first.close()
 
             second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
-            self.assertEqual(second.current_trial_step.value(), -0.12)
-            self.assertEqual(second.current_trial_kp.value(), 7.5)
-            self.assertEqual(second.current_trial_ki.value(), 700.0)
+            self.assertEqual(second.current_trial_step.value(), -0.02)
+            self.assertEqual(second.current_trial_kp.value(), 1.5)
+            self.assertEqual(second.current_trial_ki.value(), 120.0)
             self.assertEqual(second.current_trial_baseline.value(), 1.5)
             self.assertEqual(second.current_trial_step_duration.value(), 3.0)
             self.assertEqual(second.current_trial_post.value(), 2.0)
@@ -162,6 +267,7 @@ class UiSmokeTests(unittest.TestCase):
             experiment.seed_angle(0.0)
 
             position_commands = window._current_trial_positioning_commands(experiment)
+            current_sense_commands = window._current_trial_current_sense_commands(experiment)
             current_commands = window._current_trial_current_commands(experiment)
 
             self.assertEqual(
@@ -175,13 +281,21 @@ class UiSmokeTests(unittest.TestCase):
                 ["AT0", "AC2", "A0", "AMC", "AMD10", "AMS1111111", "AE1"],
             )
             self.assertEqual(
-                current_commands[:5],
-                ["AE0", "AR0.675", "ALC0.5", "ALU12", "ALV0.5"],
+                current_sense_commands[:5],
+                ["AE0", "AR-12345", "ALC0.1", "ALU0.05", "ALV0.5"],
             )
-            self.assertIn("AQP8.4222", current_commands)
-            self.assertIn("AQI814", current_commands)
-            self.assertIn("ADP8.4222", current_commands)
-            self.assertIn("ADI814", current_commands)
+            self.assertEqual(
+                current_sense_commands[-7:],
+                ["AT0", "AC0", "A0", "AMC", "AMD10", "AMS1111111", "AE1"],
+            )
+            self.assertEqual(
+                current_commands[:5],
+                ["AE0", "AR0.675", "ALC0.1", "ALU2", "ALV0.5"],
+            )
+            self.assertIn("AQP0.4", current_commands)
+            self.assertIn("AQI40", current_commands)
+            self.assertIn("ADP0.4", current_commands)
+            self.assertIn("ADI40", current_commands)
             self.assertEqual(
                 current_commands[-7:],
                 ["AT2", "AC0", "A0", "AMC", "AMD10", "AMS1111111", "AE1"],
