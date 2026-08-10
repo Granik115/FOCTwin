@@ -2949,7 +2949,7 @@ class MainWindow(QMainWindow):
     def _real_tuning_page(self) -> QWidget:
         page, layout = titled_page(
             "Доводка на реальном моторе",
-            "FOCTwin 0.4.2b3: низковольтная проверка датчика и один малый токовый шаг.",
+            "FOCTwin 0.4.2b4: фильтр одиночного сброса координаты и малый токовый шаг.",
         )
         warning = QLabel(
             "Можно физически отключить питание. FOCTwin сохранит checkpoint, будет подавать "

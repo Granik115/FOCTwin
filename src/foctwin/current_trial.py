@@ -372,6 +372,7 @@ class CurrentTrialExperiment:
         self._position_window: deque[tuple[float, float]] = deque()
         self._limit_counts: dict[str, int] = {}
         self._last_accepted_angle_rad: float | None = None
+        self._last_accepted_angle_timestamp_s: float | None = None
         self._pending_angle_rad: float | None = None
         self._board_angle_offset_rad = 0.0
         self._continuous_reference_rad = self.start_angle_rad
@@ -430,6 +431,7 @@ class CurrentTrialExperiment:
         )
         self._board_angle_offset_rad = reference - float(raw_angle_rad)
         self._last_accepted_angle_rad = reference
+        self._last_accepted_angle_timestamp_s = None
         self._continuous_reference_rad = reference
         self._pending_angle_rad = None
         self._position_window.clear()
@@ -462,7 +464,23 @@ class CurrentTrialExperiment:
             return sample
         continuous_angle = float(raw_angle) + self._board_angle_offset_rad
         previous = self._last_accepted_angle_rad
-        if previous is not None and abs(continuous_angle - previous) > 0.5:
+        previous_timestamp = self._last_accepted_angle_timestamp_s
+        discontinuity_limit = 0.5
+        if previous_timestamp is not None:
+            interval_s = float(sample.timestamp_s) - previous_timestamp
+            if not math.isfinite(interval_s) or interval_s < 0.0:
+                interval_s = 0.0
+            # A single board packet may transiently report angle 0 while changing
+            # control modes.  Anything implying more than twice the configured
+            # trip speed is held for one packet and must persist before it can be
+            # accepted as real motion.  The 0.02 rad floor tolerates encoder
+            # quantisation and duplicate timestamps at the ~64 Hz monitor rate;
+            # longer stream gaps are capped because recovery owns stale telemetry.
+            discontinuity_limit = max(
+                0.02,
+                self.config.velocity_trip_limit_rad_s * min(interval_s, 0.1) * 2.0,
+            )
+        if previous is not None and abs(continuous_angle - previous) > discontinuity_limit:
             pending = self._pending_angle_rad
             if pending is None or abs(continuous_angle - pending) > 0.05:
                 self._pending_angle_rad = continuous_angle
@@ -475,6 +493,8 @@ class CurrentTrialExperiment:
                 )
         self._pending_angle_rad = None
         self._last_accepted_angle_rad = continuous_angle
+        if math.isfinite(float(sample.timestamp_s)):
+            self._last_accepted_angle_timestamp_s = float(sample.timestamp_s)
         self._continuous_reference_rad = continuous_angle
         return replace(
             sample,
@@ -944,7 +964,11 @@ class CurrentTrialExperiment:
                     f"{working_voltage_limit:g} В"
                 )
         telemetry_velocity = sample.velocity_rad_s
-        if telemetry_velocity is not None and math.isfinite(telemetry_velocity):
+        if (
+            not sample.angle_rejected
+            and telemetry_velocity is not None
+            and math.isfinite(telemetry_velocity)
+        ):
             if abs(telemetry_velocity) > self.config.velocity_trip_limit_rad_s * 2.0:
                 return (
                     "НЕМЕДЛЕННАЯ ОСТАНОВКА: телеметрическая скорость "
@@ -958,6 +982,11 @@ class CurrentTrialExperiment:
                     f"Телеметрическая скорость {telemetry_velocity:.6g} рад/с устойчиво выше "
                     f"{self.config.velocity_trip_limit_rad_s:g} рад/с"
                 )
+        elif sample.angle_rejected:
+            # The firmware velocity is derived from the same angle packet.  Do not
+            # let one rejected coordinate reset bypass the persistence check by
+            # tripping on its equally invalid derivative.
+            self._limit_counts["telemetry_velocity"] = 0
         angle_velocity = self._estimated_angle_velocity()
         if angle_velocity is not None:
             if abs(angle_velocity) > self.config.velocity_trip_limit_rad_s * 2.0:

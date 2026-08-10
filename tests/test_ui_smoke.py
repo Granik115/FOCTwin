@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QPlainTextEdit
 
     from foctwin.current_trial import CurrentTrialExperiment
     from foctwin.drive_bridge_ui import DriveBridgeDialog
@@ -112,6 +112,11 @@ class UiSmokeTests(unittest.TestCase):
                 auto_scan=False,
             )
             self.assertIn("отдельная команда start", dialog.safety_label.text().lower())
+            self.assertIn("без таймера", dialog.safety_label.text().lower())
+            self.assertEqual(
+                dialog.arm_sample_button.text(),
+                "Разрешить выбранный план",
+            )
             self.assertFalse(dialog.auto_scan_checkbox.isChecked())
             self.assertTrue(dialog.runner.status_path.is_file())
 
@@ -149,6 +154,40 @@ class UiSmokeTests(unittest.TestCase):
                 dialog.runner._status_payload()["remote_hardware_execution_enabled"]
             )
             dialog.close()
+
+    def test_instruction_arm_dialog_keeps_scrollable_details_and_visible_default_action(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            window = InstructionRunnerDialog(
+                state_root=root / "state",
+                exchange_root=root / "exchange",
+                auto_scan=False,
+            )
+
+            with patch.object(
+                QDialog,
+                "exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ):
+                accepted = window._confirm_current_trial_arm(
+                    "00000000-0000-4000-8000-000000000001",
+                    {"step_current_a": 0.01, "current_kp": 0.4},
+                )
+
+            confirmation = window.findChild(QDialog, "currentTrialArmDialog")
+            details = confirmation.findChild(QPlainTextEdit, "currentTrialArmDetails")
+            buttons = confirmation.findChild(QDialogButtonBox, "currentTrialArmButtons")
+            allow = buttons.button(QDialogButtonBox.StandardButton.Yes)
+            cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+
+            self.assertTrue(accepted)
+            self.assertIsNotNone(details)
+            self.assertTrue(details.isReadOnly())
+            self.assertIn('"step_current_a": 0.01', details.toPlainText())
+            self.assertTrue(allow.isDefault())
+            self.assertFalse(cancel.isDefault())
+            self.assertLessEqual(confirmation.height(), 540)
+            window.close()
 
     def test_main_window_and_instruction_window_share_current_trial_controller(self):
         with tempfile.TemporaryDirectory() as temporary:

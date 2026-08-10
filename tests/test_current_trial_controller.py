@@ -218,7 +218,7 @@ class CurrentTrialControllerTests(unittest.TestCase):
                 ready_environment(permission=True),
             )
 
-    def test_expired_arm_returns_to_waiting_without_starting(self):
+    def test_remote_arm_remains_ready_without_a_timer(self):
         command_id = "00000000-0000-4000-8000-000000000007"
         self.controller.submit_instruction(
             command_id,
@@ -229,16 +229,37 @@ class CurrentTrialControllerTests(unittest.TestCase):
             command_id,
             ready_environment(permission=True),
         )
-        self.clock.value += timedelta(minutes=3)
+        self.clock.value += timedelta(days=7)
 
-        expired = self.controller.refresh_instruction(
+        still_ready = self.controller.refresh_instruction(
             command_id,
             ready_environment(),
         )
 
-        self.assertEqual(expired.state, CurrentTrialRequestState.WAITING_FOR_PERMISSION)
-        self.assertEqual(expired.reason_code, "local_arm_expired")
-        self.assertFalse(expired.to_dict()["remote_hardware_execution_enabled"])
+        self.assertEqual(still_ready.state, CurrentTrialRequestState.READY)
+        self.assertEqual(still_ready.reason_code, "locally_armed")
+        self.assertTrue(still_ready.to_dict()["remote_hardware_execution_enabled"])
+        self.assertIn("armed_at", still_ready.result)
+        self.assertNotIn("armed_until", still_ready.result)
+
+    def test_restart_revokes_an_unconsumed_remote_arm(self):
+        command_id = "00000000-0000-4000-8000-000000000010"
+        self.controller.submit_instruction(
+            command_id,
+            {"mode": "hardware", "config": {}},
+            ready_environment(),
+        )
+        self.controller.arm_instruction(
+            command_id,
+            ready_environment(permission=True),
+        )
+
+        restarted = CurrentTrialController(self.root, now_factory=self.clock)
+        restored = restarted.get_by_command(command_id)
+
+        self.assertEqual(restored.state, CurrentTrialRequestState.WAITING_FOR_PERMISSION)
+        self.assertEqual(restored.reason_code, "restart_requires_permission")
+        self.assertEqual(restored.result, {})
 
     def test_running_local_trial_revokes_a_remote_arm(self):
         command_id = "00000000-0000-4000-8000-000000000009"

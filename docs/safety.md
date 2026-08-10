@@ -28,7 +28,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Shared instruction admission (0.4.2b3)
+## Shared instruction admission (0.4.2b4)
 
 Receiving a remote hardware instruction still cannot issue a motor command. The runner lives in a
 separate module with no imports from Serial, Commander, friction or current-trial code. A narrow
@@ -47,15 +47,15 @@ The controller validates the same `CurrentTrialConfig` used by the attended butt
 unknown fields or invalid limit relationships. Simulation exports a plan with `executed: false`
 without opening Serial. A hardware instruction can transition to `ready` only when a person
 selects its exact Command ID in the local UI, reviews the immutable configuration and grants a
-two-minute arm. A separate `start_current_trial` rechecks the environment and consumes that arm
-once. Normal refresh, JSON content alone and a connected motor cannot grant permission. Restart,
-expiry or a changed prerequisite demotes the request to permission waiting.
+one-shot arm without a timer. A separate `start_current_trial` rechecks the environment and
+consumes that arm once. Normal refresh, JSON content alone and a connected motor cannot grant
+permission. Restart or a changed prerequisite demotes the request to permission waiting.
 
 The `dry_run` capability reports `simulate_or_wait_for_one_shot_local_arm` but never dispatches the
 nested command. Cancellation of a running trial reaches only the existing attended executor's
 best-effort emergency stop callback.
 
-## Guarded current trial (0.4.2b3)
+## Guarded current trial (0.4.2b4)
 
 The first direct-tuning release captures the current coordinate only when it is inside `±3 rad`.
 The return controller uses the already loaded angle and velocity PID values in
@@ -66,12 +66,15 @@ Before current PI, FOCTwin applies `0, +0.01, 0, -0.01 V` in direct-voltage mode
 ceiling and `0.1 A` current trip. It refuses to enable FOC Current unless Iq follows both command
 signs, exceeds a `0.002 A` diagnostic response and dominates Id.
 
-The b3 profile uses a `0.01 A` target for `2 s`, with a `1 s` zero before and after it. Current Q/D
+The b4 profile uses a `0.01 A` target for `2 s`, with a `1 s` zero before and after it. Current Q/D
 starts at `P=0.4`, `I=40`, ramp `50 V/s`; the firmware target is clipped to `0.1 A`, working
 voltage to `2 V`, and the host stops after two confirmed samples above `0.5 A`. A firmware-speed
 sample above `1 rad/s` stops immediately; the `0.5 rad/s` working limit is confirmed. Independent
 absolute envelopes remain `5 A`, `24 V` and `±4 rad`; reaching `±3.5 rad` stops before the final
-travel boundary. Host-derived angle-speed protection remains independent from firmware velocity.
+travel boundary. A single coordinate packet that implies more than twice the trip speed is held
+for one packet; its firmware-derived velocity is ignored only for that rejected packet. If the
+new coordinate persists on the next packet, normal emergency checks stop the trial. Host-derived
+angle-speed protection remains independent from firmware velocity.
 
 If telemetry becomes stale or Serial disappears, FOCTwin immediately attempts target zero and
 repeated `AE0`, atomically saves a checkpoint and marks all baseline/step/post samples of that

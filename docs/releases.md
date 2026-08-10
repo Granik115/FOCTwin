@@ -19,6 +19,20 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b4
+
+- Keep an exact locally approved remote plan armed without a timer. The permission remains
+  one-shot, is consumed only by a separate `start_current_trial`, and is still revoked by process
+  restart, cancellation or any changed motor/telemetry/PWM prerequisite.
+- Replace the oversized message box with a bounded confirmation dialog: the immutable JSON plan
+  is scrollable, the action buttons always remain visible, and Enter activates the explicit
+  `Разрешить план` button instead of cancelling.
+- Treat a physically impossible single coordinate jump as a candidate damaged packet. Its angle
+  and firmware-derived velocity are ignored for that packet only; a repeated coordinate on the
+  next packet is accepted as real and immediately reaches the existing emergency checks.
+- Add regression coverage for the exact `0.0588 → 0.0000 rad`, `-5.6167 rad/s` packet observed in
+  remote trial 59, for persistent jumps, no-timeout arms and restart revocation.
+
 ## 0.4.2b3
 
 - Reduce the guarded current step from `0.1 A` to `0.01 A`; start current Q/D at `P=0.4`, `I=40`,

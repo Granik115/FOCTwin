@@ -1,9 +1,10 @@
-# FOCTwin Instruction Runner 0.4.2b3
+# FOCTwin Instruction Runner 0.4.2b4
 
 This beta connects the instruction channel to the same durable current-trial admission controller
 used by the local button. It can validate and simulate a current trial or preserve an immutable
-hardware plan. A hardware plan can run only after a person locally arms that exact Command ID for
-two minutes and a separate `start_current_trial` consumes the permission once.
+hardware plan. A hardware plan can run only after a person locally arms that exact Command ID and
+a separate `start_current_trial` consumes the permission once. The local arm has no timer but is
+revoked by restart or any changed safety prerequisite.
 
 The existing `Связь с GPT` Drive chat remains available for comparison. The new `Инструкции`
 window does not use Google Drive directly; FolderBridge is the transport.
@@ -135,9 +136,9 @@ executable launch and raw Commander text have no handler.
 
 The shared controller accepts the local button only after a fresh environment check and its
 confirmation dialog. For a file instruction, merely receiving JSON never grants permission. The
-person must select the exact immutable plan in FOCTwin and confirm a two-minute arm. A normal
+person must select the exact immutable plan in FOCTwin and confirm a one-shot arm. A normal
 status refresh cannot create `ready`; a separate START rechecks all prerequisites and consumes the
-arm. Expiry, process restart, motor/telemetry loss, active PWM, another experiment or a busy command
+arm. Process restart, motor/telemetry loss, active PWM, another experiment or a busy command
 channel revokes it. There is no generic remote target, raw Commander or mode-change capability.
 
 ## Home test
@@ -161,7 +162,7 @@ channel revokes it. There is no generic remote target, raw Commander or mode-cha
     state without a second execution chain.
 
 For an attended hardware run, connect the board and wait for complete fresh telemetry. Select one
-`waiting_for_permission` row, press `Разрешить выбранный план на 2 минуты`, inspect every value and
+`waiting_for_permission` row, press `Разрешить выбранный план`, inspect every value and
 confirm locally. This action does not start the motor. Only then create a separate START. Keep
 physical power cutoff available throughout the run. Do not use this sequence for an unattended
 test.

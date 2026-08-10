@@ -1,3 +1,3 @@
 """FOCTwin application package."""
 
-__version__ = "0.4.2b3"
+__version__ = "0.4.2b4"

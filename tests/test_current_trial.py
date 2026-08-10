@@ -191,6 +191,32 @@ class CurrentTrialExperimentTests(unittest.TestCase):
 
         self.assertIn("НЕМЕДЛЕННАЯ ОСТАНОВКА", violation)
 
+    def test_isolated_zero_angle_packet_does_not_fake_an_emergency_velocity_trip(self):
+        self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+        self.experiment.current_configuration_applied(0.0)
+        self.add(sample(0.0, angle_rad=0.0588))
+
+        violation, _ = self.add(
+            sample(0.016, angle_rad=0.0, velocity_rad_s=-5.6167)
+        )
+        recovered, _ = self.add(sample(0.032, angle_rad=0.0588))
+
+        self.assertIsNone(violation)
+        self.assertIsNone(recovered)
+        self.assertEqual(self.experiment.rejected_angle_samples, 1)
+        self.assertAlmostEqual(self.experiment._last_accepted_angle_rad, 0.0588)
+
+    def test_persistent_zero_angle_packet_still_trips_on_second_sample(self):
+        self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+        self.experiment.current_configuration_applied(0.0)
+        self.add(sample(0.0, angle_rad=0.0588))
+
+        first, _ = self.add(sample(0.016, angle_rad=0.0, velocity_rad_s=-5.6167))
+        second, _ = self.add(sample(0.032, angle_rad=0.0, velocity_rad_s=-5.6167))
+
+        self.assertIsNone(first)
+        self.assertIn("НЕМЕДЛЕННАЯ ОСТАНОВКА", second)
+
     def test_bad_current_sense_sign_aborts_before_current_pi(self):
         self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT_SENSE
         self.experiment.current_sense_configuration_applied(0.0)

@@ -6,8 +6,8 @@ a request is safe to simulate, is waiting for a motor, is waiting for local perm
 handed to the existing attended UI executor.
 
 An instruction request can become ``ready`` only after a person locally arms its exact immutable
-configuration for a short period.  A separate instruction may consume that one-shot permission;
-restart, expiry or any changed safety precondition revokes it.
+configuration until it is consumed.  A separate instruction may consume that one-shot permission;
+restart or any changed safety precondition revokes it.
 """
 
 from __future__ import annotations
@@ -18,14 +18,13 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 from foctwin.current_trial import CurrentTrialConfig
 
 CURRENT_TRIAL_REQUEST_SCHEMA = 1
-REMOTE_ARM_TTL = timedelta(minutes=2)
 
 
 def utc_now() -> datetime:
@@ -610,20 +609,10 @@ class CurrentTrialController:
         ):
             return decision
         if decision.state == CurrentTrialRequestState.READY:
-            armed_until_text = str(decision.result.get("armed_until", ""))
-            try:
-                armed_until = datetime.fromisoformat(armed_until_text.replace("Z", "+00:00"))
-            except ValueError:
-                armed_until = datetime.min.replace(tzinfo=timezone.utc)
-            now = self.now_factory().astimezone(timezone.utc)
             blockers = environment.blockers()
-            if armed_until <= now or blockers:
-                code = "local_arm_expired" if armed_until <= now else blockers[0]
-                message = (
-                    "Одноразовое локальное разрешение истекло"
-                    if armed_until <= now
-                    else f"Одноразовое разрешение отозвано: {blockers[0]}"
-                )
+            if blockers:
+                code = blockers[0]
+                message = f"Одноразовое разрешение отозвано: {blockers[0]}"
                 return self._update(
                     decision.request_id,
                     state=CurrentTrialRequestState.WAITING_FOR_PERMISSION,
@@ -668,8 +657,6 @@ class CurrentTrialController:
         self,
         command_id: str,
         environment: CurrentTrialEnvironment,
-        *,
-        ttl: timedelta = REMOTE_ARM_TTL,
     ) -> CurrentTrialDecision:
         decision = self.get_by_command(command_id)
         if decision is None:
@@ -697,10 +684,6 @@ class CurrentTrialController:
                 "request_not_armable",
                 f"Запрос нельзя повторно разрешить из состояния {decision.state.value}",
             )
-        if ttl <= timedelta(0) or ttl > timedelta(minutes=5):
-            raise CurrentTrialControllerError(
-                "invalid_arm_ttl", "Разрешение должно действовать не больше пяти минут"
-            )
         state, code, message = self._decision_for(
             CurrentTrialRequestSource.INSTRUCTION,
             CurrentTrialRequestMode.HARDWARE,
@@ -708,7 +691,7 @@ class CurrentTrialController:
         )
         if state != CurrentTrialRequestState.READY:
             raise CurrentTrialControllerError(code, message)
-        armed_until = self.now_factory().astimezone(timezone.utc) + ttl
+        armed_at = self.now_factory().astimezone(timezone.utc)
         return self._update(
             decision.request_id,
             state=state,
@@ -716,7 +699,7 @@ class CurrentTrialController:
             message=message,
             environment=environment.to_dict(),
             result={
-                "armed_until": _iso(armed_until),
+                "armed_at": _iso(armed_at),
                 "arm_consumed": False,
             },
         )

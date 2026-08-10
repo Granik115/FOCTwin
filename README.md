@@ -21,8 +21,8 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The attended hardware build 0.4.2b3 makes the next current trial smaller and adds diagnostics for
-the two failures observed during the first home run:
+The attended hardware build 0.4.2b4 keeps the small diagnostic current trial and incorporates the
+evidence returned by the first remote run:
 
 - a separate **Инструкции** window that opens without a project, COM port or motor;
 - FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
@@ -37,15 +37,16 @@ the two failures observed during the first home run:
   `0.1 A` command ceiling and `2 V` working voltage;
 - before FOC Current is enabled, a direct-voltage `±0.01 V` preflight checks that Iq follows the
   commanded sign and that Id does not dominate; failure stops without entering the current PI;
-- firmware speed now participates in the current-trial stop path: a twofold excursion stops on the
-  first sample, while the existing angle-slope protection remains active;
+- firmware speed participates in the current-trial stop path, while a single coordinate packet
+  that resets to zero is held for one sample and must persist before its derived velocity can stop
+  the trial; real or persistent twofold excursions still stop immediately;
 - live plot history uses bounded constant-time buffers and renders a decimated window; the status
   reports UI processing lag so long telemetry sessions no longer degrade after 60,000 points;
 - each completed or failed current-trial ZIP is copied atomically into
   `outbox/artifacts/<command-id-or-local-trial>/`, ready for FolderBridge without a manual copy;
 - `run_current_trial` still only queues an immutable plan. A person must select that exact plan in
-  FOCTwin and arm it for two minutes; a separate `start_current_trial` consumes the permission once;
-- restart, permission expiry or changed hardware conditions revoke the arm, and
+  FOCTwin and arm it without a timer; a separate `start_current_trial` consumes the permission once;
+- restart or changed hardware conditions revoke the arm, and
   `cancel_current_trial` can also route an attended emergency stop for a running trial.
 
 The FolderBridge setup, exact JSON schema and home-test procedure are documented in

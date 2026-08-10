@@ -1,4 +1,4 @@
-"""Non-modal instruction window for the 0.4.2b3 attended hardware workflow."""
+"""Non-modal instruction window for the 0.4.2b4 attended hardware workflow."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -115,8 +116,9 @@ class InstructionRunnerDialog(QDialog):
 
         self.safety_label = QLabel(
             "АППАРАТНАЯ БЕТА: удалённый план сам по себе не включает PWM. Вы можете локально "
-            "разрешить только выбранный неизменяемый план на 2 минуты; отдельная команда START "
-            "использует разрешение один раз. Перезапуск или изменение условий его отменяет."
+            "разрешить только выбранный неизменяемый план без таймера; отдельная команда START "
+            "использует разрешение один раз. Перезапуск или изменение условий безопасности "
+            "его отменяет."
         )
         self.safety_label.setObjectName("danger")
         self.safety_label.setWordWrap(True)
@@ -205,7 +207,7 @@ class InstructionRunnerDialog(QDialog):
             self.sample_buttons.append(button)
         self.cancel_sample_button = QPushButton("Отменить выбранный ожидающий опыт")
         self.cancel_sample_button.clicked.connect(self._cancel_selected_request)
-        self.arm_sample_button = QPushButton("Разрешить выбранный план на 2 минуты")
+        self.arm_sample_button = QPushButton("Разрешить выбранный план")
         self.arm_sample_button.clicked.connect(self._arm_selected_request)
         self.start_sample_button = QPushButton("Создать START для разрешённого плана")
         self.start_sample_button.clicked.connect(self._start_selected_request)
@@ -426,32 +428,86 @@ class InstructionRunnerDialog(QDialog):
         if decision is None:
             QMessageBox.warning(self, "Разрешение", "Запрос не найден в контроллере")
             return
-        rendered_config = json.dumps(decision.config, ensure_ascii=False, indent=2)
-        answer = QMessageBox.warning(
-            self,
-            "Одноразовое разрешение аппаратного опыта",
-            "Будет разрешён только этот Command ID и только этот неизменяемый план на 2 минуты. "
-            "Само нажатие мотор не запускает; после него потребуется отдельная команда START.\n\n"
-            f"Command ID: {command_id}\n\n{rendered_config}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        if not self._confirm_current_trial_arm(command_id, decision.config):
             return
         environment = replace(
             self.current_trial_environment_factory(),
             local_permission=True,
         )
         try:
-            armed = self.current_trial_controller.arm_instruction(command_id, environment)
+            self.current_trial_controller.arm_instruction(command_id, environment)
         except CurrentTrialControllerError as exc:
             QMessageBox.warning(self, "Разрешение не выдано", str(exc))
             return
         self._append_log(
             "ARM",
-            f"одноразово разрешён {command_id} до {armed.result.get('armed_until')}",
+            f"одноразово разрешён {command_id} без таймера",
         )
         self._scan_now()
+
+    def _confirm_current_trial_arm(
+        self,
+        command_id: str,
+        config: dict[str, object],
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setObjectName("currentTrialArmDialog")
+        dialog.setWindowTitle("Одноразовое разрешение аппаратного опыта")
+        dialog.setModal(True)
+        dialog.setMinimumSize(520, 380)
+
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            dialog.resize(
+                min(720, max(520, available.width() - 80)),
+                min(540, max(380, available.height() - 80)),
+            )
+        else:
+            dialog.resize(720, 540)
+
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(
+            "Разрешается только указанный Command ID и только показанный неизменяемый план. "
+            "Разрешение не ограничено таймером, но используется ровно один раз отдельной "
+            "командой START. Закрытие FOCTwin или изменение условий безопасности его отменяет.\n\n"
+            f"Command ID: {command_id}"
+        )
+        summary.setWordWrap(True)
+        summary.setObjectName("danger")
+        layout.addWidget(summary)
+
+        details_label = QLabel("Полные параметры опыта:")
+        layout.addWidget(details_label)
+        details = QPlainTextEdit()
+        details.setObjectName("currentTrialArmDetails")
+        details.setReadOnly(True)
+        details.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        details.setPlainText(json.dumps(config, ensure_ascii=False, indent=2))
+        layout.addWidget(details, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.setObjectName("currentTrialArmButtons")
+        allow_button = buttons.button(QDialogButtonBox.StandardButton.Yes)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if allow_button is not None:
+            allow_button.setText("Разрешить план")
+            allow_button.setDefault(True)
+            allow_button.setAutoDefault(True)
+        if cancel_button is not None:
+            cancel_button.setText("Отмена")
+            cancel_button.setDefault(False)
+            cancel_button.setAutoDefault(False)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _start_selected_request(self, checked: bool = False) -> None:
         del checked
