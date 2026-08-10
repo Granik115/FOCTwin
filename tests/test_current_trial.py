@@ -44,6 +44,9 @@ class CurrentTrialConfigTests(unittest.TestCase):
         self.assertEqual(config.current_trip_limit_a, 0.5)
         self.assertEqual(config.current_voltage_limit_v, 2.0)
         self.assertEqual(config.current_sense_voltage_v, 0.01)
+        self.assertEqual(config.pwm_off_baseline_s, 0.3)
+        self.assertEqual(config.pwm_off_current_noise_limit_a, 0.05)
+        self.assertEqual(config.pwm_off_voltage_noise_limit_v, 0.01)
         self.assertEqual(config.absolute_current_limit_a, 5.0)
         self.assertEqual(config.absolute_voltage_limit_v, 24.0)
         self.assertEqual(config.absolute_angle_min_rad, -4.0)
@@ -60,6 +63,31 @@ class CurrentTrialConfigTests(unittest.TestCase):
 
         self.assertEqual(restored.transport_angle_pid, config.transport_angle_pid)
         self.assertEqual(restored.transport_velocity_pid, config.transport_velocity_pid)
+
+    def test_b5_low_voltage_plan_gets_independent_pwm_off_defaults(self):
+        payload = CurrentTrialConfig().to_dict()
+        for name in (
+            "pwm_off_baseline_s",
+            "pwm_off_current_noise_limit_a",
+            "pwm_off_voltage_noise_limit_v",
+        ):
+            payload.pop(name)
+        payload.update(
+            current_sense_voltage_v=0.001,
+            current_sense_voltage_limit_v=0.005,
+            current_sense_current_trip_a=0.25,
+            current_trip_limit_a=0.25,
+            absolute_current_limit_a=0.5,
+            current_voltage_limit_v=0.02,
+            absolute_voltage_limit_v=1.0,
+            transport_voltage_equivalent_v=0.05,
+            transport_voltage_limit_v=0.2,
+        )
+
+        restored = CurrentTrialConfig.from_dict(payload)
+
+        self.assertEqual(restored.pwm_off_current_noise_limit_a, 0.05)
+        self.assertEqual(restored.pwm_off_voltage_noise_limit_v, 0.01)
 
 
 class CurrentTrialExperimentTests(unittest.TestCase):
@@ -87,6 +115,13 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.experiment.tick(finish)
         return finish
 
+    def advance_pwm_off(self, start_s: float) -> float:
+        for index in range(12):
+            timestamp = start_s + 0.03 * (index + 1)
+            self.add(sample(timestamp, angle_rad=0.0))
+        finish = start_s + 0.36
+        return finish
+
     def advance_current_sense(self, start_s: float) -> float:
         self.experiment.current_sense_configuration_applied(start_s)
         phase_values = (
@@ -112,9 +147,14 @@ class CurrentTrialExperimentTests(unittest.TestCase):
 
     def test_uninterrupted_trial_runs_full_safe_lifecycle_and_builds_metrics(self):
         actions = self.experiment.start(0.0)
+        self.assertEqual(actions[0].kind, "checkpoint")
+
+        now = self.advance_pwm_off(0.0)
+        actions = self.experiment.tick(now)
+        self.assertEqual(self.experiment.phase, CurrentTrialPhase.CONFIGURING_POSITION)
         self.assertEqual(actions[0].kind, "configure_position")
 
-        now = self.advance_position(0.0)
+        now = self.advance_position(now)
         self.assertEqual(
             self.experiment.phase,
             CurrentTrialPhase.CONFIGURING_CURRENT_SENSE,
@@ -162,8 +202,58 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertTrue(result["metrics"]["current_response_observed"])
         self.assertAlmostEqual(result["metrics"]["steady_current_q_a"], 0.01)
+        self.assertTrue(result["pwm_off_diagnostic"]["valid"])
         self.assertTrue(result["current_sense_diagnostic"]["valid"])
         self.assertEqual(result["telemetry"]["interruption_count"], 0)
+
+    def test_trial_63_pwm_off_noise_is_reported_without_enabling_pwm(self):
+        self.experiment = CurrentTrialExperiment(
+            CurrentTrialConfig(
+                current_sense_current_trip_a=0.25,
+                current_trip_limit_a=0.25,
+                absolute_current_limit_a=0.5,
+                pwm_off_current_noise_limit_a=0.05,
+            ),
+            0.0588,
+        )
+        self.experiment.seed_angle(0.0588)
+        actions = self.experiment.start(0.0)
+        self.assertEqual(actions[0].kind, "checkpoint")
+        trial_63_currents = (
+            (0.6548, -0.1797),
+            (0.2722, 0.8417),
+            (0.1446, 0.1080),
+            (0.1021, 0.2216),
+            (0.3979, 0.4384),
+            (0.1865, -0.0265),
+            (0.1160, -0.1813),
+            (-0.2176, -0.0539),
+            (-0.0187, 0.1676),
+            (-0.5725, -0.8327),
+        )
+        for index, (current_q, current_d) in enumerate(trial_63_currents):
+            violation, _ = self.add(
+                sample(
+                    0.02 * (index + 1),
+                    angle_rad=0.0588,
+                    current_q_a=current_q,
+                    current_d_a=current_d,
+                )
+            )
+            self.assertIsNone(violation)
+
+        actions = self.experiment.tick(0.31)
+        result = self.experiment.result("failed", error=self.experiment.abort_reason)
+
+        self.assertEqual(self.experiment.phase, CurrentTrialPhase.ABORTED)
+        self.assertEqual(actions[0].kind, "safe_stop")
+        self.assertIn("PWM не включён", self.experiment.abort_reason)
+        self.assertIn("1.01052 А", self.experiment.abort_reason)
+        self.assertFalse(result["pwm_off_diagnostic"]["valid"])
+        self.assertAlmostEqual(
+            result["pwm_off_diagnostic"]["peak_full_current_a"],
+            1.0105174615,
+        )
 
     def test_two_confirmed_overcurrent_samples_abort_current_phase(self):
         self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
@@ -264,8 +354,8 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.assertEqual(self.experiment.invalid_attempts[0]["phase"], "current_step")
 
         resumed = self.experiment.resume_after_recovery(5.0)
-        self.assertEqual(self.experiment.phase, CurrentTrialPhase.CONFIGURING_POSITION)
-        self.assertEqual(resumed[0].kind, "configure_position")
+        self.assertEqual(self.experiment.phase, CurrentTrialPhase.PWM_OFF_BASELINE)
+        self.assertEqual(resumed[0].kind, "checkpoint")
 
     def test_checkpoint_restores_only_evidence_and_restarts_from_safe_positioning(self):
         self.experiment.phase = CurrentTrialPhase.CURRENT_STEP
@@ -280,8 +370,8 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.assertEqual(restored.interruption_count, 1)
         self.assertEqual(restored.recovery_attempts, 1)
         self.assertEqual(restored.total_sample_count, 1)
-        self.assertEqual(restored.phase, CurrentTrialPhase.CONFIGURING_POSITION)
-        self.assertEqual(actions[0].kind, "configure_position")
+        self.assertEqual(restored.phase, CurrentTrialPhase.PWM_OFF_BASELINE)
+        self.assertEqual(actions[0].kind, "checkpoint")
 
     def test_pre_b3_checkpoint_is_rejected_instead_of_restoring_old_gains(self):
         payload = self.experiment.checkpoint_payload(17)

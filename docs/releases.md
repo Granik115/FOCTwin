@@ -19,6 +19,16 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b6
+
+- Add a `0.3 s` passive current-sense baseline before the first motor configuration command.
+- Record Iq/Id during PWM OFF as diagnostic sensor data without mistaking it for proven physical
+  current. A peak full-current signal above `0.05 A` or non-zero Uq/Ud fails before PWM enable.
+- Export passive axis statistics, full-current RMS/peak, full-voltage peak and explicit problems in
+  the result JSON and UI report.
+- Add a regression using all ten raw trial-63 samples and verify the `1.01052 A` signal stops the
+  new state machine without ever requesting transport or PWM.
+
 ## 0.4.2b5
 
 - Preserve SimpleFOC monitor Q/D currents in their native ampere units instead of dividing them by

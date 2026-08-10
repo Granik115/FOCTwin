@@ -2949,7 +2949,7 @@ class MainWindow(QMainWindow):
     def _real_tuning_page(self) -> QWidget:
         page, layout = titled_page(
             "Доводка на реальном моторе",
-            "FOCTwin 0.4.2b5: штатные амперы SimpleFOC и малый токовый шаг.",
+            "FOCTwin 0.4.2b6: пассивная проверка current-sense до включения PWM.",
         )
         warning = QLabel(
             "Можно физически отключить питание. FOCTwin сохранит checkpoint, будет подавать "
@@ -3242,8 +3242,10 @@ class MainWindow(QMainWindow):
             dialog.setMinimumWidth(650)
             dialog_layout = QVBoxLayout(dialog)
             confirmation = QLabel(
-            "FOCTwin зафиксирует текущую координату, включит проверенный "
-            "Angle + Voltage, проверит current-sense на ±"
+            "FOCTwin сначала при выключенном PWM запишет пассивный baseline "
+            "current-sense. При шумном Iq/Id опыт закончится без включения силовой части. "
+            "Только после чистой пассивной проверки программа зафиксирует текущую "
+            "координату, включит проверенный Angle + Voltage и проверит current-sense на ±"
             f"{config.current_sense_voltage_v:g} В без PI, затем с нулевой целью "
             "переключится на FOC Current и "
             f"подаст одну ступень {config.step_current_a:g} А на {config.step_s:g} с.\n\n"
@@ -3719,6 +3721,7 @@ class MainWindow(QMainWindow):
         if experiment is None:
             return
         phase_names = {
+            CurrentTrialPhase.PWM_OFF_BASELINE: "current-sense: пассивный PWM OFF",
             CurrentTrialPhase.CONFIGURING_POSITION: "настройка транспортного режима",
             CurrentTrialPhase.POSITIONING: "выход в исходную координату",
             CurrentTrialPhase.POSITION_SETTLING: "проверка остановки",
@@ -3736,11 +3739,12 @@ class MainWindow(QMainWindow):
             CurrentTrialPhase.RETURN_SETTLING: "проверка остановки после возврата",
             CurrentTrialPhase.RECOVERING: "восстановление после обрыва",
         }
-        target_text = (
-            f"цель Uq {experiment.current_sense_voltage_target:g} В"
-            if experiment.phase in experiment.CURRENT_SENSE_PHASES
-            else f"цель {experiment.current_target:g} А"
-        )
+        if experiment.phase == CurrentTrialPhase.PWM_OFF_BASELINE:
+            target_text = "PWM OFF; силовых команд нет"
+        elif experiment.phase in experiment.CURRENT_SENSE_PHASES:
+            target_text = f"цель Uq {experiment.current_sense_voltage_target:g} В"
+        else:
+            target_text = f"цель {experiment.current_target:g} А"
         self.current_trial_status_label.setText(
             f"{phase_names.get(experiment.phase, experiment.phase.value)} · "
             f"{max(0.0, now - experiment.phase_started_s):.1f} с · "
@@ -3964,6 +3968,15 @@ class MainWindow(QMainWindow):
                 f"отброшенные углы: {telemetry.get('rejected_angle_samples', 0)}."
             )
         current_sense = result.get("current_sense_diagnostic")
+        pwm_off = result.get("pwm_off_diagnostic")
+        if isinstance(pwm_off, dict):
+            report_lines.append(
+                "Пассивная проверка PWM OFF: "
+                f"{'пройдена' if pwm_off.get('valid') else 'не пройдена'}; "
+                f"пик |Iqd|={number(pwm_off.get('peak_full_current_a'), ' А')}; "
+                f"RMS |Iqd|={number(pwm_off.get('rms_full_current_a'), ' А')}; "
+                f"пик |Uqd|={number(pwm_off.get('peak_full_voltage_v'), ' В')}."
+            )
         if isinstance(current_sense, dict):
             report_lines.append(
                 "Проверка current-sense: "

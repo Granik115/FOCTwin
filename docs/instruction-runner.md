@@ -1,10 +1,13 @@
-# FOCTwin Instruction Runner 0.4.2b5
+# FOCTwin Instruction Runner 0.4.2b6
 
 This beta connects the instruction channel to the same durable current-trial admission controller
 used by the local button. It can validate and simulate a current trial or preserve an immutable
 hardware plan. A hardware plan can run only after a person locally arms that exact Command ID and
 a separate `start_current_trial` consumes the permission once. The local arm has no timer but is
 revoked by restart or any changed safety prerequisite.
+
+The attended executor first records a passive PWM-off current-sense baseline. Invalid Iq/Id or
+non-zero Uq/Ud ends the request before the transport controller or PWM can be enabled.
 
 The existing `Связь с GPT` Drive chat remains available for comparison. The new `Инструкции`
 window does not use Google Drive directly; FolderBridge is the transport.

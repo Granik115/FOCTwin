@@ -29,7 +29,7 @@ that would weaken every host-side current limit by the same factor.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Shared instruction admission (0.4.2b5)
+## Shared instruction admission (0.4.2b6)
 
 Receiving a remote hardware instruction still cannot issue a motor command. The runner lives in a
 separate module with no imports from Serial, Commander, friction or current-trial code. A narrow
@@ -56,9 +56,14 @@ The `dry_run` capability reports `simulate_or_wait_for_one_shot_local_arm` but n
 nested command. Cancellation of a running trial reaches only the existing attended executor's
 best-effort emergency stop callback.
 
-## Guarded current trial (0.4.2b5)
+## Guarded current trial (0.4.2b6)
 
-The first direct-tuning release captures the current coordinate only when it is inside `±3 rad`.
+Every b6 attempt first records at least ten complete samples over `0.3 s` while admission still
+reports PWM disabled. Current values are retained as sensor evidence but are not interpreted as
+physical phase current in this unpowered phase. A full-current signal above `0.05 A` or a non-zero
+Uq/Ud signal fails the attempt and exports the evidence before any transport command or PWM enable.
+
+The direct-tuning workflow captures the current coordinate only when it is inside `±3 rad`.
 The return controller uses the already loaded angle and velocity PID values in
 `Angle + Voltage`, limited to the equivalent of `3 V` Uq and `0.2 rad/s`. PWM is disabled before
 the program writes `FOC Current`, Q/D PI values, limits or a neutral target.

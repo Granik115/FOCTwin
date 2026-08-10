@@ -21,8 +21,9 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The attended hardware build 0.4.2b5 keeps the small diagnostic current trial and corrects the
-current-unit contract exposed by remote trial 61:
+The attended hardware build 0.4.2b6 keeps the small diagnostic current trial, corrects the
+current-unit contract exposed by remote trial 61 and classifies the trial-63 PWM-off noise before
+any power-stage command:
 
 - a separate **Инструкции** window that opens without a project, COM port or motor;
 - FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
@@ -37,6 +38,9 @@ current-unit contract exposed by remote trial 61:
   `0.1 A` command ceiling and `2 V` working voltage;
 - before FOC Current is enabled, a direct-voltage `±0.01 V` preflight checks that Iq follows the
   commanded sign and that Id does not dominate; failure stops without entering the current PI;
+- every attempt begins with a `0.3 s` passive PWM-off baseline. Iq/Id are recorded as a sensor
+  signal, not mistaken for physical current; a peak above `0.05 A` or non-zero Uq/Ud stops the
+  attempt before transport configuration or PWM enable;
 - SimpleFOC monitor currents are handled in their native ampere units; the real trial-61 packet
   `Iq=-5.8088`, `Id=-29.9526` now reaches the emergency guard without a `/1000` rescale;
 - firmware speed participates in the current-trial stop path, while a single coordinate packet

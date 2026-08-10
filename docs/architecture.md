@@ -31,11 +31,11 @@ checkpoint or accepted parameter set.
 
 ### Experiment orchestrator
 
-The direct-tuning workspace has a separate guarded current-trial state machine. It owns transport,
-a low-voltage current-sense preflight, PWM-off reconfiguration, neutral baseline, current step,
-post-step zero, return, recovery, complete and aborted phases. Its checkpoint rule is intentionally
-simple: after any interruption, discard the partial in-memory measurement and repeat the whole
-physical trial.
+The direct-tuning workspace has a separate guarded current-trial state machine. It owns a passive
+PWM-off sensor baseline, transport, a low-voltage current-sense preflight, PWM-off reconfiguration,
+neutral baseline, current step, post-step zero, return, recovery, complete and aborted phases. Its
+checkpoint rule is intentionally simple: after any interruption, discard the partial in-memory
+measurement and repeat the whole physical trial from the passive baseline.
 
 The identification state machine remains the two-stage actuator/friction experiment. It has explicit
 baseline, direct-Uq pulse, pulse pause, velocity reconfiguration, zero, settling, measuring,
@@ -69,7 +69,7 @@ accepts one immutable JSON file per command and writes one immutable JSON file p
 SQLite journal is outside the synchronized tree and stores UUID/content-hash deduplication,
 command state and event payloads across process or power interruption.
 
-In 0.4.2b5 schema 1 exposes `run_current_trial`, `start_current_trial` and
+In 0.4.2b6 schema 1 exposes `run_current_trial`, `start_current_trial` and
 `cancel_current_trial`. The instruction
 backend still imports neither Qt nor Serial, Commander, friction or current-trial modules. It has
 no generic dispatch, interpreter, shell or executable-launch path. A narrow callback reaches a

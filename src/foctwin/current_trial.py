@@ -11,12 +11,13 @@ from typing import Any
 from foctwin.domain import TelemetrySample
 
 CURRENT_TRIAL_MONITOR_MASK = "1111111"
-CURRENT_TRIAL_CHECKPOINT_SCHEMA = 2
-CURRENT_TRIAL_RESULT_SCHEMA = 2
+CURRENT_TRIAL_CHECKPOINT_SCHEMA = 3
+CURRENT_TRIAL_RESULT_SCHEMA = 3
 
 
 class CurrentTrialPhase(str, Enum):
     IDLE = "idle"
+    PWM_OFF_BASELINE = "pwm_off_baseline"
     CONFIGURING_POSITION = "configuring_position"
     POSITIONING = "positioning"
     POSITION_SETTLING = "position_settling"
@@ -69,6 +70,9 @@ class CurrentTrialConfig:
     current_sense_current_trip_a: float = 0.1
     current_sense_phase_s: float = 0.3
     current_sense_min_response_a: float = 0.002
+    pwm_off_baseline_s: float = 0.3
+    pwm_off_current_noise_limit_a: float = 0.05
+    pwm_off_voltage_noise_limit_v: float = 0.01
     baseline_s: float = 1.0
     step_s: float = 2.0
     post_s: float = 1.0
@@ -132,6 +136,26 @@ class CurrentTrialConfig:
             raise ValueError("Фаза диагностики датчика тока должна длиться от 0,2 до 2 с")
         if not 0 < self.current_sense_min_response_a <= self.current_sense_current_trip_a:
             raise ValueError("Порог отклика диагностики датчика тока некорректен")
+        if not 0.2 <= self.pwm_off_baseline_s <= 2.0:
+            raise ValueError("Пассивная фаза PWM OFF должна длиться от 0,2 до 2 с")
+        if not (
+            0
+            < self.pwm_off_current_noise_limit_a
+            <= self.absolute_current_limit_a
+        ):
+            raise ValueError(
+                "Предел шума тока при PWM OFF должен быть положительным и не выше "
+                "абсолютного предела"
+            )
+        if not (
+            0
+            < self.pwm_off_voltage_noise_limit_v
+            <= self.absolute_voltage_limit_v
+        ):
+            raise ValueError(
+                "Предел напряжения при PWM OFF должен быть положительным и не выше "
+                "абсолютного предела"
+            )
         if not (
             0
             < self.transport_voltage_equivalent_v
@@ -201,6 +225,7 @@ class CurrentTrialConfig:
         return (
             command_overhead_s
             + 2.0 * (self.position_settle_s + min(2.0, self.position_timeout_s))
+            + self.pwm_off_baseline_s
             + 4.0 * self.current_sense_phase_s
             + self.baseline_s
             + self.step_s
@@ -247,6 +272,25 @@ def _rms(values: list[float]) -> float | None:
 
 def _peak_abs(values: list[float]) -> float | None:
     return max((abs(value) for value in values), default=None)
+
+
+def _vector_magnitudes(
+    samples: list[TelemetrySample],
+    first_name: str,
+    second_name: str,
+) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        first = getattr(sample, first_name)
+        second = getattr(sample, second_name)
+        if (
+            first is not None
+            and second is not None
+            and math.isfinite(first)
+            and math.isfinite(second)
+        ):
+            values.append(math.hypot(float(first), float(second)))
+    return values
 
 
 def _sample_rate_hz(samples: list[TelemetrySample]) -> float | None:
@@ -363,6 +407,7 @@ class CurrentTrialExperiment:
         self.baseline_samples: list[TelemetrySample] = []
         self.step_samples: list[TelemetrySample] = []
         self.post_samples: list[TelemetrySample] = []
+        self.pwm_off_baseline_samples: list[TelemetrySample] = []
         self.current_sense_baseline_samples: list[TelemetrySample] = []
         self.current_sense_positive_samples: list[TelemetrySample] = []
         self.current_sense_zero_samples: list[TelemetrySample] = []
@@ -506,16 +551,14 @@ class CurrentTrialExperiment:
     def start(self, now_s: float) -> list[CurrentTrialAction]:
         if self.phase != CurrentTrialPhase.IDLE:
             raise RuntimeError("Токовый опыт уже запущен")
-        self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+        self.phase = CurrentTrialPhase.PWM_OFF_BASELINE
         self.phase_started_s = now_s
         self._event(
             "start",
-            f"Начальная координата зафиксирована: {self.start_angle_rad:.6g} рад",
+            f"PWM выключен; начата пассивная проверка current-sense в координате "
+            f"{self.start_angle_rad:.6g} рад",
         )
-        return [
-            CurrentTrialAction("configure_position"),
-            CurrentTrialAction("checkpoint"),
-        ]
+        return [CurrentTrialAction("checkpoint")]
 
     def position_configuration_applied(
         self,
@@ -598,7 +641,9 @@ class CurrentTrialExperiment:
         violation = self._violation(sample)
         if violation:
             return violation, []
-        if self.phase == CurrentTrialPhase.CURRENT_BASELINE:
+        if self.phase == CurrentTrialPhase.PWM_OFF_BASELINE:
+            self.pwm_off_baseline_samples.append(sample)
+        elif self.phase == CurrentTrialPhase.CURRENT_BASELINE:
             self.baseline_samples.append(sample)
         elif self.phase == CurrentTrialPhase.CURRENT_STEP:
             self.step_samples.append(sample)
@@ -616,7 +661,40 @@ class CurrentTrialExperiment:
 
     def tick(self, now_s: float) -> list[CurrentTrialAction]:
         elapsed = now_s - self.phase_started_s
-        if self.phase in {CurrentTrialPhase.POSITIONING, CurrentTrialPhase.RETURNING}:
+        if self.phase == CurrentTrialPhase.PWM_OFF_BASELINE:
+            if self._phase_ready(
+                elapsed,
+                self.config.pwm_off_baseline_s,
+                self.pwm_off_baseline_samples,
+            ):
+                diagnostic = self.pwm_off_diagnostic()
+                if not diagnostic["valid"]:
+                    problems = "; ".join(str(item) for item in diagnostic["problems"])
+                    return self.abort(
+                        "Пассивная проверка current-sense при PWM OFF не пройдена; "
+                        "PWM не включён: "
+                        + problems
+                    )
+                self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+                self.phase_started_s = now_s
+                self._event(
+                    "pwm_off_baseline_passed",
+                    "Пассивный сигнал current-sense достаточно тихий; разрешена "
+                    "настройка транспортного режима",
+                )
+                return [
+                    CurrentTrialAction("configure_position"),
+                    CurrentTrialAction("checkpoint"),
+                ]
+            if self._phase_data_timeout(
+                elapsed,
+                self.config.pwm_off_baseline_s,
+                self.pwm_off_baseline_samples,
+            ):
+                return self.abort(
+                    "Недостаточно пассивной телеметрии current-sense при PWM OFF"
+                )
+        elif self.phase in {CurrentTrialPhase.POSITIONING, CurrentTrialPhase.RETURNING}:
             if elapsed >= self.config.position_timeout_s:
                 return self.abort("Транспортный позиционный режим не достиг цели до таймаута")
             if self._position_in_tolerance():
@@ -829,6 +907,7 @@ class CurrentTrialExperiment:
         self.baseline_samples.clear()
         self.step_samples.clear()
         self.post_samples.clear()
+        self.pwm_off_baseline_samples.clear()
         self.current_sense_baseline_samples.clear()
         self.current_sense_positive_samples.clear()
         self.current_sense_zero_samples.clear()
@@ -846,16 +925,14 @@ class CurrentTrialExperiment:
     def resume_after_recovery(self, now_s: float) -> list[CurrentTrialAction]:
         if self.phase != CurrentTrialPhase.RECOVERING:
             return []
-        self.phase = CurrentTrialPhase.CONFIGURING_POSITION
+        self.phase = CurrentTrialPhase.PWM_OFF_BASELINE
         self.phase_started_s = now_s
         self._event(
             "recovery",
-            "Связь восстановлена; весь незавершённый токовый опыт начинается заново",
+            "Связь восстановлена; весь незавершённый токовый опыт начинается заново "
+            "с пассивной проверки PWM OFF",
         )
-        return [
-            CurrentTrialAction("configure_position"),
-            CurrentTrialAction("checkpoint"),
-        ]
+        return [CurrentTrialAction("checkpoint")]
 
     def abort(self, reason: str) -> list[CurrentTrialAction]:
         self.abort_reason = reason
@@ -912,7 +989,11 @@ class CurrentTrialExperiment:
                 )
         iq = sample.current_q_a
         id_ = sample.current_d_a
-        if iq is not None and id_ is not None:
+        if (
+            self.phase != CurrentTrialPhase.PWM_OFF_BASELINE
+            and iq is not None
+            and id_ is not None
+        ):
             current = math.hypot(iq, id_)
             if current > self.config.absolute_current_limit_a * 2.0:
                 return f"Резкий выброс полного тока {current:.6g} А"
@@ -1000,6 +1081,61 @@ class CurrentTrialExperiment:
                     f"{self.config.velocity_trip_limit_rad_s:g} рад/с"
                 )
         return None
+
+    def pwm_off_diagnostic(self) -> dict[str, Any]:
+        samples = self.pwm_off_baseline_samples
+        stage = _stage_statistics(samples)
+        full_currents = _vector_magnitudes(
+            samples,
+            "current_q_a",
+            "current_d_a",
+        )
+        full_voltages = _vector_magnitudes(
+            samples,
+            "voltage_q_v",
+            "voltage_d_v",
+        )
+        peak_current = max(full_currents, default=None)
+        peak_voltage = max(full_voltages, default=None)
+        enough_data = (
+            len(samples) >= self.config.minimum_phase_samples
+            and len(full_currents) >= self.config.minimum_phase_samples
+            and len(full_voltages) >= self.config.minimum_phase_samples
+        )
+        current_quiet = bool(
+            peak_current is not None
+            and peak_current <= self.config.pwm_off_current_noise_limit_a
+        )
+        voltage_quiet = bool(
+            peak_voltage is not None
+            and peak_voltage <= self.config.pwm_off_voltage_noise_limit_v
+        )
+        problems: list[str] = []
+        if not enough_data:
+            problems.append("недостаточно полных пассивных отсчётов")
+        if not current_quiet:
+            value = "нет данных" if peak_current is None else f"{peak_current:.6g} А"
+            problems.append(
+                f"пик сигнала полного тока {value} выше допустимого шума "
+                f"{self.config.pwm_off_current_noise_limit_a:g} А"
+            )
+        if not voltage_quiet:
+            value = "нет данных" if peak_voltage is None else f"{peak_voltage:.6g} В"
+            problems.append(
+                f"пик телеметрического напряжения {value} выше нулевого предела "
+                f"{self.config.pwm_off_voltage_noise_limit_v:g} В"
+            )
+        return {
+            "valid": enough_data and current_quiet and voltage_quiet,
+            "pwm_enabled": False,
+            "current_noise_limit_a": self.config.pwm_off_current_noise_limit_a,
+            "voltage_noise_limit_v": self.config.pwm_off_voltage_noise_limit_v,
+            "peak_full_current_a": peak_current,
+            "rms_full_current_a": _rms(full_currents),
+            "peak_full_voltage_v": peak_voltage,
+            "problems": problems,
+            "stage": stage,
+        }
 
     def current_sense_diagnostic(self) -> dict[str, Any]:
         stages = {
@@ -1123,6 +1259,7 @@ class CurrentTrialExperiment:
         return experiment
 
     def result(self, status: str, *, error: str = "") -> dict[str, Any]:
+        pwm_off = self.pwm_off_diagnostic()
         baseline = _stage_statistics(self.baseline_samples)
         step = _stage_statistics(self.step_samples)
         post = _stage_statistics(self.post_samples)
@@ -1162,6 +1299,7 @@ class CurrentTrialExperiment:
         current_sense = self.current_sense_diagnostic()
         valid = (
             status == "completed"
+            and bool(pwm_off["valid"])
             and bool(current_sense["valid"])
             and enough_data
             and current_response_observed
@@ -1188,6 +1326,7 @@ class CurrentTrialExperiment:
             "valid": valid,
             "config": self.config.to_dict(),
             "start_angle_rad": self.start_angle_rad,
+            "pwm_off_diagnostic": pwm_off,
             "stages": {
                 "baseline": baseline,
                 "step": step,
