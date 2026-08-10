@@ -1,6 +1,6 @@
 # FOCTwin Drive Bridge 0.4.1b1
 
-FOCTwin 0.4.2b4 preserves this chat-only direct Drive bridge unchanged. Executable diagnostic
+FOCTwin 0.4.2b5 preserves this chat-only direct Drive bridge unchanged. Executable diagnostic
 instructions use the separate FolderBridge-backed local protocol documented in
 [`instruction-runner.md`](instruction-runner.md); command records placed in this legacy chat
 inbox continue to be ignored.

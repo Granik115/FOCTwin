@@ -14,8 +14,9 @@
 - For the guarded current trial, repeat the entire unfinished attempt after any telemetry or
   connection interruption instead of joining measurements across an unknown PWM interval.
 
-Streamed SimpleFOC current values are expressed in mA by the bundled firmware. FOCTwin
-normalizes them to A before applying thresholds or calculating torque.
+SimpleFOC streams `current.q` and `current.d` in amperes. FOCTwin preserves those native units
+when applying thresholds and calculating torque. It must never divide monitor currents by 1000:
+that would weaken every host-side current limit by the same factor.
 
 ## What FOCTwin cannot guarantee with the current firmware
 
@@ -28,7 +29,7 @@ normalizes them to A before applying thresholds or calculating torque.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Shared instruction admission (0.4.2b4)
+## Shared instruction admission (0.4.2b5)
 
 Receiving a remote hardware instruction still cannot issue a motor command. The runner lives in a
 separate module with no imports from Serial, Commander, friction or current-trial code. A narrow
@@ -55,7 +56,7 @@ The `dry_run` capability reports `simulate_or_wait_for_one_shot_local_arm` but n
 nested command. Cancellation of a running trial reaches only the existing attended executor's
 best-effort emergency stop callback.
 
-## Guarded current trial (0.4.2b4)
+## Guarded current trial (0.4.2b5)
 
 The first direct-tuning release captures the current coordinate only when it is inside `±3 rad`.
 The return controller uses the already loaded angle and velocity PID values in

@@ -21,8 +21,8 @@ identification, tuning, analysis, project history and detailed logs live in sepa
 
 ## Current milestone
 
-The attended hardware build 0.4.2b4 keeps the small diagnostic current trial and incorporates the
-evidence returned by the first remote run:
+The attended hardware build 0.4.2b5 keeps the small diagnostic current trial and corrects the
+current-unit contract exposed by remote trial 61:
 
 - a separate **Инструкции** window that opens without a project, COM port or motor;
 - FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
@@ -37,6 +37,8 @@ evidence returned by the first remote run:
   `0.1 A` command ceiling and `2 V` working voltage;
 - before FOC Current is enabled, a direct-voltage `±0.01 V` preflight checks that Iq follows the
   commanded sign and that Id does not dominate; failure stops without entering the current PI;
+- SimpleFOC monitor currents are handled in their native ampere units; the real trial-61 packet
+  `Iq=-5.8088`, `Id=-29.9526` now reaches the emergency guard without a `/1000` rescale;
 - firmware speed participates in the current-trial stop path, while a single coordinate packet
   that resets to zero is held for one sample and must persist before its derived velocity can stop
   the trial; real or persistent twofold excursions still stop immediately;
@@ -91,7 +93,7 @@ The preserved 0.4.0 milestone contains:
   emergency stop;
 - verified read/apply controls for the linked device limits and every firmware PID/LPF loop;
 - fragmentation-safe monitoring with staged stream recovery, rejection/counters for damaged USB
-  rows, stable live plots, correct mA-to-A conversion, live rate/jitter and non-blocking durable
+  rows, stable live plots, native ampere current values, live rate/jitter and non-blocking durable
   CSV recording;
 - safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
 - persistent manual-control values and one paced action for limits, PID/LPF, modes, target and

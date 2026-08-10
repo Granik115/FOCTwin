@@ -1,4 +1,4 @@
-"""Non-modal instruction window for the 0.4.2b4 attended hardware workflow."""
+"""Non-modal instruction window for the 0.4.2b5 attended hardware workflow."""
 
 from __future__ import annotations
 

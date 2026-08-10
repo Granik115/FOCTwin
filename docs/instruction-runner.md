@@ -1,4 +1,4 @@
-# FOCTwin Instruction Runner 0.4.2b4
+# FOCTwin Instruction Runner 0.4.2b5
 
 This beta connects the instruction channel to the same durable current-trial admission controller
 used by the local button. It can validate and simulate a current trial or preserve an immutable

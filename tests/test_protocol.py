@@ -1,6 +1,6 @@
 import unittest
 
-from foctwin.domain import MotionMode, TorqueMode
+from foctwin.domain import MotionMode, SafetyGuard, SafetyLimits, TelemetrySample, TorqueMode
 from foctwin.protocol import (
     CommanderProtocol,
     is_monitor_candidate,
@@ -31,24 +31,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(protocol.pid("velocity", "lpf", 0.01), "AVF0.01")
         self.assertEqual(protocol.monitor_clear(), "AMC")
 
-    def test_monitor_parser_normalizes_streamed_milliamps(self):
+    def test_monitor_parser_preserves_streamed_amperes(self):
         parsed = parse_monitor_line(
-            "1.0000\t2.0000\t3.0000\t400.0000\t-50.0000\t6.0000\t7.0000"
+            "0.0588\t-0.5818\t0.0017\t-5.8088\t-29.9526\t0.0958\t0.0587"
         )
         self.assertEqual(parsed, {
-            "target": 1.0,
-            "voltage_q_v": 2.0,
-            "voltage_d_v": 3.0,
-            "current_q_a": 0.4,
-            "current_d_a": -0.05,
-            "velocity_rad_s": 6.0,
-            "angle_rad": 7.0,
+            "target": 0.0588,
+            "voltage_q_v": -0.5818,
+            "voltage_d_v": 0.0017,
+            "current_q_a": -5.8088,
+            "current_d_a": -29.9526,
+            "velocity_rad_s": 0.0958,
+            "angle_rad": 0.0587,
         })
         self.assertIsNone(parse_monitor_line("Status: enabled"))
 
+    def test_trial_61_current_packet_reaches_emergency_guard_without_rescaling(self):
+        parsed = parse_monitor_line(
+            "0.0588\t-0.5818\t0.0017\t-5.8088\t-29.9526\t0.0958\t0.0587"
+        )
+        sample = TelemetrySample(timestamp_s=0.0, **parsed)
+
+        violations = SafetyGuard(SafetyLimits(current_a=0.1)).check(sample)
+
+        self.assertEqual(
+            {violation.signal for violation in violations},
+            {"current_q_a", "current_d_a"},
+        )
+
     def test_monitor_parser_supports_selected_variables(self):
         self.assertEqual(
-            parse_monitor_line("1.0000\t250.0000\t0.5000", "1001010"),
+            parse_monitor_line("1.0000\t0.2500\t0.5000", "1001010"),
             {"target": 1.0, "current_q_a": 0.25, "velocity_rad_s": 0.5},
         )
 

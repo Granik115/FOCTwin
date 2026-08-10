@@ -19,6 +19,16 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b5
+
+- Preserve SimpleFOC monitor Q/D currents in their native ampere units instead of dividing them by
+  1000. The old conversion weakened all host-side measured-current protection by three orders of
+  magnitude.
+- Add a regression test for the exact trial-61 packet (`Iq=-5.8088 A`, `Id=-29.9526 A`) and prove
+  that both values reach the immediate emergency guard.
+- Keep remote hardware execution disabled until the corrected build is installed and a fresh
+  PWM-off baseline establishes whether the board current-sense itself is usable.
+
 ## 0.4.2b4
 
 - Keep an exact locally approved remote plan armed without a timer. The permission remains

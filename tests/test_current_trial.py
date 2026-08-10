@@ -183,6 +183,24 @@ class CurrentTrialExperimentTests(unittest.TestCase):
 
         self.assertIn("Резкий выброс полного тока", violation)
 
+    def test_trial_61_current_transient_stops_transport_on_first_sample(self):
+        self.experiment.seed_angle(0.0588)
+        self.experiment.phase = CurrentTrialPhase.POSITIONING
+
+        violation, _ = self.add(
+            sample(
+                0.1,
+                angle_rad=0.0587,
+                current_q_a=-5.8088,
+                current_d_a=-29.9526,
+                voltage_q_v=-0.5818,
+                voltage_d_v=0.0017,
+                velocity_rad_s=0.0958,
+            )
+        )
+
+        self.assertIn("Резкий выброс полного тока", violation)
+
     def test_firmware_velocity_twofold_excursion_stops_on_first_sample(self):
         self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
         self.experiment.current_configuration_applied(0.0)
