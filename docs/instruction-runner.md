@@ -1,8 +1,9 @@
-# FOCTwin Instruction Runner 0.4.2b2
+# FOCTwin Instruction Runner 0.4.2b3
 
 This beta connects the instruction channel to the same durable current-trial admission controller
-used by the local button. It can validate and simulate a current trial, or preserve a hardware
-request in a safe waiting state. Remote PWM execution remains disabled in code.
+used by the local button. It can validate and simulate a current trial or preserve an immutable
+hardware plan. A hardware plan can run only after a person locally arms that exact Command ID for
+two minutes and a separate `start_current_trial` consumes the permission once.
 
 The existing `Связь с GPT` Drive chat remains available for comparison. The new `Инструкции`
 window does not use Google Drive directly; FolderBridge is the transport.
@@ -37,9 +38,13 @@ command UUID and SHA-256, so `Копирование` cannot execute the same co
 The first launch defaults to the user's Documents folder. Press `Выбрать папку обмена…` if the
 FolderBridge job uses `C:\AutotunerExchange` or another location.
 
-Automatic scanning starts when `Инструкции` is opened for the first time. Closing the window only
-hides it; scanning continues while the main FOCTwin process remains open. The checkbox can pause
-this behaviour explicitly.
+Automatic scanning starts with the main FOCTwin window, even while `Инструкции` is hidden. Closing
+the dialog only hides it; scanning continues while the main process remains open. The checkbox can
+pause this behaviour explicitly.
+
+FOCTwin creates temporary status/event/artifact files in `.staging` beside `outbox`, never inside
+the synchronized output tree. A complete file is atomically renamed into `outbox`, so FolderBridge
+does not upload FOCTwin's partial `.tmp` files.
 
 ## Command envelope
 
@@ -80,16 +85,16 @@ is recommended; FolderBridge already downloads files that way.
 | `dry_run` | `{"command":{"type":"...","arguments":{}}}` | Whether the nested type is allowed and its execution policy; it is never executed |
 | `run_current_trial` | `{"mode":"simulation","config":{...}}` | Complete a hardware-free plan simulation and export its JSON artifact |
 | `run_current_trial` | `{"mode":"hardware","config":{...}}` | Validate and preserve the immutable request as `waiting_for_motor` or `waiting_for_permission` |
-| `cancel_current_trial` | `{"command_id":"<waiting command UUID>"}` | Cancel a waiting hardware request; it never enables or configures a motor |
+| `start_current_trial` | `{"command_id":"<armed command UUID>"}` | Consume one active local arm and hand the exact plan to the attended executor |
+| `cancel_current_trial` | `{"command_id":"<current-trial command UUID>"}` | Cancel a waiting plan or route emergency stop to a running attended trial |
 
 `config` may contain any correctly spelled `CurrentTrialConfig` field. Unknown fields, invalid
 limits and unsafe relationships are rejected by the same validator used by the attended button.
 Omitting `config` or individual fields uses the conservative current-trial defaults.
 
-The `Инструкции` window has buttons for all diagnostics, a safe current-trial simulation, a
-hardware queue example and cancellation of the selected waiting request. `DRY_RUN мотора` now
-reports that `run_current_trial` is allowed only under the
-`simulate_or_wait_for_local_permission` policy and still returns `executed: false`.
+The `Инструкции` window has buttons for all diagnostics, a safe simulation, a hardware queue
+example, exact-plan arming, separate START and cancellation. `DRY_RUN мотора` reports the
+`simulate_or_wait_for_one_shot_local_arm` policy and still returns `executed: false`.
 
 ## Events and status
 
@@ -109,13 +114,15 @@ Windows path.
 A simulated current trial produces `accepted → evaluating → completed` and writes
 `outbox/artifacts/<command_id>/current_trial_simulation.json`. A hardware request produces
 `accepted → evaluating → waiting_for_motor` at home. The `evaluating` event explicitly carries
-`hardware_running: false`. If a motor later appears, the request may move only to
-`waiting_for_permission`; this beta has no transition from a remote request to `ready` or PWM.
-Cancellation adds one `cancelled` event to the target and completes the separate cancel command.
+`hardware_running: false`. If the motor and telemetry later appear, the request moves to
+`waiting_for_permission`. Local arming moves it to `ready`; only a separate valid START can move it
+to `hardware_running`. Final experiment status and the automatically exported `_SEND_ME.zip` are
+then published through the same command record. Cancellation adds one `cancelled` event to the
+target and completes the separate cancel command.
 
 If FOCTwin closes after journaling a valid command but before completion, the next scan resumes
 the `received` or `running` command. Waiting requests remain waiting after process or power loss.
-A locally attended trial that was `ready` or `running` is demoted to
+A file-backed trial that was `ready` or `running` is demoted to
 `waiting_for_permission` on controller restart and requires another visible confirmation.
 
 ## Safety boundary
@@ -126,11 +133,12 @@ controller itself owns no Serial, Commander or Qt object. Names such as `enable_
 `serial` and `commander` remain absent from the allowlist; arbitrary Python, PowerShell,
 executable launch and raw Commander text have no handler.
 
-This release deliberately has no remote arming policy. The shared controller accepts an attended
-local button only after a fresh environment check and the existing confirmation dialog. An
-instruction source is always denied the `ready` transition, even if its JSON requests hardware,
-all limits are valid and the motor is connected. Arming and real remote execution belong to the
-next beta.
+The shared controller accepts the local button only after a fresh environment check and its
+confirmation dialog. For a file instruction, merely receiving JSON never grants permission. The
+person must select the exact immutable plan in FOCTwin and confirm a two-minute arm. A normal
+status refresh cannot create `ready`; a separate START rechecks all prerequisites and consumes the
+arm. Expiry, process restart, motor/telemetry loss, active PWM, another experiment or a busy command
+channel revokes it. There is no generic remote target, raw Commander or mode-change capability.
 
 ## Home test
 
@@ -151,3 +159,9 @@ next beta.
 10. Close FOCTwin immediately after delivering several commands and reopen it. Diagnostics must
     reach one terminal state; an unchanged hardware request must remain in exactly one waiting
     state without a second execution chain.
+
+For an attended hardware run, connect the board and wait for complete fresh telemetry. Select one
+`waiting_for_permission` row, press `Разрешить выбранный план на 2 минуты`, inspect every value and
+confirm locally. This action does not start the motor. Only then create a separate START. Keep
+physical power cutoff available throughout the run. Do not use this sequence for an unattended
+test.

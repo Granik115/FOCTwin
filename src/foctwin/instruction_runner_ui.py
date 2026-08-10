@@ -1,9 +1,10 @@
-"""Non-modal instruction window for the 0.4.2b2 shared-controller test."""
+"""Non-modal instruction window for the 0.4.2b3 attended hardware workflow."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from foctwin import __version__
 from foctwin.current_trial_controller import (
     CurrentTrialController,
     CurrentTrialControllerError,
+    CurrentTrialDecision,
     CurrentTrialEnvironment,
 )
 from foctwin.instruction_runner import (
@@ -65,6 +67,8 @@ class InstructionRunnerDialog(QDialog):
         current_trial_controller: CurrentTrialController | None = None,
         current_trial_environment_factory: Callable[[], CurrentTrialEnvironment]
         | None = None,
+        current_trial_start_callback: Callable[[CurrentTrialDecision], None] | None = None,
+        current_trial_abort_callback: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"FOCTwin {__version__} — локальные инструкции")
@@ -82,6 +86,8 @@ class InstructionRunnerDialog(QDialog):
         self.current_trial_environment_factory = (
             current_trial_environment_factory or CurrentTrialEnvironment
         )
+        self.current_trial_start_callback = current_trial_start_callback
+        self.current_trial_abort_callback = current_trial_abort_callback
         self.store = InstructionStore(data_root)
         saved_root = self.store.get_metadata("exchange_root")
         selected_root = exchange_root or (Path(saved_root) if saved_root else _default_exchange_root())
@@ -108,9 +114,9 @@ class InstructionRunnerDialog(QDialog):
         root = QVBoxLayout(self)
 
         self.safety_label = QLabel(
-            "БЕЗОПАСНАЯ БЕТА: токовый опыт можно имитировать или поставить в очередь. "
-            "Удалённое включение PWM отключено: аппаратный запрос остановится на "
-            "waiting_for_motor / waiting_for_permission."
+            "АППАРАТНАЯ БЕТА: удалённый план сам по себе не включает PWM. Вы можете локально "
+            "разрешить только выбранный неизменяемый план на 2 минуты; отдельная команда START "
+            "использует разрешение один раз. Перезапуск или изменение условий его отменяет."
         )
         self.safety_label.setObjectName("danger")
         self.safety_label.setWordWrap(True)
@@ -199,7 +205,13 @@ class InstructionRunnerDialog(QDialog):
             self.sample_buttons.append(button)
         self.cancel_sample_button = QPushButton("Отменить выбранный ожидающий опыт")
         self.cancel_sample_button.clicked.connect(self._cancel_selected_request)
-        samples_layout.addWidget(self.cancel_sample_button, 1, 3)
+        self.arm_sample_button = QPushButton("Разрешить выбранный план на 2 минуты")
+        self.arm_sample_button.clicked.connect(self._arm_selected_request)
+        self.start_sample_button = QPushButton("Создать START для разрешённого плана")
+        self.start_sample_button.clicked.connect(self._start_selected_request)
+        samples_layout.addWidget(self.arm_sample_button, 1, 3)
+        samples_layout.addWidget(self.start_sample_button, 2, 0, 1, 2)
+        samples_layout.addWidget(self.cancel_sample_button, 2, 2, 1, 2)
         root.addWidget(samples_group)
 
         history_group = QGroupBox("Последние инструкции")
@@ -294,8 +306,40 @@ class InstructionRunnerDialog(QDialog):
                 decision = self.current_trial_controller.refresh_instruction(
                     command_id, environment
                 )
+            elif action == "start":
+                if self.current_trial_start_callback is None:
+                    raise CurrentTrialControllerError(
+                        "executor_not_connected",
+                        "Исполнитель токового опыта не подключён к окну инструкций",
+                    )
+                decision = self.current_trial_controller.start_instruction(
+                    command_id, environment
+                )
+                try:
+                    self.current_trial_start_callback(decision)
+                except Exception as exc:
+                    self.current_trial_controller.fail_instruction_start(
+                        command_id, str(exc)
+                    )
+                    raise CurrentTrialControllerError(
+                        "executor_start_failed", str(exc)
+                    ) from exc
             elif action == "cancel":
-                decision = self.current_trial_controller.cancel_instruction(command_id)
+                current = self.current_trial_controller.get_by_command(command_id)
+                if current is not None and current.state.value == "running":
+                    if self.current_trial_abort_callback is None:
+                        raise CurrentTrialControllerError(
+                            "abort_unavailable",
+                            "Локальный аварийный обработчик не подключён",
+                        )
+                    self.current_trial_abort_callback(command_id)
+                    decision = self.current_trial_controller.get_by_command(command_id)
+                    if decision is None:
+                        raise CurrentTrialControllerError(
+                            "request_not_found", "Запрос исчез после остановки"
+                        )
+                else:
+                    decision = self.current_trial_controller.cancel_instruction(command_id)
             else:
                 raise CurrentTrialControllerError(
                     "unsupported_action", f"Неизвестное действие контроллера: {action}"
@@ -330,6 +374,8 @@ class InstructionRunnerDialog(QDialog):
         if command_type != "run_current_trial" or state not in {
             "waiting_for_motor",
             "waiting_for_permission",
+            "ready",
+            "hardware_running",
         }:
             QMessageBox.information(
                 self,
@@ -345,6 +391,82 @@ class InstructionRunnerDialog(QDialog):
             QMessageBox.critical(self, "Отмена не создана", str(exc))
             return
         self._append_log("INFO", f"создан {path.name} для отмены {command_id}")
+        self._scan_now()
+
+    def _selected_current_trial(self, allowed_states: set[str]) -> tuple[str, str] | None:
+        row = self.history_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self,
+                "Токовый опыт",
+                "Сначала выберите строку run_current_trial",
+            )
+            return None
+        command_type = self.history_table.item(row, 1).text()
+        state = self.history_table.item(row, 2).text()
+        command_id = self.history_table.item(row, 3).text()
+        if command_type != "run_current_trial" or state not in allowed_states:
+            QMessageBox.information(
+                self,
+                "Токовый опыт",
+                f"Нужен run_current_trial в состоянии: {', '.join(sorted(allowed_states))}",
+            )
+            return None
+        return command_id, state
+
+    def _arm_selected_request(self, checked: bool = False) -> None:
+        del checked
+        selected = self._selected_current_trial(
+            {"waiting_for_motor", "waiting_for_permission"}
+        )
+        if selected is None:
+            return
+        command_id, _state = selected
+        decision = self.current_trial_controller.get_by_command(command_id)
+        if decision is None:
+            QMessageBox.warning(self, "Разрешение", "Запрос не найден в контроллере")
+            return
+        rendered_config = json.dumps(decision.config, ensure_ascii=False, indent=2)
+        answer = QMessageBox.warning(
+            self,
+            "Одноразовое разрешение аппаратного опыта",
+            "Будет разрешён только этот Command ID и только этот неизменяемый план на 2 минуты. "
+            "Само нажатие мотор не запускает; после него потребуется отдельная команда START.\n\n"
+            f"Command ID: {command_id}\n\n{rendered_config}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        environment = replace(
+            self.current_trial_environment_factory(),
+            local_permission=True,
+        )
+        try:
+            armed = self.current_trial_controller.arm_instruction(command_id, environment)
+        except CurrentTrialControllerError as exc:
+            QMessageBox.warning(self, "Разрешение не выдано", str(exc))
+            return
+        self._append_log(
+            "ARM",
+            f"одноразово разрешён {command_id} до {armed.result.get('armed_until')}",
+        )
+        self._scan_now()
+
+    def _start_selected_request(self, checked: bool = False) -> None:
+        del checked
+        selected = self._selected_current_trial({"ready"})
+        if selected is None:
+            return
+        command_id, _state = selected
+        try:
+            path = self.runner.create_sample_command(
+                "start_current_trial", target_command_id=command_id
+            )
+        except InstructionRunnerError as exc:
+            QMessageBox.warning(self, "START не создан", str(exc))
+            return
+        self._append_log("INFO", f"создан {path.name} для запуска {command_id}")
         self._scan_now()
 
     def _choose_root(self) -> None:

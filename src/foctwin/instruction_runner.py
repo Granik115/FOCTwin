@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -98,10 +99,17 @@ def _check_json_shape(value: object, *, depth: int = 0) -> None:
         )
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+def _atomic_write_json(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    staging_dir: Path | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_parent = staging_dir or path.parent
+    temporary_parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=f".{path.name}.", suffix=".tmp", dir=temporary_parent
     )
     temporary = Path(temporary_name)
     try:
@@ -164,15 +172,23 @@ CAPABILITIES = (
     Capability("dry_run", "Проверить допустимость вложенной команды без её выполнения"),
     Capability(
         "run_current_trial",
-        "Имитировать токовый опыт или сохранить аппаратный запрос в безопасном ожидании",
+        "Имитировать токовый опыт или сохранить неизменяемый аппаратный план",
         hardware_access=True,
         motor_required=True,
-        execution_policy="simulate_or_wait_for_local_permission",
+        execution_policy="simulate_or_wait_for_one_shot_local_arm",
+    ),
+    Capability(
+        "start_current_trial",
+        "Запустить ранее локально разрешённый аппаратный план по command_id",
+        hardware_access=True,
+        motor_required=True,
+        execution_policy="consume_one_shot_local_arm",
     ),
     Capability(
         "cancel_current_trial",
-        "Отменить ожидающий аппаратный запрос по command_id",
-        execution_policy="cancel_waiting_request",
+        "Отменить ожидающий запрос или аварийно остановить выполняющийся опыт",
+        hardware_access=True,
+        execution_policy="cancel_waiting_or_abort_running_trial",
     ),
 )
 CAPABILITY_BY_NAME = {item.name: item for item in CAPABILITIES}
@@ -183,12 +199,16 @@ HARDWARE_COMMAND_HINTS = {
     "connect_motor",
     "enable_pwm",
     "run_current_trial",
+    "start_current_trial",
     "run_friction_test",
     "serial",
     "set_target",
 }
 
 WAITING_COMMAND_STATES = frozenset({"waiting_for_motor", "waiting_for_permission"})
+ACTIVE_HARDWARE_COMMAND_STATES = frozenset(
+    {*WAITING_COMMAND_STATES, "ready", "hardware_running"}
+)
 TERMINAL_COMMAND_STATES = frozenset(
     {"completed", "failed", "rejected", "ignored", "cancelled"}
 )
@@ -328,6 +348,7 @@ class CommandRecord:
     finished_at: str
     error_code: str
     error_message: str
+    expires_at: str
     result: dict[str, object]
 
 
@@ -580,7 +601,9 @@ class InstructionStore:
             rows = connection.execute(
                 """
                 SELECT payload_json, source_file, state FROM commands
-                WHERE state IN ('waiting_for_motor', 'waiting_for_permission')
+                WHERE state IN (
+                    'waiting_for_motor', 'waiting_for_permission', 'ready', 'hardware_running'
+                )
                 ORDER BY received_at, command_id
                 """
             ).fetchall()
@@ -606,7 +629,7 @@ class InstructionStore:
             row = connection.execute(
                 """
                 SELECT command_id, command_type, state, received_at, finished_at,
-                       error_code, error_message, result_json
+                       error_code, error_message, payload_json, result_json
                 FROM commands WHERE command_id = ?
                 """,
                 (command_id,),
@@ -621,6 +644,7 @@ class InstructionStore:
             finished_at=str(row["finished_at"]),
             error_code=str(row["error_code"]),
             error_message=str(row["error_message"]),
+            expires_at=str(json.loads(str(row["payload_json"]))["expires_at"]),
             result=json.loads(str(row["result_json"])),
         )
 
@@ -718,7 +742,7 @@ class InstructionStore:
             rows = connection.execute(
                 """
                 SELECT command_id, command_type, state, received_at, finished_at,
-                       error_code, error_message, result_json
+                       error_code, error_message, payload_json, result_json
                 FROM commands ORDER BY received_at DESC, command_id DESC LIMIT ?
                 """,
                 (limit,),
@@ -732,6 +756,7 @@ class InstructionStore:
                 finished_at=str(row["finished_at"]),
                 error_code=str(row["error_code"]),
                 error_message=str(row["error_message"]),
+                expires_at=str(json.loads(str(row["payload_json"]))["expires_at"]),
                 result=json.loads(str(row["result_json"])),
             )
             for row in rows
@@ -781,6 +806,10 @@ class InstructionRunner:
         return self.exchange_root / "outbox" / "artifacts"
 
     @property
+    def staging_dir(self) -> Path:
+        return self.exchange_root / ".staging"
+
+    @property
     def status_path(self) -> Path:
         return self.exchange_root / "outbox" / "status.json"
 
@@ -790,7 +819,12 @@ class InstructionRunner:
             raise InstructionRunnerError(f"Путь обмена является файлом: {resolved}")
         previous_root = self.store.get_metadata("exchange_root")
         self.exchange_root = resolved
-        for directory in (self.commands_dir, self.events_dir, self.artifacts_dir):
+        for directory in (
+            self.commands_dir,
+            self.events_dir,
+            self.artifacts_dir,
+            self.staging_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         self.store.set_metadata("exchange_root", str(resolved))
         path_changed = bool(previous_root) and previous_root.casefold() != str(resolved).casefold()
@@ -817,6 +851,8 @@ class InstructionRunner:
         counts = self.store.command_counts()
         last_error = self.store.get_metadata("last_error")
         context = self._context_payload()
+        ready_count = counts.get("ready", 0)
+        running_count = counts.get("hardware_running", 0)
         return {
             "schema": INSTRUCTION_SCHEMA,
             "protocol": INSTRUCTION_PROTOCOL,
@@ -829,11 +865,17 @@ class InstructionRunner:
             "command_counts": counts,
             "pending_commands": sum(
                 counts.get(state, 0)
-                for state in ("received", "running", *sorted(WAITING_COMMAND_STATES))
+                for state in (
+                    "received",
+                    "running",
+                    *sorted(ACTIVE_HARDWARE_COMMAND_STATES),
+                )
             ),
             "motor_connected": bool(context.get("motor_connected", False)),
-            "hardware_commands_enabled": False,
-            "remote_hardware_execution_enabled": False,
+            "hardware_commands_enabled": bool(ready_count or running_count),
+            "remote_hardware_execution_enabled": bool(ready_count),
+            "locally_armed_current_trials": ready_count,
+            "running_current_trials": running_count,
             "hardware_requests_accepted": True,
             "current_trial_controller_connected": self.current_trial_gateway is not None,
             "accepted_command_types": [item.name for item in CAPABILITIES],
@@ -841,6 +883,16 @@ class InstructionRunner:
                 "commands": "inbox/commands",
                 "events": "outbox/events",
                 "artifacts": "outbox/artifacts",
+            },
+            "telemetry_diagnostics": {
+                key: context[key]
+                for key in (
+                    "telemetry_sample_rate_hz",
+                    "telemetry_ui_lag_ms",
+                    "telemetry_ui_max_lag_ms",
+                    "telemetry_plot_points",
+                )
+                if key in context
             },
         }
 
@@ -858,7 +910,11 @@ class InstructionRunner:
         return dict(payload) if isinstance(payload, dict) else {"motor_connected": False}
 
     def _write_status(self) -> None:
-        _atomic_write_json(self.status_path, self._status_payload())
+        _atomic_write_json(
+            self.status_path,
+            self._status_payload(),
+            staging_dir=self.staging_dir,
+        )
 
     def _emit(
         self,
@@ -880,8 +936,36 @@ class InstructionRunner:
 
     def _flush_events(self) -> None:
         for file_name, payload in self.store.unexported_events():
-            _atomic_write_json(self.events_dir / file_name, payload)
+            _atomic_write_json(
+                self.events_dir / file_name,
+                payload,
+                staging_dir=self.staging_dir,
+            )
             self.store.mark_event_exported(file_name)
+
+    def publish_artifact(
+        self,
+        source: Path,
+        *,
+        group: str,
+    ) -> Path:
+        source = Path(source).resolve(strict=True)
+        if not source.is_file():
+            raise InstructionRunnerError(f"Артефакт не является файлом: {source}")
+        if not re.fullmatch(r"[0-9A-Za-z._-]{1,100}", group):
+            raise InstructionRunnerError("Недопустимое имя группы артефакта")
+        destination = self.artifacts_dir / group / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staged = self.staging_dir / f"artifact-{uuid.uuid4()}-{source.name}"
+        try:
+            with source.open("rb") as input_stream, staged.open("wb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+            os.replace(staged, destination)
+        finally:
+            staged.unlink(missing_ok=True)
+        return destination
 
     @staticmethod
     def _candidate_fingerprint(path: Path, label: str) -> str:
@@ -987,6 +1071,23 @@ class InstructionRunner:
                 raise InstructionValidationError(
                     "invalid_arguments",
                     "cancel_current_trial требует только arguments.command_id",
+                    command_id=command.command_id,
+                )
+            target = command.arguments.get("command_id")
+            try:
+                uuid.UUID(str(target))
+            except (ValueError, AttributeError) as exc:
+                raise InstructionValidationError(
+                    "invalid_arguments",
+                    "arguments.command_id должен быть UUID",
+                    command_id=command.command_id,
+                ) from exc
+            return
+        if command.command_type == "start_current_trial":
+            if set(command.arguments) != {"command_id"}:
+                raise InstructionValidationError(
+                    "invalid_arguments",
+                    "start_current_trial требует только arguments.command_id",
                     command_id=command.command_id,
                 )
             target = command.arguments.get("command_id")
@@ -1270,14 +1371,21 @@ class InstructionRunner:
         if not isinstance(response, dict):
             raise InstructionRunnerError("Контроллер вернул некорректный ответ")
         state = response.get("state")
-        allowed_states = WAITING_COMMAND_STATES | {"completed", "failed", "cancelled"}
+        allowed_states = WAITING_COMMAND_STATES | {
+            "ready",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+        }
         if state not in allowed_states:
             raise InstructionRunnerError(
                 f"Контроллер вернул недопустимое состояние: {state}"
             )
-        if bool(response.get("remote_hardware_execution_enabled", False)):
+        remotely_enabled = bool(response.get("remote_hardware_execution_enabled", False))
+        if remotely_enabled != (state == "ready"):
             raise InstructionRunnerError(
-                "Контроллер попытался включить запрещённое удалённое аппаратное выполнение"
+                "Контроллер вернул несогласованное состояние одноразового разрешения"
             )
         return dict(response)
 
@@ -1287,7 +1395,11 @@ class InstructionRunner:
         payload: dict[str, object],
     ) -> str:
         relative = Path(command_id) / "current_trial_simulation.json"
-        _atomic_write_json(self.artifacts_dir / relative, payload)
+        _atomic_write_json(
+            self.artifacts_dir / relative,
+            payload,
+            staging_dir=self.staging_dir,
+        )
         return (Path("artifacts") / relative).as_posix()
 
     def _cancel_current_trial_command(
@@ -1312,7 +1424,10 @@ class InstructionRunner:
             )
 
         controller_result: dict[str, object] = {}
-        if target.state in WAITING_COMMAND_STATES and self.current_trial_gateway is not None:
+        if (
+            target.state in ACTIVE_HARDWARE_COMMAND_STATES
+            and self.current_trial_gateway is not None
+        ):
             controller_result = self._call_current_trial_gateway("cancel", target_id, {})
         finished = _iso(self.now_factory())
         target_result = {
@@ -1358,12 +1473,23 @@ class InstructionRunner:
         if command.command_type == "get_status":
             return CommandExecution("completed", self._status_payload())
         if command.command_type == "list_capabilities":
+            status = self._status_payload()
+            capabilities = []
+            for item in CAPABILITIES:
+                payload = item.to_dict()
+                if item.name == "start_current_trial":
+                    payload["remote_hardware_execution_enabled"] = bool(
+                        status["remote_hardware_execution_enabled"]
+                    )
+                capabilities.append(payload)
             return CommandExecution(
                 "completed",
                 {
-                    "capabilities": [item.to_dict() for item in CAPABILITIES],
-                    "hardware_commands_enabled": False,
-                    "remote_hardware_execution_enabled": False,
+                    "capabilities": capabilities,
+                    "hardware_commands_enabled": status["hardware_commands_enabled"],
+                    "remote_hardware_execution_enabled": status[
+                        "remote_hardware_execution_enabled"
+                    ],
                 },
             )
         if command.command_type == "self_test":
@@ -1419,6 +1545,28 @@ class InstructionRunner:
                 artifact = self._write_current_trial_artifact(command.command_id, response)
                 response["artifact"] = artifact
             return CommandExecution(state, response)
+        if command.command_type == "start_current_trial":
+            target_id = str(uuid.UUID(str(command.arguments["command_id"])))
+            target = self.store.get_command(target_id)
+            if target is None or target.command_type != "run_current_trial":
+                raise InstructionRunnerError("Запускаемый command_id не является токовым опытом")
+            if target.state != "ready":
+                raise InstructionRunnerError(
+                    f"Токовый опыт не имеет активного разрешения: {target.state}"
+                )
+            if _parse_timestamp(target.expires_at, "expires_at") <= self.now_factory():
+                raise InstructionRunnerError("Срок исходного плана токового опыта истёк")
+            response = self._call_current_trial_gateway("start", target_id, {})
+            if response.get("state") != "running":
+                raise InstructionRunnerError("Контроллер не подтвердил запуск токового опыта")
+            return CommandExecution(
+                "completed",
+                {
+                    "dispatched": True,
+                    "target_command_id": target_id,
+                    "controller": response,
+                },
+            )
         if command.command_type == "cancel_current_trial":
             return self._cancel_current_trial_command(command)
         raise InstructionRunnerError(f"Нет обработчика для {command.command_type}")
@@ -1540,12 +1688,21 @@ class InstructionRunner:
             return
         for command in self.store.waiting_commands():
             now = self.now_factory()
-            if _parse_timestamp(command.expires_at, "expires_at") <= now:
+            if (
+                command.state != "hardware_running"
+                and _parse_timestamp(command.expires_at, "expires_at") <= now
+            ):
+                controller_result: dict[str, object] = {}
+                if self.current_trial_gateway is not None:
+                    controller_result = self._call_current_trial_gateway(
+                        "cancel", command.command_id, {}
+                    )
                 finished = _iso(now)
                 self.store.update_command(
                     command.command_id,
                     state="rejected",
                     finished_at=finished,
+                    result={"controller": controller_result},
                     error_code="expired_while_waiting",
                     error_message="Команда истекла во время безопасного ожидания",
                 )
@@ -1556,13 +1713,15 @@ class InstructionRunner:
                     details={
                         "code": "expired_while_waiting",
                         "message": "Команда истекла во время безопасного ожидания",
+                        "controller": controller_result,
                     },
                 )
                 continue
             response = self._call_current_trial_gateway(
                 "refresh", command.command_id, command.arguments
             )
-            state = str(response["state"])
+            controller_state = str(response["state"])
+            state = "hardware_running" if controller_state == "running" else controller_state
             if state == command.state:
                 self.store.update_command(
                     command.command_id,
@@ -1681,6 +1840,14 @@ class InstructionRunner:
                 target_command_id = str(uuid.UUID(target_command_id))
             except ValueError as exc:
                 raise InstructionRunnerError("Command ID для отмены должен быть UUID") from exc
+            arguments = {"command_id": target_command_id}
+        elif command_type == "start_current_trial":
+            if target_command_id is None:
+                raise InstructionRunnerError("Для запуска выберите разрешённый токовый опыт")
+            try:
+                target_command_id = str(uuid.UUID(target_command_id))
+            except ValueError as exc:
+                raise InstructionRunnerError("Command ID для запуска должен быть UUID") from exc
             arguments = {"command_id": target_command_id}
         elif command_type in CAPABILITY_BY_NAME:
             arguments = {}

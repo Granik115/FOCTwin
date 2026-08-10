@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -69,14 +70,14 @@ class CurrentTrialControllerTests(unittest.TestCase):
             waiting_permission.state,
             CurrentTrialRequestState.WAITING_FOR_PERMISSION,
         )
-        self.assertEqual(waiting_permission.reason_code, "remote_hardware_locked")
+        self.assertEqual(waiting_permission.reason_code, "local_arm_required")
         self.assertNotEqual(waiting_permission.state, CurrentTrialRequestState.READY)
 
     def test_waiting_remote_request_survives_controller_restart(self):
         command_id = "00000000-0000-4000-8000-000000000002"
         first = self.controller.submit_instruction(
             command_id,
-            {"mode": "hardware", "config": {"step_current_a": 0.12}},
+            {"mode": "hardware", "config": {"step_current_a": 0.02}},
             CurrentTrialEnvironment(),
         )
 
@@ -86,7 +87,7 @@ class CurrentTrialControllerTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.request_id, first.request_id)
         self.assertEqual(restored.state, CurrentTrialRequestState.WAITING_FOR_MOTOR)
-        self.assertEqual(restored.config["step_current_a"], 0.12)
+        self.assertEqual(restored.config["step_current_a"], 0.02)
 
     def test_simulation_completes_without_hardware_and_preserves_plan(self):
         decision = self.controller.submit_instruction(
@@ -94,7 +95,7 @@ class CurrentTrialControllerTests(unittest.TestCase):
             {
                 "mode": "simulation",
                 "config": {
-                    "step_current_a": 0.15,
+                    "step_current_a": 0.02,
                     "baseline_s": 1.5,
                     "step_s": 2.5,
                     "post_s": 1.25,
@@ -108,7 +109,7 @@ class CurrentTrialControllerTests(unittest.TestCase):
         self.assertTrue(decision.result["simulated"])
         self.assertFalse(decision.result["executed"])
         self.assertFalse(decision.result["hardware_access"])
-        self.assertEqual(decision.result["targets"]["step_a"], 0.15)
+        self.assertEqual(decision.result["targets"]["step_a"], 0.02)
         self.assertEqual(decision.result["durations_s"]["step"], 2.5)
 
     def test_invalid_instruction_config_is_rejected_before_request_is_stored(self):
@@ -184,6 +185,114 @@ class CurrentTrialControllerTests(unittest.TestCase):
         self.assertEqual(cancelled.state, CurrentTrialRequestState.CANCELLED)
         self.assertEqual(repeated.state, CurrentTrialRequestState.CANCELLED)
         self.assertEqual(cancelled.request_id, repeated.request_id)
+
+    def test_remote_request_requires_explicit_arm_and_separate_one_shot_start(self):
+        command_id = "00000000-0000-4000-8000-000000000006"
+        waiting = self.controller.submit_instruction(
+            command_id,
+            {"mode": "hardware", "config": {}},
+            ready_environment(),
+        )
+
+        armed = self.controller.arm_instruction(
+            command_id,
+            ready_environment(permission=True),
+        )
+        started = self.controller.start_instruction(
+            command_id,
+            ready_environment(),
+        )
+
+        self.assertEqual(waiting.state, CurrentTrialRequestState.WAITING_FOR_PERMISSION)
+        self.assertEqual(armed.state, CurrentTrialRequestState.READY)
+        self.assertTrue(armed.to_dict()["locally_armed"])
+        self.assertTrue(armed.to_dict()["remote_hardware_execution_enabled"])
+        self.assertFalse(armed.result["arm_consumed"])
+        self.assertEqual(started.state, CurrentTrialRequestState.RUNNING)
+        self.assertTrue(started.result["arm_consumed"])
+        self.assertFalse(started.to_dict()["remote_hardware_execution_enabled"])
+
+        with self.assertRaisesRegex(CurrentTrialControllerError, "повторно разрешить"):
+            self.controller.arm_instruction(
+                command_id,
+                ready_environment(permission=True),
+            )
+
+    def test_expired_arm_returns_to_waiting_without_starting(self):
+        command_id = "00000000-0000-4000-8000-000000000007"
+        self.controller.submit_instruction(
+            command_id,
+            {"mode": "hardware", "config": {}},
+            ready_environment(),
+        )
+        self.controller.arm_instruction(
+            command_id,
+            ready_environment(permission=True),
+        )
+        self.clock.value += timedelta(minutes=3)
+
+        expired = self.controller.refresh_instruction(
+            command_id,
+            ready_environment(),
+        )
+
+        self.assertEqual(expired.state, CurrentTrialRequestState.WAITING_FOR_PERMISSION)
+        self.assertEqual(expired.reason_code, "local_arm_expired")
+        self.assertFalse(expired.to_dict()["remote_hardware_execution_enabled"])
+
+    def test_running_local_trial_revokes_a_remote_arm(self):
+        command_id = "00000000-0000-4000-8000-000000000009"
+        self.controller.submit_instruction(
+            command_id,
+            {"mode": "hardware", "config": {}},
+            ready_environment(),
+        )
+        self.controller.arm_instruction(
+            command_id,
+            ready_environment(permission=True),
+        )
+        busy = CurrentTrialEnvironment(
+            project_open=True,
+            motor_connected=True,
+            pwm_disabled=True,
+            telemetry_fresh=True,
+            telemetry_complete=True,
+            friction_idle=True,
+            current_trial_idle=False,
+            command_channel_idle=True,
+            phase_resistance_valid=True,
+        )
+
+        revoked = self.controller.refresh_instruction(command_id, busy)
+
+        self.assertEqual(revoked.state, CurrentTrialRequestState.WAITING_FOR_PERMISSION)
+        self.assertEqual(revoked.reason_code, "current_trial_running")
+
+    def test_old_persisted_plan_is_failed_before_it_can_be_armed(self):
+        command_id = "00000000-0000-4000-8000-000000000008"
+        decision = self.controller.submit_instruction(
+            command_id,
+            {"mode": "hardware", "config": {}},
+            ready_environment(),
+        )
+        old_config = dict(decision.config)
+        old_config.update(
+            {
+                "step_current_a": 0.1,
+                "current_kp": 8.4222,
+                "current_ki": 814.0,
+            }
+        )
+        with self.controller._connect() as connection:
+            connection.execute(
+                "UPDATE current_trial_requests SET config_json = ? WHERE request_id = ?",
+                (json.dumps(old_config), decision.request_id),
+            )
+
+        failed = self.controller.refresh_instruction(command_id, ready_environment())
+
+        self.assertEqual(failed.state, CurrentTrialRequestState.FAILED)
+        self.assertEqual(failed.reason_code, "stored_config_no_longer_valid")
 
 
 if __name__ == "__main__":

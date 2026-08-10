@@ -4,6 +4,7 @@ import csv
 import math
 import queue
 import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -20,9 +21,14 @@ class TelemetryStatistics:
     _interval_m2_s2: float = 0.0
     minimum_interval_s: float | None = None
     maximum_interval_s: float | None = None
+    latest_processing_lag_s: float = 0.0
+    maximum_processing_lag_s: float = 0.0
 
-    def add(self, timestamp_s: float) -> None:
+    def add(self, timestamp_s: float, *, processing_lag_s: float = 0.0) -> None:
         self.sample_count += 1
+        lag = max(0.0, float(processing_lag_s))
+        self.latest_processing_lag_s = lag
+        self.maximum_processing_lag_s = max(self.maximum_processing_lag_s, lag)
         if self._last_timestamp_s is not None:
             interval = timestamp_s - self._last_timestamp_s
             if interval > 0:
@@ -62,6 +68,59 @@ class TelemetryStatistics:
         self._interval_m2_s2 = 0.0
         self.minimum_interval_s = None
         self.maximum_interval_s = None
+        self.latest_processing_lag_s = 0.0
+        self.maximum_processing_lag_s = 0.0
+
+
+class TelemetryPlotSeries:
+    """Bounded O(1) history used only by the live Qt plot.
+
+    Raw experiment/CSV recording is independent from this display buffer.  The previous list
+    implementation deleted one element from the front of a 60k-element list for every incoming
+    sample once it filled, which made the UI progressively unresponsive during long monitoring.
+    """
+
+    def __init__(self, max_history_points: int = 60_000) -> None:
+        if max_history_points < 2:
+            raise ValueError("Plot history must retain at least two points")
+        self._times: deque[float] = deque(maxlen=max_history_points)
+        self._values: deque[float] = deque(maxlen=max_history_points)
+
+    def __len__(self) -> int:
+        return len(self._times)
+
+    def append(self, timestamp_s: float, value: float) -> None:
+        self._times.append(float(timestamp_s))
+        self._values.append(float(value))
+
+    def clear(self) -> None:
+        self._times.clear()
+        self._values.clear()
+
+    def window(
+        self,
+        cutoff_s: float,
+        *,
+        max_render_points: int = 4_000,
+    ) -> tuple[list[float], list[float]]:
+        if max_render_points < 2:
+            raise ValueError("Plot rendering needs at least two points")
+        selected: list[tuple[float, float]] = []
+        for timestamp, value in zip(reversed(self._times), reversed(self._values), strict=True):
+            if timestamp < cutoff_s:
+                break
+            selected.append((timestamp, value))
+        selected.reverse()
+        if len(selected) > max_render_points:
+            stride = math.ceil((len(selected) - 1) / (max_render_points - 1))
+            reduced = selected[::stride]
+            if reduced[-1] != selected[-1]:
+                reduced.append(selected[-1])
+            selected = reduced
+        return (
+            [timestamp for timestamp, _value in selected],
+            [value for _timestamp, value in selected],
+        )
 
 
 class TelemetryRecorder:

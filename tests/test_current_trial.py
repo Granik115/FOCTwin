@@ -1,6 +1,7 @@
 import unittest
 
 from foctwin.current_trial import (
+    CURRENT_TRIAL_CHECKPOINT_SCHEMA,
     CurrentTrialConfig,
     CurrentTrialExperiment,
     CurrentTrialPhase,
@@ -36,12 +37,13 @@ class CurrentTrialConfigTests(unittest.TestCase):
 
         config.validate()
 
-        self.assertEqual(config.step_current_a, 0.1)
-        self.assertEqual(config.current_kp, 8.4222)
-        self.assertEqual(config.current_ki, 814.0)
-        self.assertEqual(config.current_target_limit_a, 0.5)
-        self.assertEqual(config.current_trip_limit_a, 1.0)
-        self.assertEqual(config.current_voltage_limit_v, 12.0)
+        self.assertEqual(config.step_current_a, 0.01)
+        self.assertEqual(config.current_kp, 0.4)
+        self.assertEqual(config.current_ki, 40.0)
+        self.assertEqual(config.current_target_limit_a, 0.1)
+        self.assertEqual(config.current_trip_limit_a, 0.5)
+        self.assertEqual(config.current_voltage_limit_v, 2.0)
+        self.assertEqual(config.current_sense_voltage_v, 0.01)
         self.assertEqual(config.absolute_current_limit_a, 5.0)
         self.assertEqual(config.absolute_voltage_limit_v, 24.0)
         self.assertEqual(config.absolute_angle_min_rad, -4.0)
@@ -85,11 +87,40 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.experiment.tick(finish)
         return finish
 
+    def advance_current_sense(self, start_s: float) -> float:
+        self.experiment.current_sense_configuration_applied(start_s)
+        phase_values = (
+            (0.0, 0.0),
+            (0.01, 0.001),
+            (0.0, 0.0),
+            (-0.01, -0.001),
+        )
+        now = start_s
+        for current_q, current_d in phase_values:
+            for index in range(12):
+                timestamp = now + 0.03 * (index + 1)
+                self.add(
+                    sample(
+                        timestamp,
+                        current_q_a=current_q,
+                        current_d_a=current_d,
+                    )
+                )
+            now += 0.36
+            self.experiment.tick(now)
+        return now
+
     def test_uninterrupted_trial_runs_full_safe_lifecycle_and_builds_metrics(self):
         actions = self.experiment.start(0.0)
         self.assertEqual(actions[0].kind, "configure_position")
 
         now = self.advance_position(0.0)
+        self.assertEqual(
+            self.experiment.phase,
+            CurrentTrialPhase.CONFIGURING_CURRENT_SENSE,
+        )
+
+        now = self.advance_current_sense(now)
         self.assertEqual(self.experiment.phase, CurrentTrialPhase.CONFIGURING_CURRENT)
 
         self.experiment.current_configuration_applied(now)
@@ -99,14 +130,14 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         now += 1.2
         actions = self.experiment.tick(now)
         self.assertEqual(self.experiment.phase, CurrentTrialPhase.CURRENT_STEP)
-        self.assertEqual(actions[0].value, 0.1)
+        self.assertEqual(actions[0].value, 0.01)
 
         for index in range(22):
             timestamp = now + 0.1 * (index + 1)
             self.add(
                 sample(
                     timestamp,
-                    current_q_a=0.1,
+                    current_q_a=0.01,
                     current_d_a=0.002,
                     voltage_q_v=0.2,
                 )
@@ -130,18 +161,50 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         result = self.experiment.result("completed")
         self.assertTrue(result["valid"])
         self.assertTrue(result["metrics"]["current_response_observed"])
-        self.assertAlmostEqual(result["metrics"]["steady_current_q_a"], 0.1)
+        self.assertAlmostEqual(result["metrics"]["steady_current_q_a"], 0.01)
+        self.assertTrue(result["current_sense_diagnostic"]["valid"])
         self.assertEqual(result["telemetry"]["interruption_count"], 0)
 
     def test_two_confirmed_overcurrent_samples_abort_current_phase(self):
         self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
         self.experiment.current_configuration_applied(0.0)
 
-        violation, _ = self.add(sample(0.1, current_q_a=1.2))
+        violation, _ = self.add(sample(0.1, current_q_a=0.7))
         self.assertIsNone(violation)
-        violation, _ = self.add(sample(0.2, current_q_a=1.2))
+        violation, _ = self.add(sample(0.2, current_q_a=0.7))
 
         self.assertIn("Полный ток", violation)
+
+    def test_twofold_current_excursion_stops_on_first_sample(self):
+        self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+        self.experiment.current_configuration_applied(0.0)
+
+        violation, _ = self.add(sample(0.1, current_q_a=1.2))
+
+        self.assertIn("Резкий выброс полного тока", violation)
+
+    def test_firmware_velocity_twofold_excursion_stops_on_first_sample(self):
+        self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT
+        self.experiment.current_configuration_applied(0.0)
+
+        violation, _ = self.add(sample(0.1, velocity_rad_s=1.2))
+
+        self.assertIn("НЕМЕДЛЕННАЯ ОСТАНОВКА", violation)
+
+    def test_bad_current_sense_sign_aborts_before_current_pi(self):
+        self.experiment.phase = CurrentTrialPhase.CONFIGURING_CURRENT_SENSE
+        self.experiment.current_sense_configuration_applied(0.0)
+        now = 0.0
+        for current_q in (0.0, -0.01, 0.0, 0.01):
+            for index in range(12):
+                timestamp = now + 0.03 * (index + 1)
+                self.add(sample(timestamp, current_q_a=current_q))
+            now += 0.36
+            actions = self.experiment.tick(now)
+
+        self.assertEqual(self.experiment.phase, CurrentTrialPhase.ABORTED)
+        self.assertIn("FOC Current не включён", self.experiment.abort_reason)
+        self.assertEqual(actions[0].kind, "safe_stop")
 
     def test_connection_loss_discards_partial_measurement_and_repeats_whole_trial(self):
         self.experiment.phase = CurrentTrialPhase.CURRENT_STEP
@@ -175,6 +238,13 @@ class CurrentTrialExperimentTests(unittest.TestCase):
         self.assertEqual(restored.total_sample_count, 1)
         self.assertEqual(restored.phase, CurrentTrialPhase.CONFIGURING_POSITION)
         self.assertEqual(actions[0].kind, "configure_position")
+
+    def test_pre_b3_checkpoint_is_rejected_instead_of_restoring_old_gains(self):
+        payload = self.experiment.checkpoint_payload(17)
+        payload["schema"] = CURRENT_TRIAL_CHECKPOINT_SCHEMA - 1
+
+        with self.assertRaisesRegex(ValueError, "несовместимую схему"):
+            CurrentTrialExperiment.from_checkpoint(payload)
 
     def test_first_large_angle_jump_is_rejected_but_persistent_jump_is_not_hidden(self):
         first = self.experiment.prepare_sample(sample(0.1, angle_rad=1.0))

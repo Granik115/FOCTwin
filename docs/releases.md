@@ -19,6 +19,23 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.4.2b3
+
+- Reduce the guarded current step from `0.1 A` to `0.01 A`; start current Q/D at `P=0.4`, `I=40`,
+  ramp `50 V/s`, target ceiling `0.1 A` and working voltage `2 V`.
+- Add a `0, +0.01, 0, -0.01 V` direct-voltage current-sense preflight. FOC Current is never enabled
+  unless Iq follows both voltage signs and the Q response dominates Id.
+- Stop the trial immediately on a first telemetry-speed sample above twice the `0.5 rad/s` working
+  limit, while retaining confirmed working-limit and independent angle-slope checks.
+- Replace front-deleted 60,000-element plot lists with bounded deques, cap each rendered window at
+  4,000 points and expose current/maximum Qt processing backlog in the UI and `status.json`.
+- Stage status, event and artifact files outside the synchronized `outbox`, then atomically rename
+  them into place. Automatically publish every `_SEND_ME.zip` under `outbox/artifacts`.
+- Add a two-minute, exact-command local arm for hardware instructions. A separate
+  `start_current_trial` consumes it once; restart, expiry and changed prerequisites revoke it.
+- Route cancellation of a running instruction through the attended executor's emergency stop,
+  preserve full-trial retry after genuine power/telemetry loss, and cover the new states with tests.
+
 ## 0.4.2b2
 
 - Add one durable current-trial admission controller shared by the existing attended button and

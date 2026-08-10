@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 
 from foctwin.domain import TelemetrySample
-from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics, monitor_stale_timeout
+from foctwin.telemetry import (
+    TelemetryPlotSeries,
+    TelemetryRecorder,
+    TelemetryStatistics,
+    monitor_stale_timeout,
+)
 
 
 class TelemetryTests(unittest.TestCase):
@@ -16,6 +21,27 @@ class TelemetryTests(unittest.TestCase):
         self.assertAlmostEqual(statistics.frequency_hz, 10.0)
         self.assertAlmostEqual(statistics.jitter_s, 0.0)
         self.assertEqual(statistics.sample_count, 4)
+
+    def test_statistics_track_qt_processing_backlog(self):
+        statistics = TelemetryStatistics()
+        statistics.add(0.0, processing_lag_s=0.02)
+        statistics.add(0.1, processing_lag_s=0.08)
+        statistics.add(0.2, processing_lag_s=0.03)
+
+        self.assertAlmostEqual(statistics.latest_processing_lag_s, 0.03)
+        self.assertAlmostEqual(statistics.maximum_processing_lag_s, 0.08)
+
+    def test_plot_series_is_bounded_and_returns_decimated_recent_window(self):
+        series = TelemetryPlotSeries(max_history_points=10)
+        for index in range(20):
+            series.append(index * 0.1, float(index))
+
+        self.assertEqual(len(series), 10)
+        times, values = series.window(1.2, max_render_points=4)
+        self.assertLessEqual(len(times), 4)
+        self.assertAlmostEqual(times[-1], 1.9)
+        self.assertEqual(values[-1], 19.0)
+        self.assertGreaterEqual(times[0], 1.2)
 
     def test_recorder_flushes_normalized_samples_to_csv(self):
         with tempfile.TemporaryDirectory() as temporary:

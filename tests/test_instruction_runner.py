@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -75,6 +76,10 @@ class InstructionRunnerTests(unittest.TestCase):
             decision = self.controller.refresh_instruction(
                 command_id, self._environment()
             )
+        elif action == "start":
+            decision = self.controller.start_instruction(
+                command_id, self._environment()
+            )
         elif action == "cancel":
             decision = self.controller.cancel_instruction(command_id)
         else:  # pragma: no cover - test gateway contract
@@ -141,6 +146,7 @@ class InstructionRunnerTests(unittest.TestCase):
                 "self_test",
                 "dry_run",
                 "run_current_trial",
+                "start_current_trial",
                 "cancel_current_trial",
             ],
         )
@@ -253,7 +259,7 @@ class InstructionRunnerTests(unittest.TestCase):
         self.assertTrue(dry_result["would_access_hardware"])
         self.assertEqual(
             dry_result["execution_policy"],
-            "simulate_or_wait_for_local_permission",
+            "simulate_or_wait_for_one_shot_local_arm",
         )
         self.assertFalse(dry_result["remote_hardware_execution_enabled"])
 
@@ -262,7 +268,7 @@ class InstructionRunnerTests(unittest.TestCase):
             "run_current_trial",
             arguments={
                 "mode": "simulation",
-                "config": {"step_current_a": 0.12, "step_s": 2.5},
+                "config": {"step_current_a": 0.02, "step_s": 2.5},
             },
         )
         command_id = str(payload["command_id"])
@@ -283,7 +289,7 @@ class InstructionRunnerTests(unittest.TestCase):
         artifact = self.exchange_root / "outbox" / record.result["artifact"]
         self.assertTrue(artifact.is_file())
         artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
-        self.assertEqual(artifact_payload["config"]["step_current_a"], 0.12)
+        self.assertEqual(artifact_payload["config"]["step_current_a"], 0.02)
 
     def test_waiting_request_moves_to_permission_but_never_runs_when_motor_appears(self):
         payload = self._payload(
@@ -307,6 +313,94 @@ class InstructionRunnerTests(unittest.TestCase):
             ["accepted", "evaluating", "waiting_for_motor", "waiting_for_permission"],
         )
         self.assertNotIn("completed", event_types)
+
+    def test_locally_armed_request_runs_only_after_separate_start_command(self):
+        target = self._payload(
+            "run_current_trial",
+            command_id="00000000-0000-4000-8000-000000000011",
+            arguments={"mode": "hardware", "config": {}},
+        )
+        target_id = str(target["command_id"])
+        self._write(target)
+        self.runner.scan_once()
+        self.motor_connected = True
+        self.runner.scan_once()
+
+        armed_environment = replace(self._environment(), local_permission=True)
+        self.controller.arm_instruction(target_id, armed_environment)
+        self.runner.scan_once()
+        self.assertEqual(self.store.get_command(target_id).state, "ready")
+
+        start = self._payload(
+            "start_current_trial",
+            arguments={"command_id": target_id},
+        )
+        start_id = str(start["command_id"])
+        self._write(start)
+        self.runner.scan_once()
+
+        self.assertEqual(self.store.get_command(start_id).state, "completed")
+        self.assertEqual(self.store.get_command(target_id).state, "hardware_running")
+        self.assertTrue(
+            self.controller.get_by_command(target_id).result["arm_consumed"]
+        )
+
+        self.controller.finish_local(
+            self.controller.get_by_command(target_id).request_id,
+            status="completed",
+            result={"valid": True},
+        )
+        self.runner.scan_once()
+        self.assertEqual(self.store.get_command(target_id).state, "completed")
+
+    def test_publish_artifact_stages_outside_synced_outbox(self):
+        source = Path(self.temporary.name) / "trial.zip"
+        source.write_bytes(b"diagnostic-zip")
+
+        destination = self.runner.publish_artifact(source, group="trial-42")
+
+        self.assertEqual(destination.read_bytes(), b"diagnostic-zip")
+        self.assertEqual(destination.parent.name, "trial-42")
+        self.assertEqual(list((self.exchange_root / "outbox").rglob("*.tmp")), [])
+        self.assertEqual(list((self.exchange_root / "outbox").rglob(".*.part")), [])
+
+    def test_start_cannot_consume_arm_after_original_plan_expires(self):
+        target = self._payload(
+            "run_current_trial",
+            command_id="00000000-0000-4000-8000-000000000012",
+            arguments={"mode": "hardware", "config": {}},
+            expires_at=self.clock.value + timedelta(seconds=5),
+        )
+        target_id = str(target["command_id"])
+        self.motor_connected = True
+        self._write(target)
+        self.runner.scan_once()
+        self.controller.arm_instruction(
+            target_id,
+            replace(self._environment(), local_permission=True),
+        )
+        self.runner.scan_once()
+        self.assertEqual(self.store.get_command(target_id).state, "ready")
+        self.clock.value += timedelta(seconds=10)
+
+        start = self._payload(
+            "start_current_trial",
+            arguments={"command_id": target_id},
+        )
+        start_id = str(start["command_id"])
+        self._write(start)
+        self.runner.scan_once()
+
+        self.assertEqual(self.store.get_command(start_id).state, "failed")
+        self.assertEqual(self.store.get_command(target_id).state, "rejected")
+        self.assertNotEqual(
+            self.controller.get_by_command(target_id).state.value,
+            "running",
+        )
+        self.assertEqual(
+            self.controller.get_by_command(target_id).state.value,
+            "cancelled",
+        )
 
     def test_cancel_instruction_terminates_waiting_request_once(self):
         target = self._payload(

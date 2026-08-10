@@ -4,7 +4,6 @@ import json
 import math
 import threading
 import time
-from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -59,7 +58,10 @@ from foctwin.current_trial import (
 from foctwin.current_trial_controller import (
     CurrentTrialController,
     CurrentTrialControllerError,
+    CurrentTrialDecision,
     CurrentTrialEnvironment,
+    CurrentTrialRequestMode,
+    CurrentTrialRequestSource,
     CurrentTrialRequestState,
 )
 from foctwin.domain import (
@@ -110,7 +112,12 @@ from foctwin.protocol import (
 )
 from foctwin.scenario import ScenarioCompiler, ScenarioError
 from foctwin.serial_device import SerialDevice
-from foctwin.telemetry import TelemetryRecorder, TelemetryStatistics, monitor_stale_timeout
+from foctwin.telemetry import (
+    TelemetryPlotSeries,
+    TelemetryRecorder,
+    TelemetryStatistics,
+    monitor_stale_timeout,
+)
 
 try:
     import pyqtgraph as pg
@@ -190,6 +197,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
+        self._external_settings = settings is not None
         self.setWindowTitle(f"FOCTwin {__version__} — Identify. Simulate. Tune.")
         self.resize(1200, 800)
         self.setMinimumSize(900, 600)
@@ -224,6 +232,7 @@ class MainWindow(QMainWindow):
         self._current_trial_experiment: CurrentTrialExperiment | None = None
         self._current_trial_experiment_id: int | None = None
         self._current_trial_request_id: str | None = None
+        self._current_trial_command_id: str | None = None
         self._current_trial_telemetry_paths: list[str] = []
         self._current_trial_restore_commands: list[str] = []
         self._current_trial_restore_mask = self.monitor_mask
@@ -246,8 +255,8 @@ class MainWindow(QMainWindow):
         self._friction_resume_pending = False
         self._telemetry_sequence = 0
         self._rejected_telemetry_count = 0
-        self._telemetry_series: dict[str, tuple[list[float], list[float]]] = {
-            name: ([], []) for name in MONITOR_FIELDS
+        self._telemetry_series: dict[str, TelemetryPlotSeries] = {
+            name: TelemetryPlotSeries() for name in MONITOR_FIELDS
         }
         self._last_sample: TelemetrySample | None = None
         self._last_telemetry_received_at: float | None = None
@@ -303,6 +312,7 @@ class MainWindow(QMainWindow):
         self._current_trial_timer.setInterval(20)
         self._current_trial_timer.timeout.connect(self._advance_current_trial)
         self._current_trial_timer.start()
+        self._ensure_instruction_runner()
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -2939,7 +2949,7 @@ class MainWindow(QMainWindow):
     def _real_tuning_page(self) -> QWidget:
         page, layout = titled_page(
             "Доводка на реальном моторе",
-            "FOCTwin 0.4.0: один полностью автоматический и возобновляемый токовый опыт.",
+            "FOCTwin 0.4.2b3: низковольтная проверка датчика и один малый токовый шаг.",
         )
         warning = QLabel(
             "Можно физически отключить питание. FOCTwin сохранит checkpoint, будет подавать "
@@ -2952,9 +2962,16 @@ class MainWindow(QMainWindow):
 
         settings = QGroupBox("Первый безопасный токовый опыт")
         settings_form = QFormLayout(settings)
-        self.current_trial_step = spin(0.1, -0.5, 0.5, 3, 0.01)
-        self.current_trial_kp = spin(self.profile.current_q.p, 0.0, 10000.0, 6, 0.1)
-        self.current_trial_ki = spin(self.profile.current_q.i, 0.0, 100000.0, 6, 1.0)
+        safe_defaults = CurrentTrialConfig()
+        self.current_trial_step = spin(
+            safe_defaults.step_current_a,
+            -safe_defaults.current_target_limit_a,
+            safe_defaults.current_target_limit_a,
+            4,
+            0.001,
+        )
+        self.current_trial_kp = spin(safe_defaults.current_kp, 0.0, 2.0, 4, 0.05)
+        self.current_trial_ki = spin(safe_defaults.current_ki, 0.0, 200.0, 3, 5.0)
         self.current_trial_baseline = spin(1.0, 0.5, 10.0, 1, 0.5)
         self.current_trial_step_duration = spin(2.0, 0.5, 20.0, 1, 0.5)
         self.current_trial_post = spin(1.0, 0.5, 10.0, 1, 0.5)
@@ -2972,10 +2989,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(settings)
 
         defaults = QLabel(
-            "Автоматические ограничения первого запуска: цель ≤ 0,5 А; остановка токового "
-            "участка при 1 А; абсолютный максимум 5 А; рабочее U ≤ 12 В; абсолютное U ≤ 24 В; "
+            "Перед PI программа проверит знаки Iq и развязку Q/D короткими ±0,01 В. "
+            "Автоматические ограничения первого запуска: ступень 0,01 А; цель ≤ 0,1 А; "
+            "остановка токового участка при 0,5 А; рабочее U ≤ 2 В; абсолютные пределы "
+            "5 А / 24 В; "
             "рабочая координата ±3 рад; остановка при ±3,5 рад; абсолютная граница ±4 рад; "
-            "скорость ≤ 0,5 рад/с; телеметрия около 100 Гц. Начальная координата берётся "
+            "немедленная остановка при телеметрической скорости >1 рад/с и подтверждённая "
+            "при >0,5 рад/с; телеметрия около 100 Гц. Начальная координата берётся "
             "из свежей телеметрии в момент нажатия кнопки."
         )
         defaults.setObjectName("hint")
@@ -3074,6 +3094,7 @@ class MainWindow(QMainWindow):
             telemetry_fresh=telemetry_fresh,
             telemetry_complete=telemetry_complete,
             friction_idle=not self._friction_running(),
+            current_trial_idle=not self._current_trial_running(),
             command_channel_idle=not (
                 self._configuration_apply_in_progress
                 or self._command_queue
@@ -3081,6 +3102,12 @@ class MainWindow(QMainWindow):
             ),
             phase_resistance_valid=self.profile.phase_resistance_ohm > 0,
             local_permission=local_permission,
+            telemetry_sample_rate_hz=self.telemetry_statistics.frequency_hz,
+            telemetry_ui_lag_ms=self.telemetry_statistics.latest_processing_lag_s * 1000.0,
+            telemetry_ui_max_lag_ms=(
+                self.telemetry_statistics.maximum_processing_lag_s * 1000.0
+            ),
+            telemetry_plot_points=sum(len(series) for series in self._telemetry_series.values()),
         )
 
     def _current_trial_config_from_widgets(self) -> CurrentTrialConfig:
@@ -3149,22 +3176,42 @@ class MainWindow(QMainWindow):
         telemetry_paths: list[str] | None = None,
         resumed: bool = False,
         controller_request_id: str | None = None,
+        remote_decision: CurrentTrialDecision | None = None,
     ) -> None:
         if self._current_trial_running():
             QMessageBox.information(self, "Токовый опыт", "Опыт уже выполняется")
             return
         try:
-            config = (
-                restored_experiment.config
-                if restored_experiment is not None
-                else self._current_trial_config_from_widgets()
-            )
-            preview = self.current_trial_controller.preview_local(
-                config,
-                self._current_trial_environment(),
-            )
-            if preview.state != CurrentTrialRequestState.WAITING_FOR_PERMISSION:
-                raise CurrentTrialControllerError(preview.reason_code, preview.message)
+            if remote_decision is not None:
+                if (
+                    remote_decision.source != CurrentTrialRequestSource.INSTRUCTION
+                    or remote_decision.mode != CurrentTrialRequestMode.HARDWARE
+                    or remote_decision.state != CurrentTrialRequestState.RUNNING
+                ):
+                    raise CurrentTrialControllerError(
+                        "remote_request_not_running",
+                        "Удалённый запрос не находится в подтверждённом состоянии running",
+                    )
+                config = CurrentTrialConfig.from_dict(remote_decision.config)
+                environment = self._current_trial_environment()
+                if environment.blockers():
+                    raise CurrentTrialControllerError(
+                        environment.blockers()[0],
+                        "Аппаратные условия изменились перед передачей плана исполнителю",
+                    )
+                controller_request_id = remote_decision.request_id
+            else:
+                config = (
+                    restored_experiment.config
+                    if restored_experiment is not None
+                    else self._current_trial_config_from_widgets()
+                )
+                preview = self.current_trial_controller.preview_local(
+                    config,
+                    self._current_trial_environment(),
+                )
+                if preview.state != CurrentTrialRequestState.WAITING_FOR_PERMISSION:
+                    raise CurrentTrialControllerError(preview.reason_code, preview.message)
             sample = self._last_sample
             if sample is None or sample.angle_rad is None:
                 raise CurrentTrialControllerError(
@@ -3184,56 +3231,66 @@ class MainWindow(QMainWindow):
                 loop: self._pid_values(loop) for loop in self.pid_tables
             }
         except (CurrentTrialControllerError, ValueError) as exc:
+            if remote_decision is not None:
+                raise RuntimeError(str(exc)) from exc
             QMessageBox.warning(self, "Токовый опыт", str(exc))
             return
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Запуск одного токового опыта")
-        dialog.setMinimumWidth(650)
-        dialog_layout = QVBoxLayout(dialog)
-        confirmation = QLabel(
+        if remote_decision is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Запуск одного токового опыта")
+            dialog.setMinimumWidth(650)
+            dialog_layout = QVBoxLayout(dialog)
+            confirmation = QLabel(
             "FOCTwin зафиксирует текущую координату, включит проверенный "
-            "Angle + Voltage, затем с нулевой целью переключится на FOC Current и "
+            "Angle + Voltage, проверит current-sense на ±"
+            f"{config.current_sense_voltage_v:g} В без PI, затем с нулевой целью "
+            "переключится на FOC Current и "
             f"подаст одну ступень {config.step_current_a:g} А на {config.step_s:g} с.\n\n"
             f"Коэффициенты Q/D: P={config.current_kp:g}, I={config.current_ki:g}, D=0; "
-            f"рабочее U≤{config.current_voltage_limit_v:g} В. При токе "
+            f"рабочее U≤{config.current_voltage_limit_v:g} В. FOC Current не включится, если "
+            "Iq не меняет знак вместе с Uq или Id доминирует. При токе "
             f"{config.current_trip_limit_a:g} А на токовом участке, скорости "
             f"{config.velocity_trip_limit_rad_s:g} рад/с, координате ±3,5 рад или "
             "потере телеметрии PWM будет снят best-effort.\n\n"
             "При физическом отключении питания ничего не будет записано как успешный "
             "результат: после возврата платы попытка начнётся заново. Держите питание "
             "доступным. Запустить?"
-        )
-        confirmation.setWordWrap(True)
-        dialog_layout.addWidget(confirmation)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Yes
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Запустить")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        dialog_layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            )
+            confirmation.setWordWrap(True)
+            dialog_layout.addWidget(confirmation)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Yes
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+            buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Запустить")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            dialog_layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
 
-        try:
-            controller_decision = self.current_trial_controller.submit_local(
-                config,
-                self._current_trial_environment(local_permission=True),
-                request_id=controller_request_id,
-            )
-            controller_decision = self.current_trial_controller.mark_running(
-                controller_decision.request_id
-            )
-        except CurrentTrialControllerError as exc:
-            QMessageBox.warning(
-                self,
-                "Токовый опыт",
-                f"Условия изменились до запуска: {exc}",
-            )
-            return
+        if remote_decision is None:
+            try:
+                controller_decision = self.current_trial_controller.submit_local(
+                    config,
+                    self._current_trial_environment(local_permission=True),
+                    request_id=controller_request_id,
+                )
+                controller_decision = self.current_trial_controller.mark_running(
+                    controller_decision.request_id
+                )
+            except CurrentTrialControllerError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Токовый опыт",
+                    f"Условия изменились до запуска: {exc}",
+                )
+                return
+        else:
+            controller_decision = remote_decision
         self._current_trial_request_id = controller_decision.request_id
+        self._current_trial_command_id = controller_decision.command_id or None
 
         self._current_trial_recovery_sound_enabled = (
             self.current_trial_recovery_sound.isChecked()
@@ -3298,12 +3355,33 @@ class MainWindow(QMainWindow):
         self._clear_current_trial_results()
         self._log(
             "CURRENT_TRIAL",
-            f"{'Продолжение' if resumed else 'Запуск'} опыта "
+            f"{'Удалённый запуск' if remote_decision else ('Продолжение' if resumed else 'Запуск')} "
+            "опыта "
             f"#{self._current_trial_experiment_id}: step={config.step_current_a:g} A, "
             f"P={config.current_kp:g}, I={config.current_ki:g}",
         )
         self._save_current_trial_checkpoint()
         self._process_current_trial_actions(experiment.start(time.monotonic()))
+
+    def _start_remote_current_trial(self, decision: CurrentTrialDecision) -> None:
+        self._prepare_current_trial(remote_decision=decision)
+        if (
+            self._current_trial_experiment is None
+            or self._current_trial_request_id != decision.request_id
+        ):
+            raise RuntimeError("Исполнитель не принял локально разрешённый токовый опыт")
+
+    def _abort_remote_current_trial(self, command_id: str) -> None:
+        if command_id != self._current_trial_command_id or not self._current_trial_running():
+            raise RuntimeError("Указанный удалённый токовый опыт сейчас не выполняется")
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            raise RuntimeError("Исполнитель токового опыта не найден")
+        experiment.abort("Остановлено командой cancel_current_trial")
+        self._cancel_queued_commands()
+        self.device.emergency_stop()
+        self._pwm_requested = False
+        self._finalize_current_trial("interrupted", experiment.abort_reason)
 
     def _current_trial_positioning_commands(
         self,
@@ -3383,13 +3461,33 @@ class MainWindow(QMainWindow):
         )
         return commands
 
+    def _current_trial_current_sense_commands(
+        self,
+        experiment: CurrentTrialExperiment,
+    ) -> list[str]:
+        config = experiment.config
+        return [
+            self.protocol.disable(),
+            self.protocol.phase_resistance(FRICTION_DIRECT_VOLTAGE_SENTINEL),
+            self.protocol.current_limit(config.current_sense_current_trip_a),
+            self.protocol.voltage_limit(config.current_sense_voltage_limit_v),
+            self.protocol.velocity_limit(config.velocity_trip_limit_rad_s),
+            self.protocol.torque_mode(TorqueMode.VOLTAGE),
+            self.protocol.motion_mode(MotionMode.TORQUE),
+            self.protocol.target(0.0),
+            self.protocol.monitor_clear(),
+            self.protocol.monitor_downsample(config.monitor_downsample),
+            self.protocol.monitor_variables(CURRENT_TRIAL_MONITOR_MASK),
+            self.protocol.enable(),
+        ]
+
     def _process_current_trial_actions(
         self,
         actions: list[CurrentTrialAction],
     ) -> None:
         experiment = self._current_trial_experiment
         for action in actions:
-            if action.kind == "target" and action.value is not None:
+            if action.kind in {"target", "voltage_target"} and action.value is not None:
                 self._send(self.protocol.target(action.value))
             elif action.kind == "position_target" and action.value is not None:
                 if experiment is not None:
@@ -3423,6 +3521,16 @@ class MainWindow(QMainWindow):
                 self._queue_commands(
                     self._current_trial_current_commands(experiment),
                     self._finish_current_trial_current_configuration,
+                )
+            elif action.kind == "configure_current_sense":
+                if experiment is None:
+                    continue
+                self.current_trial_status_label.setText(
+                    "PWM отключается; настраивается проверка current-sense при ±0,01 В без PI…"
+                )
+                self._queue_commands(
+                    self._current_trial_current_sense_commands(experiment),
+                    self._finish_current_trial_current_sense_configuration,
                 )
             elif action.kind == "checkpoint":
                 self._save_current_trial_checkpoint()
@@ -3484,6 +3592,18 @@ class MainWindow(QMainWindow):
             experiment.current_configuration_applied(time.monotonic())
         )
 
+    def _finish_current_trial_current_sense_configuration(self) -> None:
+        experiment = self._current_trial_experiment
+        if experiment is None:
+            return
+        self._pwm_requested = True
+        self._safety_latched = False
+        self.guard.reset()
+        self._mark_monitor_configuration_started()
+        self._process_current_trial_actions(
+            experiment.current_sense_configuration_applied(time.monotonic())
+        )
+
     def _advance_current_trial(self) -> None:
         experiment = self._current_trial_experiment
         if (
@@ -3496,6 +3616,7 @@ class MainWindow(QMainWindow):
         if experiment.phase in {
             CurrentTrialPhase.IDLE,
             CurrentTrialPhase.CONFIGURING_POSITION,
+            CurrentTrialPhase.CONFIGURING_CURRENT_SENSE,
             CurrentTrialPhase.CONFIGURING_CURRENT,
             CurrentTrialPhase.CONFIGURING_RETURN,
         }:
@@ -3601,6 +3722,11 @@ class MainWindow(QMainWindow):
             CurrentTrialPhase.CONFIGURING_POSITION: "настройка транспортного режима",
             CurrentTrialPhase.POSITIONING: "выход в исходную координату",
             CurrentTrialPhase.POSITION_SETTLING: "проверка остановки",
+            CurrentTrialPhase.CONFIGURING_CURRENT_SENSE: "настройка проверки current-sense",
+            CurrentTrialPhase.CURRENT_SENSE_BASELINE: "current-sense: нулевая база",
+            CurrentTrialPhase.CURRENT_SENSE_POSITIVE: "current-sense: малое +Uq",
+            CurrentTrialPhase.CURRENT_SENSE_ZERO: "current-sense: пауза при нуле",
+            CurrentTrialPhase.CURRENT_SENSE_NEGATIVE: "current-sense: малое −Uq",
             CurrentTrialPhase.CONFIGURING_CURRENT: "переключение на FOC Current",
             CurrentTrialPhase.CURRENT_BASELINE: "запись нуля до ступени",
             CurrentTrialPhase.CURRENT_STEP: "запись токовой ступени",
@@ -3610,10 +3736,15 @@ class MainWindow(QMainWindow):
             CurrentTrialPhase.RETURN_SETTLING: "проверка остановки после возврата",
             CurrentTrialPhase.RECOVERING: "восстановление после обрыва",
         }
+        target_text = (
+            f"цель Uq {experiment.current_sense_voltage_target:g} В"
+            if experiment.phase in experiment.CURRENT_SENSE_PHASES
+            else f"цель {experiment.current_target:g} А"
+        )
         self.current_trial_status_label.setText(
             f"{phase_names.get(experiment.phase, experiment.phase.value)} · "
             f"{max(0.0, now - experiment.phase_started_s):.1f} с · "
-            f"цель {experiment.current_target:g} А · "
+            f"{target_text} · "
             f"восстановлений {experiment.recovery_attempts}/"
             f"{experiment.config.max_recovery_attempts}"
         )
@@ -3661,33 +3792,9 @@ class MainWindow(QMainWindow):
             self._current_trial_telemetry_paths.append(str(recorder_path))
         result = experiment.result(status, error=error)
         result["telemetry_paths"] = list(self._current_trial_telemetry_paths)
-        if self._current_trial_request_id is not None:
-            try:
-                self.current_trial_controller.finish_local(
-                    self._current_trial_request_id,
-                    status=status,
-                    result=result,
-                    error=error,
-                )
-            except CurrentTrialControllerError as exc:
-                self._log(
-                    "ERROR",
-                    f"Не удалось завершить запись общего контроллера: {exc}",
-                )
         export_path: Path | None = None
         bundle_path: Path | None = None
         if self.project is not None and self._current_trial_experiment_id is not None:
-            fields: dict[str, object] = {
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "result_json": json.dumps(result, ensure_ascii=False),
-            }
-            if error:
-                fields["error"] = error
-            self.project.update_experiment(
-                self._current_trial_experiment_id,
-                status,
-                **fields,
-            )
             export_path = self.project.save_export(
                 f"current_trial_{self._current_trial_experiment_id}",
                 result,
@@ -3707,6 +3814,55 @@ class MainWindow(QMainWindow):
                 self._log(
                     "CURRENT_TRIAL",
                     f"Готов единый диагностический ZIP: {bundle_path}",
+                )
+                try:
+                    runner_dialog = self._ensure_instruction_runner()
+                    artifact_group = (
+                        self._current_trial_command_id
+                        or f"local-current-trial-{self._current_trial_experiment_id}"
+                    )
+                    outgoing_path = runner_dialog.runner.publish_artifact(
+                        bundle_path,
+                        group=artifact_group,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    result["folderbridge_export_error"] = str(exc)
+                    self._log(
+                        "ERROR",
+                        f"ZIP сохранён в проекте, но не передан в FolderBridge: {exc}",
+                    )
+                else:
+                    relative_artifact = outgoing_path.relative_to(
+                        runner_dialog.runner.exchange_root / "outbox"
+                    ).as_posix()
+                    result["folderbridge_artifact"] = relative_artifact
+                    self._log(
+                        "CURRENT_TRIAL",
+                        f"ZIP автоматически помещён в FolderBridge: {outgoing_path}",
+                    )
+            fields: dict[str, object] = {
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result_json": json.dumps(result, ensure_ascii=False),
+            }
+            if error:
+                fields["error"] = error
+            self.project.update_experiment(
+                self._current_trial_experiment_id,
+                status,
+                **fields,
+            )
+        if self._current_trial_request_id is not None:
+            try:
+                self.current_trial_controller.finish_local(
+                    self._current_trial_request_id,
+                    status=status,
+                    result=result,
+                    error=error,
+                )
+            except CurrentTrialControllerError as exc:
+                self._log(
+                    "ERROR",
+                    f"Не удалось завершить запись общего контроллера: {exc}",
                 )
         self._render_current_trial_result(result, bundle_path)
         self._save_current_trial_checkpoint()
@@ -3729,6 +3885,7 @@ class MainWindow(QMainWindow):
         )
         self._current_trial_experiment = None
         self._current_trial_request_id = None
+        self._current_trial_command_id = None
         self._current_trial_resume_pending = False
         self.monitor_mask = restore_mask
         if self.device.connected and restore_commands:
@@ -3805,6 +3962,21 @@ class MainWindow(QMainWindow):
                 f"{telemetry.get('interruption_count', 0)}; "
                 f"восстановления: {telemetry.get('recovery_attempts', 0)}; "
                 f"отброшенные углы: {telemetry.get('rejected_angle_samples', 0)}."
+            )
+        current_sense = result.get("current_sense_diagnostic")
+        if isinstance(current_sense, dict):
+            report_lines.append(
+                "Проверка current-sense: "
+                f"{'пройдена' if current_sense.get('valid') else 'не пройдена'}; "
+                f"ΔIq(+Uq)={number(current_sense.get('positive_q_delta_a'), ' А')}; "
+                f"ΔIq(−Uq)={number(current_sense.get('negative_q_delta_a'), ' А')}; "
+                f"|Id|/|Iq|={number(current_sense.get('d_to_q_span_ratio'))}."
+            )
+        folderbridge_artifact = result.get("folderbridge_artifact")
+        if isinstance(folderbridge_artifact, str):
+            report_lines.append(
+                "ZIP уже автоматически помещён в исходящую папку FolderBridge:\n"
+                f"{folderbridge_artifact}"
             )
         if bundle_path is not None:
             report_lines.append(
@@ -3988,18 +4160,31 @@ class MainWindow(QMainWindow):
         self._drive_bridge_dialog.raise_()
         self._drive_bridge_dialog.activateWindow()
 
-    def _open_instruction_runner(self) -> None:
+    def _ensure_instruction_runner(self):
         if self._instruction_runner_dialog is None:
             from foctwin.instruction_runner_ui import InstructionRunnerDialog
 
+            state_root = None
+            if self._external_settings:
+                state_root = (
+                    Path(self.settings.fileName()).expanduser().resolve(strict=False).parent
+                    / "instruction_runner"
+                )
             self._instruction_runner_dialog = InstructionRunnerDialog(
                 self,
+                state_root=state_root,
                 current_trial_controller=self.current_trial_controller,
                 current_trial_environment_factory=self._current_trial_environment,
+                current_trial_start_callback=self._start_remote_current_trial,
+                current_trial_abort_callback=self._abort_remote_current_trial,
             )
-        self._instruction_runner_dialog.show()
-        self._instruction_runner_dialog.raise_()
-        self._instruction_runner_dialog.activateWindow()
+        return self._instruction_runner_dialog
+
+    def _open_instruction_runner(self) -> None:
+        dialog = self._ensure_instruction_runner()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _connect_settings_persistence(self) -> None:
         spin_boxes = [
@@ -4128,6 +4313,7 @@ class MainWindow(QMainWindow):
             },
             "friction": self._friction_config_from_widgets().to_dict(),
             "current_trial": {
+                "schema": CURRENT_TRIAL_CHECKPOINT_SCHEMA,
                 "step_current_a": self.current_trial_step.value(),
                 "current_kp": self.current_trial_kp.value(),
                 "current_ki": self.current_trial_ki.value(),
@@ -4222,15 +4408,21 @@ class MainWindow(QMainWindow):
                     self._set_friction_config_widgets(config)
             current_trial = payload.get("current_trial")
             if isinstance(current_trial, dict):
-                self.current_trial_step.setValue(
-                    float(current_trial.get("step_current_a", 0.1))
-                )
-                self.current_trial_kp.setValue(
-                    float(current_trial.get("current_kp", self.profile.current_q.p))
-                )
-                self.current_trial_ki.setValue(
-                    float(current_trial.get("current_ki", self.profile.current_q.i))
-                )
+                safe_defaults = CurrentTrialConfig()
+                saved_step = float(current_trial.get("step_current_a", safe_defaults.step_current_a))
+                saved_kp = float(current_trial.get("current_kp", safe_defaults.current_kp))
+                saved_ki = float(current_trial.get("current_ki", safe_defaults.current_ki))
+                if int(current_trial.get("schema", 1)) < CURRENT_TRIAL_CHECKPOINT_SCHEMA:
+                    saved_step = safe_defaults.step_current_a
+                    saved_kp = safe_defaults.current_kp
+                    saved_ki = safe_defaults.current_ki
+                    self._log(
+                        "CURRENT_TRIAL",
+                        "Параметры токового опыта до b3 заменены безопасными значениями b3",
+                    )
+                self.current_trial_step.setValue(saved_step)
+                self.current_trial_kp.setValue(saved_kp)
+                self.current_trial_ki.setValue(saved_ki)
                 self.current_trial_baseline.setValue(
                     float(current_trial.get("baseline_s", 1.0))
                 )
@@ -4820,9 +5012,8 @@ class MainWindow(QMainWindow):
             self._apply_monitoring()
 
     def _clear_live_plot(self) -> None:
-        for times, values in self._telemetry_series.values():
-            times.clear()
-            values.clear()
+        for series in self._telemetry_series.values():
+            series.clear()
         for curve in self.telemetry_curves.values():
             curve.setData([], [])
 
@@ -5008,7 +5199,10 @@ class MainWindow(QMainWindow):
                 f"Поток восстановлен после {self._monitor_recovery_attempt} попыток",
             )
             self._monitor_recovery_attempt = 0
-        self.telemetry_statistics.add(timestamp_s)
+        self.telemetry_statistics.add(
+            timestamp_s,
+            processing_lag_s=max(0.0, time.monotonic() - received_at),
+        )
         self.telemetry_recorder.append(sample)
         self.friction_recorder.append(sample)
         self.current_trial_recorder.append(sample)
@@ -5016,12 +5210,7 @@ class MainWindow(QMainWindow):
             value = getattr(sample, name)
             if value is None:
                 continue
-            times, values = self._telemetry_series[name]
-            times.append(timestamp_s)
-            values.append(value)
-            if len(times) > 60000:
-                del times[:-60000]
-                del values[:-60000]
+            self._telemetry_series[name].append(timestamp_s, value)
 
         if current_trial is not None and self._current_trial_running():
             violation, actions = current_trial.add_sample(
@@ -5079,7 +5268,9 @@ class MainWindow(QMainWindow):
         self.monitor_stats_label.setText(
             f"{self.telemetry_statistics.sample_count} отсчётов · "
             f"{self.telemetry_statistics.frequency_hz:.1f} Гц · "
-            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс{rejected}"
+            f"jitter {self.telemetry_statistics.jitter_s * 1000:.2f} мс · "
+            f"очередь UI {self.telemetry_statistics.latest_processing_lag_s * 1000:.0f} мс "
+            f"(max {self.telemetry_statistics.maximum_processing_lag_s * 1000:.0f}){rejected}"
         )
         self._refresh_live_plot()
         recorder_error = self.telemetry_recorder.last_error
@@ -5105,10 +5296,12 @@ class MainWindow(QMainWindow):
             visible = self.plot_checks[name].isChecked()
             curve.setVisible(visible)
             if visible:
-                times, values = self._telemetry_series[name]
+                series = self._telemetry_series[name]
+                times, values = series.window(
+                    (self._last_sample.timestamp_s if self._last_sample else 0.0) - window_s
+                )
                 if times:
-                    start = bisect_left(times, times[-1] - window_s)
-                    curve.setData(times[start:], values[start:])
+                    curve.setData(times, values)
                     last_timestamp = max(last_timestamp or times[-1], times[-1])
                 else:
                     curve.setData([], [])
@@ -5252,6 +5445,8 @@ class MainWindow(QMainWindow):
         self._telemetry_watchdog_timer.stop()
         self._friction_timer.stop()
         self._current_trial_timer.stop()
+        if self._instruction_runner_dialog is not None:
+            self._instruction_runner_dialog.poll_timer.stop()
         self.telemetry_recorder.stop()
         self.friction_recorder.stop()
         self.current_trial_recorder.stop()

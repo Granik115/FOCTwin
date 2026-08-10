@@ -5,9 +5,9 @@ This module deliberately owns no Serial, Commander or Qt object.  It validates t
 a request is safe to simulate, is waiting for a motor, is waiting for local permission or may be
 handed to the existing attended UI executor.
 
-Remote hardware execution is hard-disabled in this beta.  A remote request can therefore move
-from ``waiting_for_motor`` to ``waiting_for_permission`` when the environment changes, but it can
-never become ``ready`` or ``running`` through this controller.
+An instruction request can become ``ready`` only after a person locally arms its exact immutable
+configuration for a short period.  A separate instruction may consume that one-shot permission;
+restart, expiry or any changed safety precondition revokes it.
 """
 
 from __future__ import annotations
@@ -17,14 +17,15 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
 from foctwin.current_trial import CurrentTrialConfig
 
 CURRENT_TRIAL_REQUEST_SCHEMA = 1
+REMOTE_ARM_TTL = timedelta(minutes=2)
 
 
 def utc_now() -> datetime:
@@ -79,9 +80,14 @@ class CurrentTrialEnvironment:
     telemetry_fresh: bool = False
     telemetry_complete: bool = False
     friction_idle: bool = True
+    current_trial_idle: bool = True
     command_channel_idle: bool = True
     phase_resistance_valid: bool = False
     local_permission: bool = False
+    telemetry_sample_rate_hz: float = 0.0
+    telemetry_ui_lag_ms: float = 0.0
+    telemetry_ui_max_lag_ms: float = 0.0
+    telemetry_plot_points: int = 0
 
     def blockers(self) -> tuple[str, ...]:
         blockers: list[str] = []
@@ -97,6 +103,8 @@ class CurrentTrialEnvironment:
             blockers.append("telemetry_incomplete")
         if not self.friction_idle:
             blockers.append("friction_trial_running")
+        if not self.current_trial_idle:
+            blockers.append("current_trial_running")
         if not self.command_channel_idle:
             blockers.append("command_channel_busy")
         if not self.phase_resistance_valid:
@@ -111,9 +119,14 @@ class CurrentTrialEnvironment:
             "telemetry_fresh": self.telemetry_fresh,
             "telemetry_complete": self.telemetry_complete,
             "friction_idle": self.friction_idle,
+            "current_trial_idle": self.current_trial_idle,
             "command_channel_idle": self.command_channel_idle,
             "phase_resistance_valid": self.phase_resistance_valid,
             "local_permission": self.local_permission,
+            "telemetry_sample_rate_hz": self.telemetry_sample_rate_hz,
+            "telemetry_ui_lag_ms": self.telemetry_ui_lag_ms,
+            "telemetry_ui_max_lag_ms": self.telemetry_ui_max_lag_ms,
+            "telemetry_plot_points": self.telemetry_plot_points,
             "blockers": list(self.blockers()),
         }
 
@@ -138,6 +151,11 @@ class CurrentTrialDecision:
         return self.state in TERMINAL_REQUEST_STATES
 
     def to_dict(self) -> dict[str, object]:
+        remote_execution_enabled = bool(
+            self.source == CurrentTrialRequestSource.INSTRUCTION
+            and self.mode == CurrentTrialRequestMode.HARDWARE
+            and self.state == CurrentTrialRequestState.READY
+        )
         return {
             "schema": CURRENT_TRIAL_REQUEST_SCHEMA,
             "request_id": self.request_id,
@@ -151,7 +169,8 @@ class CurrentTrialDecision:
             "config": self.config,
             "environment": self.environment,
             "result": self.result,
-            "remote_hardware_execution_enabled": False,
+            "locally_armed": self.state == CurrentTrialRequestState.READY,
+            "remote_hardware_execution_enabled": remote_execution_enabled,
         }
 
 
@@ -205,7 +224,7 @@ class CurrentTrialController:
             connection.execute(
                 """
                 UPDATE current_trial_requests
-                SET state = ?, reason_code = ?, message = ?, updated_at = ?
+                SET state = ?, reason_code = ?, message = ?, result_json = '{}', updated_at = ?
                 WHERE state IN (?, ?)
                 """,
                 (
@@ -323,10 +342,23 @@ class CurrentTrialController:
                     "motor_not_connected",
                     "Аппаратный запрос сохранён и ждёт подключения мотора",
                 )
+            if blockers:
+                first = blockers[0]
+                return (
+                    CurrentTrialRequestState.WAITING_FOR_PERMISSION,
+                    first,
+                    f"Локальное разрешение пока невозможно: {first}",
+                )
+            if not environment.local_permission:
+                return (
+                    CurrentTrialRequestState.WAITING_FOR_PERMISSION,
+                    "local_arm_required",
+                    "Выберите этот запрос в FOCTwin и выдайте одноразовое локальное разрешение",
+                )
             return (
-                CurrentTrialRequestState.WAITING_FOR_PERMISSION,
-                "remote_hardware_locked",
-                "Удалённый аппаратный запуск заблокирован до будущего локального вооружения",
+                CurrentTrialRequestState.READY,
+                "locally_armed",
+                "Точный план локально разрешён и ждёт отдельной команды запуска",
             )
         if blockers:
             first = blockers[0]
@@ -337,6 +369,7 @@ class CurrentTrialController:
                 "telemetry_not_fresh": "Нет свежей распознанной телеметрии",
                 "telemetry_incomplete": "Нужны угол, Iq, Id, Uq и Ud",
                 "friction_trial_running": "Сначала завершите выполняющийся тест трения",
+                "current_trial_running": "Сначала завершите выполняющийся токовый опыт",
                 "command_channel_busy": "Дождитесь завершения текущей отправки команд",
                 "phase_resistance_invalid": "Нужно положительное сопротивление фазы",
             }
@@ -434,6 +467,8 @@ class CurrentTrialController:
             "phases": [
                 "configure_position",
                 "position_and_settle",
+                "configure_low_voltage_current_sense",
+                "current_sense_zero_positive_zero_negative",
                 "configure_current_at_zero",
                 "baseline",
                 "current_step",
@@ -454,6 +489,8 @@ class CurrentTrialController:
                 "target_current_a": config.current_target_limit_a,
                 "trip_current_a": config.current_trip_limit_a,
                 "working_voltage_v": config.current_voltage_limit_v,
+                "current_sense_voltage_v": config.current_sense_voltage_v,
+                "current_sense_trip_current_a": config.current_sense_current_trip_a,
                 "absolute_current_a": config.absolute_current_limit_a,
                 "absolute_voltage_v": config.absolute_voltage_limit_v,
                 "absolute_angle_rad": [
@@ -556,17 +593,67 @@ class CurrentTrialController:
         decision = self.get_by_command(command_id)
         if decision is None:
             raise CurrentTrialControllerError("request_not_found", "Запрос опыта не найден")
-        if decision.terminal or decision.mode == CurrentTrialRequestMode.SIMULATION:
+        try:
+            CurrentTrialConfig.from_dict(decision.config)
+        except (KeyError, TypeError, ValueError) as exc:
+            return self._update(
+                decision.request_id,
+                state=CurrentTrialRequestState.FAILED,
+                reason_code="stored_config_no_longer_valid",
+                message=f"Сохранённый план несовместим с текущими пределами: {exc}",
+                result={"validation_error": str(exc)},
+            )
+        if (
+            decision.terminal
+            or decision.mode == CurrentTrialRequestMode.SIMULATION
+            or decision.state == CurrentTrialRequestState.RUNNING
+        ):
             return decision
+        if decision.state == CurrentTrialRequestState.READY:
+            armed_until_text = str(decision.result.get("armed_until", ""))
+            try:
+                armed_until = datetime.fromisoformat(armed_until_text.replace("Z", "+00:00"))
+            except ValueError:
+                armed_until = datetime.min.replace(tzinfo=timezone.utc)
+            now = self.now_factory().astimezone(timezone.utc)
+            blockers = environment.blockers()
+            if armed_until <= now or blockers:
+                code = "local_arm_expired" if armed_until <= now else blockers[0]
+                message = (
+                    "Одноразовое локальное разрешение истекло"
+                    if armed_until <= now
+                    else f"Одноразовое разрешение отозвано: {blockers[0]}"
+                )
+                return self._update(
+                    decision.request_id,
+                    state=CurrentTrialRequestState.WAITING_FOR_PERMISSION,
+                    reason_code=code,
+                    message=message,
+                    environment=environment.to_dict(),
+                    result={},
+                )
+            if environment.to_dict() != decision.environment:
+                return self._update(
+                    decision.request_id,
+                    state=CurrentTrialRequestState.READY,
+                    reason_code=decision.reason_code,
+                    message=decision.message,
+                    environment=environment.to_dict(),
+                    result=decision.result,
+                )
+            return decision
+        # Refreshing a file-backed request must never grant permission.  Only
+        # ``arm_instruction`` may honor the local UI's one-shot consent.
+        unarmed_environment = replace(environment, local_permission=False)
         state, code, message = self._decision_for(
             CurrentTrialRequestSource.INSTRUCTION,
             CurrentTrialRequestMode.HARDWARE,
-            environment,
+            unarmed_environment,
         )
         if (
             state == decision.state
             and code == decision.reason_code
-            and environment.to_dict() == decision.environment
+            and unarmed_environment.to_dict() == decision.environment
         ):
             return decision
         return self._update(
@@ -574,7 +661,103 @@ class CurrentTrialController:
             state=state,
             reason_code=code,
             message=message,
+            environment=unarmed_environment.to_dict(),
+        )
+
+    def arm_instruction(
+        self,
+        command_id: str,
+        environment: CurrentTrialEnvironment,
+        *,
+        ttl: timedelta = REMOTE_ARM_TTL,
+    ) -> CurrentTrialDecision:
+        decision = self.get_by_command(command_id)
+        if decision is None:
+            raise CurrentTrialControllerError("request_not_found", "Запрос опыта не найден")
+        if decision.source != CurrentTrialRequestSource.INSTRUCTION:
+            raise CurrentTrialControllerError(
+                "request_source_mismatch", "Одноразово разрешать можно только инструкцию"
+            )
+        try:
+            CurrentTrialConfig.from_dict(decision.config)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CurrentTrialControllerError(
+                "stored_config_no_longer_valid",
+                f"Сохранённый план несовместим с текущими пределами: {exc}",
+            ) from exc
+        if decision.mode != CurrentTrialRequestMode.HARDWARE or decision.terminal:
+            raise CurrentTrialControllerError(
+                "request_not_armable", "Этот запрос нельзя вооружить для аппаратного запуска"
+            )
+        if decision.state not in {
+            CurrentTrialRequestState.WAITING_FOR_MOTOR,
+            CurrentTrialRequestState.WAITING_FOR_PERMISSION,
+        }:
+            raise CurrentTrialControllerError(
+                "request_not_armable",
+                f"Запрос нельзя повторно разрешить из состояния {decision.state.value}",
+            )
+        if ttl <= timedelta(0) or ttl > timedelta(minutes=5):
+            raise CurrentTrialControllerError(
+                "invalid_arm_ttl", "Разрешение должно действовать не больше пяти минут"
+            )
+        state, code, message = self._decision_for(
+            CurrentTrialRequestSource.INSTRUCTION,
+            CurrentTrialRequestMode.HARDWARE,
+            environment,
+        )
+        if state != CurrentTrialRequestState.READY:
+            raise CurrentTrialControllerError(code, message)
+        armed_until = self.now_factory().astimezone(timezone.utc) + ttl
+        return self._update(
+            decision.request_id,
+            state=state,
+            reason_code=code,
+            message=message,
             environment=environment.to_dict(),
+            result={
+                "armed_until": _iso(armed_until),
+                "arm_consumed": False,
+            },
+        )
+
+    def start_instruction(
+        self,
+        command_id: str,
+        environment: CurrentTrialEnvironment,
+    ) -> CurrentTrialDecision:
+        decision = self.refresh_instruction(command_id, environment)
+        if decision.state != CurrentTrialRequestState.READY:
+            raise CurrentTrialControllerError(
+                "request_not_armed",
+                f"Опыт нельзя запустить из состояния {decision.state.value}: {decision.message}",
+            )
+        if environment.blockers():
+            raise CurrentTrialControllerError(
+                environment.blockers()[0], "Условия изменились после локального разрешения"
+            )
+        result = dict(decision.result)
+        result["arm_consumed"] = True
+        result["started_at"] = _iso(self.now_factory())
+        return self._update(
+            decision.request_id,
+            state=CurrentTrialRequestState.RUNNING,
+            reason_code="remote_triggered_after_local_arm",
+            message="Одноразовое разрешение использовано; токовый опыт передан исполнителю",
+            environment=environment.to_dict(),
+            result=result,
+        )
+
+    def fail_instruction_start(self, command_id: str, message: str) -> CurrentTrialDecision:
+        decision = self.get_by_command(command_id)
+        if decision is None:
+            raise CurrentTrialControllerError("request_not_found", "Запрос опыта не найден")
+        return self._update(
+            decision.request_id,
+            state=CurrentTrialRequestState.FAILED,
+            reason_code="executor_start_failed",
+            message=message,
+            result={**decision.result, "executor_error": message},
         )
 
     def _update(
@@ -662,7 +845,7 @@ class CurrentTrialController:
         if decision.state == CurrentTrialRequestState.RUNNING:
             raise CurrentTrialControllerError(
                 "remote_running_cancel_unavailable",
-                "Эта бета не запускает удалённые аппаратные опыты",
+                "Выполняющийся опыт должен останавливать подключённый исполнитель",
             )
         return self._update(
             decision.request_id,
