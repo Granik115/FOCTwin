@@ -19,6 +19,25 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.5.0b1
+
+- Replace the inactive high-level scenario editor with an executable, deliberately small
+  `.focscript` language: exact firmware Commander lines plus `WAIT <seconds>`.
+- Add manual Open, Save, Save As, Validate, Run and Stop controls under the renamed
+  **Команды и программы** workspace. Editing invalidates the previous validation.
+- Create one unique plain-file directory per run with `program.focscript`, ordered
+  `execution.jsonl`, `telemetry.csv` and atomic `summary.json`.
+- Abort a program on Serial loss, write failure or telemetry-log failure; never auto-resume after
+  reconnect. User Stop and the global emergency action send the existing best-effort stop.
+- Keep normal completion literal: FOCTwin adds no hidden firmware command, so the program's safe
+  `A0`/`AE0` ending remains visible and reviewable.
+- Remove the built-in GPT/Google Drive bridge, instruction scanner and their cloud dependencies.
+  FolderBridge remains an external file synchronizer with no direct motor path.
+- Replace stale editable COM fallbacks with the actual enumerated ports and explain missing cable,
+  power or driver when no port exists.
+- Preserve the 0.4.2b6 current-unit correction, passive current-sense baseline and guarded motor
+  experiments while removing their remote-instruction UI entry points.
+
 ## 0.4.2b6
 
 - Add a `0.3 s` passive current-sense baseline before the first motor configuration command.
@@ -110,8 +129,8 @@ Until code signing is introduced, Windows SmartScreen may warn when the executab
   buttons that generate valid local examples for the home test.
 - Keep the backend free of Qt, Serial, Commander and experiment imports. Motor/PWM/raw command,
   shell and arbitrary-code paths do not exist; known hardware-like types are explicitly rejected.
-- Document the two one-way FolderBridge jobs, exact envelope/event formats and interruption test
-  procedure in `docs/instruction-runner.md`.
+- Document the then-current two one-way FolderBridge jobs, envelope/event formats and interruption
+  test procedure (the obsolete runner and document are removed in 0.5.0b1).
 
 ## 0.4.1b1
 

@@ -12,7 +12,7 @@ a = Analysis(
         (str(root / "profiles"), "profiles"),
         (str(root / "matlab"), "matlab"),
     ],
-    hiddenimports=["keyring.backends.Windows"],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -2,238 +2,153 @@
 
 **Identify. Simulate. Tune.**
 
-FOCTwin is a Windows engineering workstation for a SimpleFOC-controlled PMSM:
-
-1. record controlled experiments on the real azimuth drive;
-2. identify inertia and nonlinear friction for a Simulink digital twin;
-3. tune current, velocity and position controllers in simulation;
-4. refine the accepted parameters on the real drive with bounded steps and rollback.
-
-The project intentionally exposes the full control surface instead of hiding it behind a
-single wizard. Manual control, raw Commander commands, repeatable FOCTwin scenarios,
-identification, tuning, analysis, project history and detailed logs live in separate sections.
+FOCTwin — Windows-приложение для управления PMSM с прошивкой SimpleFOC, записи
+экспериментов, идентификации установки и работы с цифровым двойником в MATLAB/Simulink.
 
 > [!WARNING]
-> The current firmware cannot be changed and has no confirmed host heartbeat shutdown.
-> Software emergency stop is therefore best-effort (`target=0`, then `AE0` repeatedly).
-> Loss of USB or a frozen PC cannot guarantee PWM shutdown. Keep physical access to power
-> during every real-motor test.
+> У текущей прошивки нет подтверждённого аппаратного heartbeat shutdown. Аварийная остановка
+> с компьютера выполняется best-effort (`target=0`, затем несколько `AE0`). При потере USB или
+> зависании ПК программно гарантировать снятие PWM нельзя. Во время работы с мотором держите
+> физическое отключение питания доступным.
 
-## Current milestone
+## Пререлиз 0.5.0b1
 
-The attended hardware build 0.4.2b6 keeps the small diagnostic current trial, corrects the
-current-unit contract exposed by remote trial 61 and classifies the trial-63 PWM-off noise before
-any power-stage command:
+Этот пререлиз возвращает простой локальный рабочий цикл «файл → приложение → мотор → файлы
+результата»:
 
-- a separate **Инструкции** window that opens without a project, COM port or motor;
-- FolderBridge-compatible `inbox/commands` and `outbox/events|artifacts|status.json` trees under a
-  user-selected exchange root;
-- strict schema-1 command envelopes, UUID/filename checks, expiry and size limits, target Instance
-  IDs, SHA-256 conflict detection and a durable SQLite journal outside the synchronized folders;
-- immutable `accepted → running → completed` event chains, explicit rejection events and recovery
-  of journaled diagnostic commands after application or power interruption;
-- the same durable controller validates requests from both the attended current-trial button and
-  FolderBridge instructions, with restart-safe request states in a separate SQLite journal;
-- the experimental step is `0.01 A`; current Q/D starts at `P=0.4`, `I=40`, ramp `50 V/s`, with a
-  `0.1 A` command ceiling and `2 V` working voltage;
-- before FOC Current is enabled, a direct-voltage `±0.01 V` preflight checks that Iq follows the
-  commanded sign and that Id does not dominate; failure stops without entering the current PI;
-- every attempt begins with a `0.3 s` passive PWM-off baseline. Iq/Id are recorded as a sensor
-  signal, not mistaken for physical current; a peak above `0.05 A` or non-zero Uq/Ud stops the
-  attempt before transport configuration or PWM enable;
-- SimpleFOC monitor currents are handled in their native ampere units; the real trial-61 packet
-  `Iq=-5.8088`, `Id=-29.9526` now reaches the emergency guard without a `/1000` rescale;
-- firmware speed participates in the current-trial stop path, while a single coordinate packet
-  that resets to zero is held for one sample and must persist before its derived velocity can stop
-  the trial; real or persistent twofold excursions still stop immediately;
-- live plot history uses bounded constant-time buffers and renders a decimated window; the status
-  reports UI processing lag so long telemetry sessions no longer degrade after 60,000 points;
-- each completed or failed current-trial ZIP is copied atomically into
-  `outbox/artifacts/<command-id-or-local-trial>/`, ready for FolderBridge without a manual copy;
-- `run_current_trial` still only queues an immutable plan. A person must select that exact plan in
-  FOCTwin and arm it without a timer; a separate `start_current_trial` consumes the permission once;
-- restart or changed hardware conditions revoke the arm, and
-  `cancel_current_trial` can also route an attended emergency stop for a running trial.
+- раздел **«Консоль и сценарии»** переименован в **«Команды и программы»**;
+- одну Commander-команду по-прежнему можно отправить из вкладки **«Одна команда»**;
+- программа состоит только из строк, которые уже понимает прошивка, и команды `WAIT`;
+- программу можно открыть через Проводник, проверить, при необходимости отредактировать,
+  сохранить и запустить вручную;
+- каждый запуск получает отдельную папку с исходником, журналом исполнения, телеметрией и
+  итоговым JSON;
+- встроенные окна **«Связь с GPT»** и **«Инструкции»**, прямой Google OAuth и автоматический
+  файловый исполнитель удалены;
+- FOCTwin не обращается к Google Drive: синхронизацией локальных папок занимается отдельный
+  FolderBridge;
+- сохранённый COM-порт используется только если он реально найден. При отсутствии устройств
+  интерфейс подсказывает проверить USB-кабель, питание платы и драйвер.
 
-The FolderBridge setup, exact JSON schema and home-test procedure are documented in
-[`docs/instruction-runner.md`](docs/instruction-runner.md).
+Синтаксис, ограничения, структура журналов и тестовый сценарий описаны в
+[`docs/programs.md`](docs/programs.md).
 
-The preserved 0.4.1b1 milestone keeps the complete 0.4.0 current-trial implementation unchanged
-and adds:
+## Рабочий цикл с Google Drive
 
-- a separate **Связь с GPT** window that opens without a project, COM port or motor;
-- direct Google Drive API authorization for a Desktop OAuth client; Google Drive Desktop is not
-  required;
-- a narrow `drive.file` workspace named `FOCTwin_Bridge_<ID>` with separate one-writer inbox and
-  outbox streams;
-- a locally durable outgoing queue, UUID deduplication, restart recovery, three-second polling,
-  visible delay/status information and an expandable technical log;
-- an explicit schema-1 safety boundary that accepts only human-readable `CHAT` messages and
-  rejects every incoming command kind before it can reach any motor code.
+1. FolderBridge переносит `.focscript` из папки Google Drive в локальную папку, например
+   `Документы\AutotunerExchange\inbox\programs`.
+2. Пользователь открывает файл в **«Команды и программы»**, проверяет его и нажимает
+   **«Запустить»**. Полученный с диска файл сам по себе никогда не запускает мотор.
+3. FOCTwin последовательно отправляет команды в Serial и пишет запуск в
+   `Документы\AutotunerExchange\outbox\runs\<run-id>`.
+4. FolderBridge синхронизирует эту папку обратно в Google Drive.
+5. По журналу и телеметрии можно подготовить следующий `.focscript`, после чего цикл повторяется.
 
-First-time OAuth setup and the exact file protocol are documented in
-[`docs/drive-bridge.md`](docs/drive-bridge.md).
+В FOCTwin нет учётных данных Google, сетевого опроса, удалённого `START` и автоматического
+возобновления программы после обрыва связи.
 
-The preserved 0.4.0 milestone contains:
+## Минимальный пример программы
 
-- a runnable PySide6 desktop shell with full-control workspaces;
-- a one-button guarded current-step trial in the real-motor tuning workspace: it captures the
-  current shaft coordinate, settles there through the accepted `Angle + Voltage` transport
-  controller, switches with PWM disabled to `Torque + FOC Current`, records a bounded step and
-  returns to the captured coordinate;
-- conservative first-run defaults (`0.1 A`, current Q/D `P=8.4222`, `I=814`, `1–2–1 s`,
-  approximately `100 Hz`) with independent working and absolute envelopes up to
-  `24 V / 5 A / ±4 rad`;
-- durable restart of the whole unfinished current trial after stale telemetry, Serial loss,
-  board reset, application restart or physical power interruption, never scoring a partial
-  attempt as successful;
-- an alert while recovery has remained impossible for more than five seconds, up to 50 recovery
-  attempts, safe reconnect beginning with `AE0`, and automatic restoration of the user's manual
-  configuration with PWM disabled;
-- a single `*_SEND_ME.zip` export containing the result JSON and every CSV segment required for
-  remote diagnosis;
-- a typed SimpleFOC Commander encoder for device ID `A`;
-- a serial transport with paced Commander writes, transparent DTR recovery and a best-effort
-  emergency stop;
-- verified read/apply controls for the linked device limits and every firmware PID/LPF loop;
-- fragmentation-safe monitoring with staged stream recovery, rejection/counters for damaged USB
-  rows, stable live plots, native ampere current values, live rate/jitter and non-blocking durable
-  CSV recording;
-- safe reconnect that requests `AE0` before restoring monitoring and reading configuration;
-- persistent manual-control values and one paced action for limits, PID/LPF, modes, target and
-  monitoring before PWM is enabled;
-- an actuator preflight that alternates short direct-Uq pulses, zeros Uq on the first detected
-  movement and finds breakaway independently in both directions;
-- an evidence mode that compares raw encoder/SSI behaviour with PWM disabled and enabled, preserves
-  both raw and accepted angles, and distinguishes PWM-correlated dropouts from independent faults;
-- residual breakaway confirmation after Uq returns to zero, with repeated signed trials that keep
-  reversible elastic motion separate from static-friction thresholds;
-- a two-electrical-period position preset derived from the motor pole-pair count, plus explicit
-  tests for electrical-period repetition and approach-direction hysteresis;
-- fixed-Uq, distance-bounded velocity comparisons and repeated fixed-limit position steps of ±0.1,
-  ±0.3 and ±0.6 rad, so controller evidence and same-start dispersion are not altered by adaptive
-  voltage ceilings;
-- separate recording of commanded Uq, actual Uq and measured Iq; movement in both directions
-  advances the diagnostic, while missing measured-current evidence invalidates affected friction
-  points instead of hiding the rest of the experiment;
-- a gated six-point velocity experiment at low, geometric-middle and high speed in both
-  directions, retaining transient rise, acceleration and overshoot diagnostics as well as
-  steady-state tracking;
-- a cumulative position map that keeps each breakaway coordinate and divides velocity sweeps into
-  configurable angle bins, storing measured-Iq torque separately from a diagnostic Uq estimate;
-- optional multi-position friction runs: the current coordinate is measured first, then the
-  loaded angle/velocity controllers move by a signed configurable step and repeat a zero baseline,
-  local preflight and all six velocity points at every bounded position;
-- configurable forward/reverse map passes that revisit coordinates to expose approach-direction
-  hysteresis and repeatability instead of collapsing every coordinate into one sample;
-- adaptive automatic positioning that raises only its own ALC after both a progress stall and
-  confirmed Uq saturation, up to a separately approved voltage ceiling; a stall without
-  saturation is reported as a controller/mode problem;
-- continuous host-side angle tracking across board resets, with position commands translated back
-  into the board's current turn reference so a ±2π reset cannot request an extra revolution;
-- sustained-current validation that rejects sparse or wrong-sign Iq bursts instead of accepting
-  a speed point after only three nonzero current samples;
-- automatic stop/recovery/retry of an interrupted friction point when telemetry stalls or the
-  Serial link reconnects, with 50 recoveries by default for board-reset workflows;
-- a decisive evidence preset with a 3 V preflight floor, automatic expansion of the reported
-  0.5 V failed checkpoint, and mandatory retry of any pulse that did not record enough telemetry;
-- an optional short alert after telemetry finally returns from an interruption longer than five
-  seconds, selectable in every test-start confirmation;
-- a structured diagnostic report covering zero-signal quality, position-step performance,
-  breakaway envelopes, directional asymmetry, repeated-position variability, speed tracking,
-  measured-Iq usability, telemetry interruptions and readiness for Simulink identification,
-  saved as a short standalone JSON alongside the full experiment export;
-- robust objective-dispersion evidence and a recommended repeat count for a future guarded
-  real-motor optimizer, plus a data-driven stateful semi-mechanical friction-model recommendation;
-- explicit review before identified friction values are accepted into the active profile;
-- automatically synchronized experiment, FOCTwin and SimpleFOC limits, with command ALC kept
-  separate from the independently measured-current emergency threshold and every change stated
-  in the confirmation dialog;
-- automatic reconciliation of the positioning and fixed-velocity Uq ceilings with the pulse
-  ceiling and the global experiment voltage limit, reported once without blocking test startup;
-- PWM-off observations ignore inactive Uq/Ud telemetry while retaining current and travel safety,
-  and a checkpoint taken after that observation resumes with PWM-enabled actuator preflight;
-- temporary direct-voltage operation for actuator preflight followed by automatic restoration of
-  phase resistance and the user's manual configuration with PWM left disabled;
-- rolling angle-slope speed and confirmed small-motion detection for experiment decisions, with
-  isolated encoder dropouts/jumps rejected while impossible firmware velocity remains diagnostic;
-- debounced working limits for isolated telemetry/control spikes, while twofold excursions,
-  travel violations and telemetry loss still stop immediately;
-- editable safety limits and a Russian FOCTwin scenario language;
-- durable project folders with SQLite events, atomic checkpoints and raw telemetry files;
-- the supplied voltage/current Simulink models and MATLAB tuning sources;
-- JSON-file MATLAB simulation and checkpointed `surrogateopt` tuning APIs for R2022b;
-- tests for protocol encoding, scenarios, safety checks and project recovery.
-
-Hardware execution and MATLAB simulations are deliberately not started on application launch.
-The guarded current trial starts only after a user opens a project, connects the motor and
-explicitly confirms the one-button run.
-
-## Download for Windows
-
-Open [GitHub Releases](https://github.com/Granik115/FOCTwin/releases), expand **Assets** for
-the newest version and download `FOCTwin-<version>-windows-x64.zip`. Extract the whole
-archive and run `FOCTwin.exe`; installation and a separate Python environment are not
-required for manual motor control.
-
-Preview builds are intentionally marked as pre-releases while real-hardware testing is in
-progress. They are not code-signed yet, so Windows SmartScreen can display a warning. MATLAB
-R2022b and its Python Engine are still required for the simulation and tuning workspaces.
-
-## Update a source checkout
-
-`git pull` is supported for the development/project form of FOCTwin. Clone and update the
-stable project branch with:
-
-```powershell
-git clone https://github.com/Granik115/FOCTwin.git
-cd FOCTwin
-git switch main
-git pull --ff-only origin main
+```text
+# Строки прошивки передаются без перевода
+AE0
+AT0
+AC2
+ALU3
+ALV0.2
+A0
+AE1
+A0.2
+WAIT 2.0
+A0
+WAIT 1.0
+AE0
 ```
 
-An existing editable Python installation uses the updated sources immediately. Run
-`python -m pip install -e ".[dev]"` again only when dependencies change. A portable ZIP from
-GitHub Releases has no Git metadata and is updated by downloading the next ZIP instead.
+`WAIT` задаётся в секундах. Пустые строки и строки, начинающиеся с `#`, игнорируются. Условий,
+циклов и вычислений в версии 0.5.0b1 нет.
 
-## Development setup
+## Установка готовой Windows-сборки
 
-MATLAB R2022b supports Python 3.10, so FOCTwin pins that interpreter family.
+Откройте [GitHub Releases](https://github.com/Granik115/FOCTwin/releases), раскройте **Assets** у
+`v0.5.0b1` и скачайте `FOCTwin-0.5.0b1-windows-x64.zip`. Распакуйте архив целиком и запустите
+`FOCTwin.exe`; Python для portable-сборки не нужен.
+
+Сборка пока не подписана, поэтому Windows SmartScreen может показать предупреждение. MATLAB
+R2022b и Python Engine нужны только для разделов моделирования и тюнинга, но не для ручных
+Commander-команд и `.focscript`.
+
+Установка и проверка хеша из PowerShell:
 
 ```powershell
+$Version = "0.5.0b1"
+$Base = "https://github.com/Granik115/FOCTwin/releases/download/v${Version}"
+$Zip = "FOCTwin-${Version}-windows-x64.zip"
+
+Invoke-WebRequest "$Base/$Zip" -OutFile $Zip
+Invoke-WebRequest "$Base/$Zip.sha256" -OutFile "$Zip.sha256"
+$Expected = ((Get-Content "$Zip.sha256" -Raw).Trim() -split '\s+')[0]
+$Actual = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Expected) { throw "SHA-256 не совпал" }
+
+Expand-Archive $Zip -DestinationPath "FOCTwin-${Version}" -Force
+& ".\FOCTwin-${Version}\FOCTwin\FOCTwin.exe"
+```
+
+## Запуск из исходников пререлиза
+
+FOCTwin использует Python 3.10, совместимый с MATLAB Engine R2022b.
+
+```powershell
+git clone --branch release/v0.5.0b1 --single-branch https://github.com/Granik115/FOCTwin.git
+cd FOCTwin
 py -3.10 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
 python -m foctwin
 ```
 
-MATLAB Engine is installed from the R2022b installation rather than from PyPI:
+Для разработки установите дополнительные зависимости и запустите проверки:
+
+```powershell
+python -m pip install -e ".[dev]"
+python -m unittest discover -s tests -v
+ruff check src tests
+```
+
+MATLAB Engine устанавливается из MATLAB R2022b, а не из PyPI:
 
 ```powershell
 cd "C:\Program Files\MATLAB\R2022b\extern\engines\python"
 python -m pip install .
 ```
 
-## Tests
+## Основные возможности
 
-```powershell
-python -m unittest discover -s tests -v
-ruff check src tests
-```
+- ручное управление и точные SimpleFOC Commander-команды;
+- мониторинг, живые графики и CSV-телеметрия;
+- локальные последовательные `.focscript`-программы;
+- защищённый диагностический токовый опыт и многоэтапный тест трения;
+- проектные папки с SQLite-журналом, checkpoint и экспортами;
+- модели и MATLAB API для идентификации и тюнинга цифрового двойника;
+- настраиваемые ограничения тока, напряжения, скорости и координаты.
 
-## Repository layout
+Аппаратные опыты и MATLAB никогда не запускаются при старте приложения автоматически.
+
+## Структура репозитория
 
 ```text
-src/foctwin/        Python application
-matlab/api/         stable JSON input/output interface
-matlab/models/      supplied Simulink models
-matlab/tuning/      tuning prototypes and future optimization services
-profiles/           versioned motor/profile defaults
-docs/               requirements, architecture and safety notes
-tests/              core tests that do not require MATLAB or hardware
+src/foctwin/        Python-приложение
+matlab/api/         JSON-интерфейс Python ↔ MATLAB
+matlab/models/      модели Simulink
+matlab/tuning/      прототипы тюнинга
+profiles/           профили мотора и установки
+docs/               требования, архитектура и инструкции
+tests/              тесты без обязательного мотора и MATLAB
 ```
 
-The manual-control behaviour and the distinction between firmware and host-side limits are
-documented in [`docs/manual-control.md`](docs/manual-control.md).
+Ручное управление и различие между пределами прошивки и защитой хоста описаны в
+[`docs/manual-control.md`](docs/manual-control.md).
 
-No software license has been selected yet.
+Лицензия проекта пока не выбрана.

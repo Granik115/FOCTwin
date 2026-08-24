@@ -29,32 +29,27 @@ that would weaken every host-side current limit by the same factor.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Shared instruction admission (0.4.2b6)
+## Local command programs (0.5.0b1)
 
-Receiving a remote hardware instruction still cannot issue a motor command. The runner lives in a
-separate module with no imports from Serial, Commander, friction or current-trial code. A narrow
-callback asks the shared admission controller to validate and simulate `run_current_trial`, or
-journal it as `waiting_for_motor` / `waiting_for_permission`. Neither module owns a Serial or
-Commander object. Arbitrary Python, PowerShell, raw Commander text and executable launch are not
-protocol features.
+A synchronized file cannot start the motor. FOCTwin neither watches the input directory nor owns
+a Google Drive client. A person must open the file, validate the rendered `TX`/`WAIT` sequence and
+press **Запустить** while Serial is connected. Editing the text invalidates that approval.
 
-Incoming files are bounded to 256 KiB, must be UTF-8 JSON, have a filename matching their UUID,
-include timezone-aware creation/expiry values and remain valid for no more than seven days. A
-SQLite journal outside the synchronized tree binds each UUID to its first SHA-256. Replaying an
-unchanged file has no effect; replacing it with different content produces a conflict event rather
-than another execution.
+The language accepts only one printable ASCII Commander token beginning with the active motor ID,
+`WAIT <nonnegative seconds>`, blank lines and full-line comments. It has no Python, PowerShell,
+shell, executable launch, include, variable, condition, loop or network feature. The format check
+does not prove that an opcode is suitable for the installed firmware or mechanism; that remains
+part of the visible human review.
 
-The controller validates the same `CurrentTrialConfig` used by the attended button and rejects
-unknown fields or invalid limit relationships. Simulation exports a plan with `executed: false`
-without opening Serial. A hardware instruction can transition to `ready` only when a person
-selects its exact Command ID in the local UI, reviews the immutable configuration and grants a
-one-shot arm without a timer. A separate `start_current_trial` rechecks the environment and
-consumes that arm once. Normal refresh, JSON content alone and a connected motor cannot grant
-permission. Restart or a changed prerequisite demotes the request to permission waiting.
+Files are bounded to 256 KiB and 10,000 executable lines. An individual wait is limited to 24
+hours and total waits to seven days. Each attended run stores the reviewed source, its SHA-256,
+ordered JSONL events, monitor telemetry and a final summary in a unique local directory.
 
-The `dry_run` capability reports `simulate_or_wait_for_one_shot_local_arm` but never dispatches the
-nested command. Cancellation of a running trial reaches only the existing attended executor's
-best-effort emergency stop callback.
+The runner excludes manual/configuration command queues and protected motor experiments while it
+is active. User Stop, write/log failure and stale telemetry request the existing best-effort stop.
+Serial loss marks the run interrupted; no command is automatically resumed after reconnect.
+Normal completion adds no hidden motor command, so a safe `A0`/`AE0` ending must remain visible in
+the program itself.
 
 ## Guarded current trial (0.4.2b6)
 

@@ -1,18 +1,15 @@
 import os
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QPlainTextEdit
+    from PySide6.QtWidgets import QApplication
 
     from foctwin.current_trial import CurrentTrialExperiment
-    from foctwin.drive_bridge_ui import DriveBridgeDialog
-    from foctwin.instruction_runner_ui import InstructionRunnerDialog
     from foctwin.protocol import CommanderResponse
     from foctwin.ui import MainWindow
 except ImportError:
@@ -84,144 +81,63 @@ class UiSmokeTests(unittest.TestCase):
                 window.manual_scroll.horizontalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded,
             )
+            self.assertIn("Команды и программы", window.NAVIGATION)
+            self.assertFalse(hasattr(window, "_open_drive_bridge"))
+            self.assertFalse(hasattr(window, "_open_instruction_runner"))
             window.close()
 
-    def test_drive_bridge_window_queues_chat_without_project_or_serial(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            dialog = DriveBridgeDialog(state_root=Path(temporary) / "bridge")
-            self.assertEqual(dialog.engine.snapshot().pending_count, 0)
-            self.assertFalse(dialog.open_folder_button.isEnabled())
-            self.assertIn("команды мотору", dialog.safety_label.text().lower())
-
-            dialog.message_input.setPlainText("Домашний тест без мотора")
-            dialog._queue_message()
-
-            snapshot = dialog.engine.snapshot()
-            self.assertEqual(snapshot.pending_count, 1)
-            self.assertEqual(snapshot.messages[-1].kind, "chat")
-            self.assertEqual(snapshot.messages[-1].text, "Домашний тест без мотора")
-            self.assertEqual(snapshot.credentials_path, "")
-            dialog.close()
-
-    def test_instruction_window_executes_ping_without_project_or_serial(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            dialog = InstructionRunnerDialog(
-                state_root=root / "state",
-                exchange_root=root / "exchange",
-                auto_scan=False,
-            )
-            self.assertIn("отдельная команда start", dialog.safety_label.text().lower())
-            self.assertIn("без таймера", dialog.safety_label.text().lower())
-            self.assertEqual(
-                dialog.arm_sample_button.text(),
-                "Разрешить выбранный план",
-            )
-            self.assertFalse(dialog.auto_scan_checkbox.isChecked())
-            self.assertTrue(dialog.runner.status_path.is_file())
-
-            dialog.runner.create_sample_command("ping")
-            result = dialog.runner.scan_once()
-            dialog._render_snapshot(dialog.runner.snapshot())
-
-            self.assertEqual(result.completed, 1)
-            self.assertEqual(dialog.history_table.rowCount(), 1)
-            self.assertEqual(dialog.history_table.item(0, 1).text(), "ping")
-            self.assertEqual(dialog.history_table.item(0, 2).text(), "completed")
-            dialog.close()
-
-    def test_instruction_window_simulates_and_queues_current_trial_without_serial(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            dialog = InstructionRunnerDialog(
-                state_root=root / "state",
-                exchange_root=root / "exchange",
-                auto_scan=False,
-            )
-
-            dialog.runner.create_sample_command("run_current_trial")
-            simulated = dialog.runner.scan_once()
-            dialog.runner.create_sample_command("queue_current_trial")
-            queued = dialog.runner.scan_once()
-            snapshot = dialog.runner.snapshot()
-
-            self.assertEqual(simulated.completed, 1)
-            self.assertEqual(queued.waiting, 1)
-            states = {record.state for record in snapshot.recent_commands}
-            self.assertIn("completed", states)
-            self.assertIn("waiting_for_motor", states)
-            self.assertFalse(
-                dialog.runner._status_payload()["remote_hardware_execution_enabled"]
-            )
-            dialog.close()
-
-    def test_instruction_arm_dialog_keeps_scrollable_details_and_visible_default_action(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            window = InstructionRunnerDialog(
-                state_root=root / "state",
-                exchange_root=root / "exchange",
-                auto_scan=False,
-            )
-
-            with patch.object(
-                QDialog,
-                "exec",
-                return_value=QDialog.DialogCode.Accepted,
-            ):
-                accepted = window._confirm_current_trial_arm(
-                    "00000000-0000-4000-8000-000000000001",
-                    {"step_current_a": 0.01, "current_kp": 0.4},
-                )
-
-            confirmation = window.findChild(QDialog, "currentTrialArmDialog")
-            details = confirmation.findChild(QPlainTextEdit, "currentTrialArmDetails")
-            buttons = confirmation.findChild(QDialogButtonBox, "currentTrialArmButtons")
-            allow = buttons.button(QDialogButtonBox.StandardButton.Yes)
-            cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
-
-            self.assertTrue(accepted)
-            self.assertIsNotNone(details)
-            self.assertTrue(details.isReadOnly())
-            self.assertIn('"step_current_a": 0.01', details.toPlainText())
-            self.assertTrue(allow.isDefault())
-            self.assertFalse(cancel.isDefault())
-            self.assertLessEqual(confirmation.height(), 540)
-            window.close()
-
-    def test_main_window_and_instruction_window_share_current_trial_controller(self):
+    def test_program_editor_validates_raw_firmware_commands_and_waits(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
             window = MainWindow(settings)
-
-            window._open_instruction_runner()
-            dialog = window._instruction_runner_dialog
-
-            self.assertIsNotNone(dialog)
-            self.assertIs(
-                dialog.current_trial_controller,
-                window.current_trial_controller,
+            window.program_editor.setPlainText(
+                "# exact firmware lines\nAE0\nA0.2\nWAIT 0.05\nA0\nAE0\n"
             )
-            environment = dialog.current_trial_environment_factory()
-            self.assertFalse(environment.motor_connected)
-            self.assertFalse(environment.local_permission)
+            window._compile_program()
+
+            self.assertIsNotNone(window._compiled_program)
+            self.assertEqual(window._compiled_program.command_count, 4)
+            self.assertEqual(window._compiled_program.wait_count, 1)
+            self.assertTrue(window.program_run_button.isEnabled())
+            self.assertIn("Проверка пройдена", window.program_output.toPlainText())
+            window.close()
+
+    def test_running_program_excludes_manual_and_experiment_command_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window._program_running = True
+
+            with patch.object(window.device, "send") as send:
+                self.assertFalse(window._send("AE0"))
+                send.assert_not_called()
+            self.assertIn("командную программу", window._current_trial_start_error())
+
+            window._program_running = False
             window.close()
 
     def test_manual_configuration_is_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = f"{temporary}/settings.ini"
-            first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
-            first.port_combo.setCurrentText("COM17")
-            first.motion_combo.setCurrentIndex(first.motion_combo.findData("velocity"))
-            first.target_spin.setValue(1.25)
-            first.device_limit_spins["current_a"].setValue(8.5)
-            first.current_limit.setValue(7.5)
-            first.monitor_downsample_spin.setValue(12)
-            first.pid_tables["velocity"].item(first.PID_ROW_BY_FIELD["p"], 1).setText("21.5")
-            first._save_user_settings()
-            first.close()
+            ports = [("COM17", "Test motor controller")]
+            with patch(
+                "foctwin.serial_device.SerialDevice.available_ports",
+                return_value=ports,
+            ):
+                first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+                first.port_combo.setCurrentText("COM17")
+                first.motion_combo.setCurrentIndex(first.motion_combo.findData("velocity"))
+                first.target_spin.setValue(1.25)
+                first.device_limit_spins["current_a"].setValue(8.5)
+                first.current_limit.setValue(7.5)
+                first.monitor_downsample_spin.setValue(12)
+                first.pid_tables["velocity"].item(
+                    first.PID_ROW_BY_FIELD["p"], 1
+                ).setText("21.5")
+                first._save_user_settings()
+                first.close()
 
-            second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+                second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
             self.assertEqual(second.port_combo.currentText(), "COM17")
             self.assertEqual(second.motion_combo.currentData(), "velocity")
             self.assertEqual(second.target_spin.value(), 1.25)
@@ -233,6 +149,27 @@ class UiSmokeTests(unittest.TestCase):
                 "21.5",
             )
             second.close()
+
+    def test_missing_saved_port_is_replaced_by_a_real_detected_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = f"{temporary}/settings.ini"
+            with patch(
+                "foctwin.serial_device.SerialDevice.available_ports",
+                return_value=[("COM17", "Old controller")],
+            ):
+                first = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+                first._save_user_settings()
+                first.close()
+
+            with patch(
+                "foctwin.serial_device.SerialDevice.available_ports",
+                return_value=[("COM8", "Connected controller")],
+            ):
+                second = MainWindow(QSettings(path, QSettings.Format.IniFormat))
+                self.assertEqual(second.port_combo.currentText(), "COM8")
+                self.assertIn("COM17", second.connection_details.text())
+                self.assertIn("не найден", second.connection_details.text())
+                second.close()
 
     def test_current_trial_settings_are_restored_between_program_runs(self):
         with tempfile.TemporaryDirectory() as temporary:

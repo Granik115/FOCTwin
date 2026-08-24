@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -55,15 +55,6 @@ from foctwin.current_trial import (
     CurrentTrialExperiment,
     CurrentTrialPhase,
 )
-from foctwin.current_trial_controller import (
-    CurrentTrialController,
-    CurrentTrialControllerError,
-    CurrentTrialDecision,
-    CurrentTrialEnvironment,
-    CurrentTrialRequestMode,
-    CurrentTrialRequestSource,
-    CurrentTrialRequestState,
-)
 from foctwin.domain import (
     MotionMode,
     MotorProfile,
@@ -101,6 +92,15 @@ from foctwin.friction import (
     PositioningResult,
 )
 from foctwin.matlab_backend import MatlabBackend
+from foctwin.program import (
+    MotorProgram,
+    MotorProgramCompiler,
+    ProgramError,
+    ProgramRunLogger,
+    ProgramStep,
+    render_program,
+    save_program_source,
+)
 from foctwin.project_store import ProjectStore
 from foctwin.protocol import (
     MONITOR_FIELDS,
@@ -110,7 +110,6 @@ from foctwin.protocol import (
     parse_commander_response,
     parse_monitor_line,
 )
-from foctwin.scenario import ScenarioCompiler, ScenarioError
 from foctwin.serial_device import SerialDevice
 from foctwin.telemetry import (
     TelemetryPlotSeries,
@@ -190,7 +189,7 @@ class MainWindow(QMainWindow):
         "Виртуальный тюнинг",
         "Доводка на моторе",
         "Анализ данных",
-        "Консоль и сценарии",
+        "Команды и программы",
         "Профили",
         "Журнал",
     )
@@ -211,10 +210,6 @@ class MainWindow(QMainWindow):
             "FOCTwin",
             "FOCTwin",
         )
-        settings_path = Path(self.settings.fileName()).expanduser().resolve(strict=False)
-        self.current_trial_controller = CurrentTrialController(
-            settings_path.parent / "current_trial_controller"
-        )
         self._settings_loading = False
         self.project: ProjectStore | None = None
         self.matlab = MatlabBackend(Path(__file__).resolve().parents[3] / "matlab")
@@ -229,10 +224,23 @@ class MainWindow(QMainWindow):
         self.telemetry_recorder = TelemetryRecorder()
         self.friction_recorder = TelemetryRecorder()
         self.current_trial_recorder = TelemetryRecorder()
+        self.program_recorder = TelemetryRecorder()
+        documents_path = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        )
+        documents = Path(documents_path) if documents_path else Path.home() / "Documents"
+        exchange_root = documents / "AutotunerExchange"
+        self._program_input_directory = exchange_root / "inbox" / "programs"
+        self._program_output_root = exchange_root / "outbox" / "runs"
+        self._program_path: Path | None = None
+        self._compiled_program: MotorProgram | None = None
+        self._program_steps: tuple[ProgramStep, ...] = ()
+        self._program_step_index = 0
+        self._program_waiting_step: ProgramStep | None = None
+        self._program_logger: ProgramRunLogger | None = None
+        self._program_running = False
         self._current_trial_experiment: CurrentTrialExperiment | None = None
         self._current_trial_experiment_id: int | None = None
-        self._current_trial_request_id: str | None = None
-        self._current_trial_command_id: str | None = None
         self._current_trial_telemetry_paths: list[str] = []
         self._current_trial_restore_commands: list[str] = []
         self._current_trial_restore_mask = self.monitor_mask
@@ -274,8 +282,6 @@ class MainWindow(QMainWindow):
         self._pwm_requested = False
         self._safety_latched = False
         self._configuration_apply_in_progress = False
-        self._drive_bridge_dialog: QDialog | None = None
-        self._instruction_runner_dialog: QDialog | None = None
         self._device_limit_copy_pending: set[str] = set()
         self._command_queue: deque[str | Callable[[], None]] = deque()
         self._started_at = time.monotonic()
@@ -291,6 +297,7 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.setInterval(250)
         self._settings_save_timer.timeout.connect(self._save_user_settings)
         self._restore_user_settings()
+        self._refresh_ports()
         self._connect_settings_persistence()
         self._reconnect_timer = QTimer(self)
         self._reconnect_timer.setInterval(1000)
@@ -312,7 +319,9 @@ class MainWindow(QMainWindow):
         self._current_trial_timer.setInterval(20)
         self._current_trial_timer.timeout.connect(self._advance_current_trial)
         self._current_trial_timer.start()
-        self._ensure_instruction_runner()
+        self._program_timer = QTimer(self)
+        self._program_timer.setSingleShot(True)
+        self._program_timer.timeout.connect(self._advance_program)
         self._refresh_status()
 
     def _build_actions(self) -> None:
@@ -328,12 +337,6 @@ class MainWindow(QMainWindow):
         toolbar.addActions((new_project, open_project))
         toolbar.addSeparator()
         toolbar.addAction(matlab)
-        drive_bridge = QAction("Связь с GPT", self)
-        drive_bridge.triggered.connect(self._open_drive_bridge)
-        toolbar.addAction(drive_bridge)
-        instruction_runner = QAction("Инструкции", self)
-        instruction_runner.triggered.connect(self._open_instruction_runner)
-        toolbar.addAction(instruction_runner)
         toolbar.addSeparator()
         emergency = QAction("АВАРИЙНЫЙ СТОП", self)
         emergency.triggered.connect(self._emergency_stop)
@@ -1518,6 +1521,13 @@ class MainWindow(QMainWindow):
                 self,
                 "Тест трения",
                 "Сначала завершите выполняющийся токовый опыт",
+            )
+            return
+        if self._program_running:
+            QMessageBox.warning(
+                self,
+                "Тест трения",
+                "Сначала остановите выполняющуюся командную программу",
             )
             return
         if self.project is None:
@@ -2868,19 +2878,24 @@ class MainWindow(QMainWindow):
             return experiment.config.monitor_downsample
         return self.monitor_downsample_spin.value()
 
-    def _manual_control_blocked_by_friction(self, operation: str) -> bool:
-        if not self._friction_running() and not self._current_trial_running():
+    def _manual_control_blocked(self, operation: str) -> bool:
+        if (
+            not self._friction_running()
+            and not self._current_trial_running()
+            and not self._program_running
+        ):
             return False
-        title = (
-            "Выполняется токовый опыт"
-            if self._current_trial_running()
-            else "Выполняется тест трения"
-        )
+        if self._current_trial_running():
+            title = "Выполняется токовый опыт"
+        elif self._friction_running():
+            title = "Выполняется тест трения"
+        else:
+            title = "Выполняется командная программа"
         QMessageBox.warning(
             self,
             title,
-            f"{operation.capitalize()} заблокировано до завершения опыта. "
-            "Для немедленной остановки используйте «СТОП И ОТКЛЮЧИТЬ PWM».",
+            f"{operation.capitalize()} заблокировано до завершения текущего запуска. "
+            "Для немедленной остановки используйте общий аварийный стоп.",
         )
         return True
 
@@ -3062,53 +3077,44 @@ class MainWindow(QMainWindow):
             not in {CurrentTrialPhase.COMPLETE, CurrentTrialPhase.ABORTED}
         )
 
-    def _current_trial_environment(
-        self,
-        *,
-        local_permission: bool = False,
-    ) -> CurrentTrialEnvironment:
+    def _current_trial_start_error(self) -> str | None:
+        if self._current_trial_running():
+            return "Токовый опыт уже выполняется"
+        if self._friction_running():
+            return "Сначала завершите выполняющийся тест трения"
+        if self._program_running:
+            return "Сначала остановите выполняющуюся командную программу"
+        if self.project is None:
+            return "Сначала создайте или откройте проект"
+        if not self.device.connected:
+            return "Сначала подключите мотор"
+        if self._pwm_requested:
+            return "Перед запуском вручную отключите PWM"
+        if (
+            self._configuration_apply_in_progress
+            or self._command_queue
+            or self._command_timer.isActive()
+        ):
+            return "Дождитесь завершения текущей отправки команд"
         sample = self._last_sample
-        telemetry_fresh = bool(
-            sample is not None
-            and self._last_telemetry_received_at is not None
-            and time.monotonic() - self._last_telemetry_received_at
-            <= monitor_stale_timeout(self._active_monitor_downsample())
+        if sample is None or self._last_telemetry_received_at is None:
+            return "Нет свежей распознанной телеметрии"
+        if time.monotonic() - self._last_telemetry_received_at > monitor_stale_timeout(
+            self._active_monitor_downsample()
+        ):
+            return "Телеметрия устарела; дождитесь восстановления потока"
+        required_values = (
+            sample.angle_rad,
+            sample.current_q_a,
+            sample.current_d_a,
+            sample.voltage_q_v,
+            sample.voltage_d_v,
         )
-        telemetry_complete = bool(
-            sample is not None
-            and all(
-                value is not None
-                for value in (
-                    sample.angle_rad,
-                    sample.current_q_a,
-                    sample.current_d_a,
-                    sample.voltage_q_v,
-                    sample.voltage_d_v,
-                )
-            )
-        )
-        return CurrentTrialEnvironment(
-            project_open=self.project is not None,
-            motor_connected=self.device.connected,
-            pwm_disabled=not self._pwm_requested,
-            telemetry_fresh=telemetry_fresh,
-            telemetry_complete=telemetry_complete,
-            friction_idle=not self._friction_running(),
-            current_trial_idle=not self._current_trial_running(),
-            command_channel_idle=not (
-                self._configuration_apply_in_progress
-                or self._command_queue
-                or self._command_timer.isActive()
-            ),
-            phase_resistance_valid=self.profile.phase_resistance_ohm > 0,
-            local_permission=local_permission,
-            telemetry_sample_rate_hz=self.telemetry_statistics.frequency_hz,
-            telemetry_ui_lag_ms=self.telemetry_statistics.latest_processing_lag_s * 1000.0,
-            telemetry_ui_max_lag_ms=(
-                self.telemetry_statistics.maximum_processing_lag_s * 1000.0
-            ),
-            telemetry_plot_points=sum(len(series) for series in self._telemetry_series.values()),
-        )
+        if any(value is None for value in required_values):
+            return "Нужны угол, Iq, Id, Uq и Ud; включите все поля мониторинга"
+        if self.profile.phase_resistance_ohm <= 0:
+            return "Для безопасного транспортного режима нужно положительное сопротивление фазы"
+        return None
 
     def _current_trial_config_from_widgets(self) -> CurrentTrialConfig:
         transport_pid = {
@@ -3148,7 +3154,6 @@ class MainWindow(QMainWindow):
                 raise ValueError("Checkpoint токового опыта создан несовместимой версией")
             experiment = CurrentTrialExperiment.from_checkpoint(payload)
             experiment_id = payload.get("experiment_id")
-            controller_request_id = payload.get("controller_request_id")
             telemetry_paths = [
                 str(path) for path in payload.get("telemetry_paths", [])
             ]
@@ -3163,9 +3168,6 @@ class MainWindow(QMainWindow):
             ),
             telemetry_paths=telemetry_paths,
             resumed=True,
-            controller_request_id=(
-                str(controller_request_id) if controller_request_id else None
-            ),
         )
 
     def _prepare_current_trial(
@@ -3175,49 +3177,22 @@ class MainWindow(QMainWindow):
         experiment_id: int | None = None,
         telemetry_paths: list[str] | None = None,
         resumed: bool = False,
-        controller_request_id: str | None = None,
-        remote_decision: CurrentTrialDecision | None = None,
     ) -> None:
-        if self._current_trial_running():
-            QMessageBox.information(self, "Токовый опыт", "Опыт уже выполняется")
+        start_error = self._current_trial_start_error()
+        if start_error:
+            QMessageBox.warning(self, "Токовый опыт", start_error)
+            return
+        sample = self._last_sample
+        if sample is None or sample.angle_rad is None:
+            QMessageBox.warning(self, "Токовый опыт", "Контроллер не получил текущую координату")
             return
         try:
-            if remote_decision is not None:
-                if (
-                    remote_decision.source != CurrentTrialRequestSource.INSTRUCTION
-                    or remote_decision.mode != CurrentTrialRequestMode.HARDWARE
-                    or remote_decision.state != CurrentTrialRequestState.RUNNING
-                ):
-                    raise CurrentTrialControllerError(
-                        "remote_request_not_running",
-                        "Удалённый запрос не находится в подтверждённом состоянии running",
-                    )
-                config = CurrentTrialConfig.from_dict(remote_decision.config)
-                environment = self._current_trial_environment()
-                if environment.blockers():
-                    raise CurrentTrialControllerError(
-                        environment.blockers()[0],
-                        "Аппаратные условия изменились перед передачей плана исполнителю",
-                    )
-                controller_request_id = remote_decision.request_id
-            else:
-                config = (
-                    restored_experiment.config
-                    if restored_experiment is not None
-                    else self._current_trial_config_from_widgets()
-                )
-                preview = self.current_trial_controller.preview_local(
-                    config,
-                    self._current_trial_environment(),
-                )
-                if preview.state != CurrentTrialRequestState.WAITING_FOR_PERMISSION:
-                    raise CurrentTrialControllerError(preview.reason_code, preview.message)
-            sample = self._last_sample
-            if sample is None or sample.angle_rad is None:
-                raise CurrentTrialControllerError(
-                    "telemetry_incomplete",
-                    "Контроллер не получил текущую координату",
-                )
+            config = (
+                restored_experiment.config
+                if restored_experiment is not None
+                else self._current_trial_config_from_widgets()
+            )
+            config.validate()
             start_angle = (
                 restored_experiment.start_angle_rad
                 if restored_experiment is not None
@@ -3230,18 +3205,15 @@ class MainWindow(QMainWindow):
             manual_pid_values = {
                 loop: self._pid_values(loop) for loop in self.pid_tables
             }
-        except (CurrentTrialControllerError, ValueError) as exc:
-            if remote_decision is not None:
-                raise RuntimeError(str(exc)) from exc
+        except ValueError as exc:
             QMessageBox.warning(self, "Токовый опыт", str(exc))
             return
 
-        if remote_decision is None:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Запуск одного токового опыта")
-            dialog.setMinimumWidth(650)
-            dialog_layout = QVBoxLayout(dialog)
-            confirmation = QLabel(
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Запуск одного токового опыта")
+        dialog.setMinimumWidth(650)
+        dialog_layout = QVBoxLayout(dialog)
+        confirmation = QLabel(
             "FOCTwin сначала при выключенном PWM запишет пассивный baseline "
             "current-sense. При шумном Iq/Id опыт закончится без включения силовой части. "
             "Только после чистой пассивной проверки программа зафиксирует текущую "
@@ -3258,41 +3230,45 @@ class MainWindow(QMainWindow):
             "При физическом отключении питания ничего не будет записано как успешный "
             "результат: после возврата платы попытка начнётся заново. Держите питание "
             "доступным. Запустить?"
-            )
-            confirmation.setWordWrap(True)
-            dialog_layout.addWidget(confirmation)
-            buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Yes
-                | QDialogButtonBox.StandardButton.Cancel
-            )
-            buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Запустить")
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            dialog_layout.addWidget(buttons)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
+        )
+        confirmation.setWordWrap(True)
+        dialog_layout.addWidget(confirmation)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Запустить")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
 
-        if remote_decision is None:
-            try:
-                controller_decision = self.current_trial_controller.submit_local(
-                    config,
-                    self._current_trial_environment(local_permission=True),
-                    request_id=controller_request_id,
-                )
-                controller_decision = self.current_trial_controller.mark_running(
-                    controller_decision.request_id
-                )
-            except CurrentTrialControllerError as exc:
+        start_error = self._current_trial_start_error()
+        if start_error:
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                f"Условия изменились до запуска: {start_error}",
+            )
+            return
+        sample = self._last_sample
+        if sample is None or sample.angle_rad is None:
+            QMessageBox.warning(
+                self,
+                "Токовый опыт",
+                "Условия изменились до запуска: нет текущей координаты",
+            )
+            return
+        if restored_experiment is None:
+            start_angle = float(sample.angle_rad)
+            if not config.working_angle_min_rad <= start_angle <= config.working_angle_max_rad:
                 QMessageBox.warning(
                     self,
                     "Токовый опыт",
-                    f"Условия изменились до запуска: {exc}",
+                    "Условия изменились до запуска: координата вне рабочего коридора ±3 рад",
                 )
                 return
-        else:
-            controller_decision = remote_decision
-        self._current_trial_request_id = controller_decision.request_id
-        self._current_trial_command_id = controller_decision.command_id or None
 
         self._current_trial_recovery_sound_enabled = (
             self.current_trial_recovery_sound.isChecked()
@@ -3357,33 +3333,13 @@ class MainWindow(QMainWindow):
         self._clear_current_trial_results()
         self._log(
             "CURRENT_TRIAL",
-            f"{'Удалённый запуск' if remote_decision else ('Продолжение' if resumed else 'Запуск')} "
+            f"{'Продолжение' if resumed else 'Запуск'} "
             "опыта "
             f"#{self._current_trial_experiment_id}: step={config.step_current_a:g} A, "
             f"P={config.current_kp:g}, I={config.current_ki:g}",
         )
         self._save_current_trial_checkpoint()
         self._process_current_trial_actions(experiment.start(time.monotonic()))
-
-    def _start_remote_current_trial(self, decision: CurrentTrialDecision) -> None:
-        self._prepare_current_trial(remote_decision=decision)
-        if (
-            self._current_trial_experiment is None
-            or self._current_trial_request_id != decision.request_id
-        ):
-            raise RuntimeError("Исполнитель не принял локально разрешённый токовый опыт")
-
-    def _abort_remote_current_trial(self, command_id: str) -> None:
-        if command_id != self._current_trial_command_id or not self._current_trial_running():
-            raise RuntimeError("Указанный удалённый токовый опыт сейчас не выполняется")
-        experiment = self._current_trial_experiment
-        if experiment is None:
-            raise RuntimeError("Исполнитель токового опыта не найден")
-        experiment.abort("Остановлено командой cancel_current_trial")
-        self._cancel_queued_commands()
-        self.device.emergency_stop()
-        self._pwm_requested = False
-        self._finalize_current_trial("interrupted", experiment.abort_reason)
 
     def _current_trial_positioning_commands(
         self,
@@ -3780,7 +3736,6 @@ class MainWindow(QMainWindow):
         payload = experiment.checkpoint_payload(
             self._current_trial_experiment_id
         )
-        payload["controller_request_id"] = self._current_trial_request_id
         payload["telemetry_paths"] = list(self._current_trial_telemetry_paths)
         self.project.save_checkpoint("current_trial", payload)
 
@@ -3819,31 +3774,6 @@ class MainWindow(QMainWindow):
                     "CURRENT_TRIAL",
                     f"Готов единый диагностический ZIP: {bundle_path}",
                 )
-                try:
-                    runner_dialog = self._ensure_instruction_runner()
-                    artifact_group = (
-                        self._current_trial_command_id
-                        or f"local-current-trial-{self._current_trial_experiment_id}"
-                    )
-                    outgoing_path = runner_dialog.runner.publish_artifact(
-                        bundle_path,
-                        group=artifact_group,
-                    )
-                except (OSError, RuntimeError, ValueError) as exc:
-                    result["folderbridge_export_error"] = str(exc)
-                    self._log(
-                        "ERROR",
-                        f"ZIP сохранён в проекте, но не передан в FolderBridge: {exc}",
-                    )
-                else:
-                    relative_artifact = outgoing_path.relative_to(
-                        runner_dialog.runner.exchange_root / "outbox"
-                    ).as_posix()
-                    result["folderbridge_artifact"] = relative_artifact
-                    self._log(
-                        "CURRENT_TRIAL",
-                        f"ZIP автоматически помещён в FolderBridge: {outgoing_path}",
-                    )
             fields: dict[str, object] = {
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "result_json": json.dumps(result, ensure_ascii=False),
@@ -3855,19 +3785,6 @@ class MainWindow(QMainWindow):
                 status,
                 **fields,
             )
-        if self._current_trial_request_id is not None:
-            try:
-                self.current_trial_controller.finish_local(
-                    self._current_trial_request_id,
-                    status=status,
-                    result=result,
-                    error=error,
-                )
-            except CurrentTrialControllerError as exc:
-                self._log(
-                    "ERROR",
-                    f"Не удалось завершить запись общего контроллера: {exc}",
-                )
         self._render_current_trial_result(result, bundle_path)
         self._save_current_trial_checkpoint()
         self.current_trial_start_button.setEnabled(True)
@@ -3888,8 +3805,6 @@ class MainWindow(QMainWindow):
             f"Опыт завершён со статусом {status}: {error or result['note']}",
         )
         self._current_trial_experiment = None
-        self._current_trial_request_id = None
-        self._current_trial_command_id = None
         self._current_trial_resume_pending = False
         self.monitor_mask = restore_mask
         if self.device.connected and restore_commands:
@@ -3985,12 +3900,6 @@ class MainWindow(QMainWindow):
                 f"ΔIq(−Uq)={number(current_sense.get('negative_q_delta_a'), ' А')}; "
                 f"|Id|/|Iq|={number(current_sense.get('d_to_q_span_ratio'))}."
             )
-        folderbridge_artifact = result.get("folderbridge_artifact")
-        if isinstance(folderbridge_artifact, str):
-            report_lines.append(
-                "ZIP уже автоматически помещён в исходящую папку FolderBridge:\n"
-                f"{folderbridge_artifact}"
-            )
         if bundle_path is not None:
             report_lines.append(
                 "Для передачи нужен только этот файл:\n"
@@ -4039,8 +3948,9 @@ class MainWindow(QMainWindow):
 
     def _console_page(self) -> QWidget:
         page, layout = titled_page(
-            "Консоль и сценарии",
-            "Сырые команды платы и проверяемый FOCTwin DSL. Сценарий компилируется в Commander-команды до запуска.",
+            "Команды и программы",
+            "Одна команда отправляется сразу. Программа состоит только из точных команд "
+            "прошивки и WAIT <секунды>, загружается вручную и запускается только человеком.",
         )
         tabs = QTabWidget()
         raw_tab = QWidget()
@@ -4048,7 +3958,7 @@ class MainWindow(QMainWindow):
         raw_row = QHBoxLayout()
         self.raw_command = QLineEdit("AMG6")
         raw_send = QPushButton("Отправить как есть")
-        raw_send.clicked.connect(lambda: self._send(self.raw_command.text()))
+        raw_send.clicked.connect(self._send_raw_command)
         raw_row.addWidget(self.raw_command, 1)
         raw_row.addWidget(raw_send)
         raw_layout.addLayout(raw_row)
@@ -4056,35 +3966,79 @@ class MainWindow(QMainWindow):
         self.raw_output.setReadOnly(True)
         self.raw_output.document().setMaximumBlockCount(5000)
         raw_layout.addWidget(self.raw_output, 1)
-        scenario_tab = QWidget()
-        scenario_layout = QVBoxLayout(scenario_tab)
-        self.scenario_editor = QPlainTextEdit(
-            "# Пример безопасного сценария\n"
-            "LIMIT CURRENT 1\n"
-            "LIMIT VOLTAGE 12\n"
-            "LIMIT VELOCITY 0.7\n"
-            "MODE ANGLE\n"
-            "TORQUE VOLTAGE\n"
-            "EN\n"
-            "TARGET 0.2\n"
-            "WAIT 2\n"
-            "TARGET 0\n"
-            "STOP\n"
+        program_tab = QWidget()
+        program_layout = QVBoxLayout(program_tab)
+
+        file_row = QHBoxLayout()
+        open_program = QPushButton("Открыть программу…")
+        open_program.clicked.connect(self._open_program_file)
+        save_program = QPushButton("Сохранить")
+        save_program.clicked.connect(self._save_program_file)
+        save_program_as = QPushButton("Сохранить как…")
+        save_program_as.clicked.connect(self._save_program_file_as)
+        file_row.addWidget(open_program)
+        file_row.addWidget(save_program)
+        file_row.addWidget(save_program_as)
+        file_row.addStretch(1)
+        program_layout.addLayout(file_row)
+
+        self.program_file_label = QLabel("Новый несохранённый файл")
+        self.program_file_label.setWordWrap(True)
+        program_layout.addWidget(self.program_file_label)
+
+        self.program_editor = QPlainTextEdit(
+            "# Каждая строка, кроме WAIT, отправляется в плату без перевода.\n"
+            "AE0\n"
+            "AT0\n"
+            "AC2\n"
+            "ALU3\n"
+            "ALV0.2\n"
+            "A0\n"
+            "AE1\n"
+            "A0.2\n"
+            "WAIT 2.0\n"
+            "A0\n"
+            "WAIT 1.0\n"
+            "AE0\n"
         )
-        scenario_layout.addWidget(self.scenario_editor, 1)
-        scenario_buttons = QHBoxLayout()
-        validate = QPushButton("Проверить и показать трансляцию")
-        validate.clicked.connect(self._compile_scenario)
-        run = QPushButton("Запустить сценарий")
-        run.setEnabled(False)
-        scenario_buttons.addWidget(validate)
-        scenario_buttons.addWidget(run)
-        scenario_layout.addLayout(scenario_buttons)
-        self.scenario_output = QPlainTextEdit()
-        self.scenario_output.setReadOnly(True)
-        scenario_layout.addWidget(self.scenario_output)
-        tabs.addTab(raw_tab, "Сырые команды")
-        tabs.addTab(scenario_tab, "FOCTwin DSL")
+        self.program_editor.textChanged.connect(self._invalidate_program_validation)
+        program_layout.addWidget(self.program_editor, 2)
+
+        output_group = QGroupBox("Куда записывать журналы запусков")
+        output_layout = QHBoxLayout(output_group)
+        self.program_output_root_edit = QLineEdit(str(self._program_output_root))
+        self.program_output_root_edit.textChanged.connect(self._schedule_user_settings_save)
+        choose_output = QPushButton("Выбрать папку…")
+        choose_output.clicked.connect(self._choose_program_output_root)
+        output_layout.addWidget(self.program_output_root_edit, 1)
+        output_layout.addWidget(choose_output)
+        program_layout.addWidget(output_group)
+
+        program_buttons = QHBoxLayout()
+        validate = QPushButton("Проверить программу")
+        validate.clicked.connect(self._compile_program)
+        self.program_run_button = QPushButton("Запустить")
+        self.program_run_button.setEnabled(False)
+        self.program_run_button.clicked.connect(self._start_program)
+        self.program_stop_button = QPushButton("Остановить")
+        self.program_stop_button.setEnabled(False)
+        self.program_stop_button.clicked.connect(self._stop_program)
+        program_buttons.addWidget(validate)
+        program_buttons.addWidget(self.program_run_button)
+        program_buttons.addWidget(self.program_stop_button)
+        program_buttons.addStretch(1)
+        program_layout.addLayout(program_buttons)
+
+        self.program_status_label = QLabel("Программа ещё не проверена")
+        self.program_status_label.setWordWrap(True)
+        program_layout.addWidget(self.program_status_label)
+        self.program_output = QPlainTextEdit()
+        self.program_output.setReadOnly(True)
+        self.program_output.document().setMaximumBlockCount(5000)
+        program_layout.addWidget(self.program_output, 1)
+
+        tabs.addTab(raw_tab, "Одна команда")
+        tabs.addTab(program_tab, "Программа")
         layout.addWidget(tabs, 1)
         return page
 
@@ -4163,41 +4117,6 @@ class MainWindow(QMainWindow):
         self.dashboard_project.setText(str(root))
         self.statusBar().showMessage(f"Проект открыт: {root}", 5000)
         self._log("INFO", f"Проект открыт: {root}")
-
-    def _open_drive_bridge(self) -> None:
-        if self._drive_bridge_dialog is None:
-            from foctwin.drive_bridge_ui import DriveBridgeDialog
-
-            self._drive_bridge_dialog = DriveBridgeDialog(self)
-        self._drive_bridge_dialog.show()
-        self._drive_bridge_dialog.raise_()
-        self._drive_bridge_dialog.activateWindow()
-
-    def _ensure_instruction_runner(self):
-        if self._instruction_runner_dialog is None:
-            from foctwin.instruction_runner_ui import InstructionRunnerDialog
-
-            state_root = None
-            if self._external_settings:
-                state_root = (
-                    Path(self.settings.fileName()).expanduser().resolve(strict=False).parent
-                    / "instruction_runner"
-                )
-            self._instruction_runner_dialog = InstructionRunnerDialog(
-                self,
-                state_root=state_root,
-                current_trial_controller=self.current_trial_controller,
-                current_trial_environment_factory=self._current_trial_environment,
-                current_trial_start_callback=self._start_remote_current_trial,
-                current_trial_abort_callback=self._abort_remote_current_trial,
-            )
-        return self._instruction_runner_dialog
-
-    def _open_instruction_runner(self) -> None:
-        dialog = self._ensure_instruction_runner()
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def _connect_settings_persistence(self) -> None:
         spin_boxes = [
@@ -4324,6 +4243,10 @@ class MainWindow(QMainWindow):
                 "window_s": self.plot_window_spin.value(),
                 "follow": self.plot_follow_checkbox.isChecked(),
             },
+            "program": {
+                "input_directory": str(self._program_input_directory),
+                "output_root": self.program_output_root_edit.text().strip(),
+            },
             "friction": self._friction_config_from_widgets().to_dict(),
             "current_trial": {
                 "schema": CURRENT_TRIAL_CHECKPOINT_SCHEMA,
@@ -4410,6 +4333,16 @@ class MainWindow(QMainWindow):
                 self.plot_checks[name].setChecked(name in plot_signals)
             self.plot_window_spin.setValue(int(plot.get("window_s", 30)))
             self.plot_follow_checkbox.setChecked(bool(plot.get("follow", True)))
+
+            program = payload.get("program", {})
+            if isinstance(program, dict):
+                input_directory = str(program.get("input_directory", "")).strip()
+                output_root = str(program.get("output_root", "")).strip()
+                if input_directory:
+                    self._program_input_directory = Path(input_directory).expanduser().resolve()
+                if output_root:
+                    self._program_output_root = Path(output_root).expanduser().resolve()
+                    self.program_output_root_edit.setText(str(self._program_output_root))
 
             friction = payload.get("friction")
             if isinstance(friction, dict):
@@ -4504,6 +4437,16 @@ class MainWindow(QMainWindow):
         commands: list[str] | tuple[str, ...],
         on_complete: Callable[[], None] | None = None,
     ) -> None:
+        if self._program_running:
+            self._log(
+                "PROGRAM",
+                "Параллельная очередь Commander-команд заблокирована до завершения программы",
+            )
+            self.statusBar().showMessage(
+                "Дождитесь завершения командной программы",
+                5000,
+            )
+            return
         self._command_queue.extend(commands)
         if on_complete is not None:
             self._command_queue.append(on_complete)
@@ -4528,17 +4471,34 @@ class MainWindow(QMainWindow):
         self._command_queue.clear()
 
     def _refresh_ports(self) -> None:
-        current = self.port_combo.currentText().strip() or "COM3"
+        current = self.port_combo.currentText().strip()
         ports = self.device.available_ports()
+        available = [device for device, _description in ports]
         self.port_combo.clear()
         for device, description in ports:
             self.port_combo.addItem(device, description)
-        if self.port_combo.findText(current) < 0:
-            self.port_combo.addItem(current)
-        self.port_combo.setCurrentText(current)
         if ports:
             details = "; ".join(f"{device}: {description}" for device, description in ports)
-            self.connection_details.setText(details)
+            if current in available:
+                self.port_combo.setCurrentText(current)
+                self.connection_details.setText(details)
+            else:
+                self.port_combo.setCurrentIndex(0)
+                missing = f"Порт {current} не найден. " if current else ""
+                self.connection_details.setText(
+                    f"{missing}Выбран {available[0]}. Доступны: {details}"
+                )
+            self.connect_button.setEnabled(True)
+        else:
+            if self.port_combo.lineEdit() is not None:
+                self.port_combo.lineEdit().setPlaceholderText("COM-порты не обнаружены")
+            self.port_combo.setEditText("")
+            self.connection_details.setText(
+                "COM-порты не обнаружены. Проверьте USB-кабель, питание платы и драйвер."
+            )
+            self.connect_button.setEnabled(
+                self.device.connected or self._connection_requested
+            )
 
     def _toggle_connection(self) -> None:
         if self.device.connected or self._connection_requested:
@@ -4547,6 +4507,14 @@ class MainWindow(QMainWindow):
             self._cancel_queued_commands()
             self.device.disconnect()
             self.connect_button.setText("Подключить")
+            return
+        self._refresh_ports()
+        if not self.port_combo.currentText().strip():
+            QMessageBox.warning(
+                self,
+                "Serial",
+                "COM-порты не обнаружены. Подключите кабель и нажмите «Обновить порты».",
+            )
             return
         self._connection_requested = True
         self._attempt_connect(show_error=True)
@@ -4558,7 +4526,15 @@ class MainWindow(QMainWindow):
         self.protocol = CommanderProtocol(self.device_id_edit.text().strip() or "A")
         self.device.protocol = self.protocol
         try:
-            self.device.connect(self.port_combo.currentText().strip(), int(self.baud_combo.currentText()))
+            selected_port = self.port_combo.currentText().strip()
+            available = [device for device, _description in self.device.available_ports()]
+            if selected_port not in available:
+                available_text = ", ".join(available) or "нет"
+                raise RuntimeError(
+                    f"Порт {selected_port or 'не выбран'} не найден. "
+                    f"Доступные порты: {available_text}"
+                )
+            self.device.connect(selected_port, int(self.baud_combo.currentText()))
         except Exception as exc:  # noqa: BLE001
             self._connecting = False
             self._log("ERROR", f"Не удалось подключиться: {exc}")
@@ -4618,7 +4594,7 @@ class MainWindow(QMainWindow):
         self._read_device_configuration()
 
     def _apply_modes(self) -> None:
-        if self._manual_control_blocked_by_friction("применение ручной конфигурации"):
+        if self._manual_control_blocked("применение ручной конфигурации"):
             return
         if not self.device.connected:
             QMessageBox.warning(self, "Конфигурация", "Сначала подключите мотор")
@@ -4716,7 +4692,7 @@ class MainWindow(QMainWindow):
         self._read_device_limits(copy_to_inputs=False)
 
     def _send_target(self) -> None:
-        if self._manual_control_blocked_by_friction("ручная отправка цели"):
+        if self._manual_control_blocked("ручная отправка цели"):
             return
         error = self._target_validation_error()
         if error:
@@ -4743,7 +4719,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _enable_pwm(self) -> None:
-        if self._manual_control_blocked_by_friction("ручное включение PWM"):
+        if self._manual_control_blocked("ручное включение PWM"):
             return
         if not self.device.connected:
             QMessageBox.warning(self, "PWM", "Сначала подключите мотор")
@@ -4784,7 +4760,7 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_device_limits(self) -> None:
-        if self._manual_control_blocked_by_friction("изменение ограничений SimpleFOC"):
+        if self._manual_control_blocked("изменение ограничений SimpleFOC"):
             return
         if not self._allow_parameter_change("изменение ограничений SimpleFOC"):
             return
@@ -4818,7 +4794,7 @@ class MainWindow(QMainWindow):
         self._read_device_limits(copy_to_inputs=False)
 
     def _apply_software_limits(self, show_status: bool = True) -> bool:
-        if self._manual_control_blocked_by_friction("изменение аварийных порогов"):
+        if self._manual_control_blocked("изменение аварийных порогов"):
             return False
         limits = SafetyLimits(
             current_a=self.current_limit.value(),
@@ -4872,7 +4848,7 @@ class MainWindow(QMainWindow):
         self._queue_commands(commands)
 
     def _apply_selected_pid(self) -> None:
-        if self._manual_control_blocked_by_friction("изменение PID/LPF"):
+        if self._manual_control_blocked("изменение PID/LPF"):
             return
         if not self._allow_parameter_change("изменение PID/LPF"):
             return
@@ -4914,7 +4890,7 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def _apply_monitoring(self) -> None:
-        if self._manual_control_blocked_by_friction("ручная настройка мониторинга"):
+        if self._manual_control_blocked("ручная настройка мониторинга"):
             return
         mask = self._monitor_mask_from_ui()
         if mask is None:
@@ -4962,7 +4938,7 @@ class MainWindow(QMainWindow):
         )
         self._log(
             "INFO",
-            f"Мониторинг {reason}: mask={self.monitor_mask}; токи потока переводятся из мА в А",
+            f"Мониторинг {reason}: mask={self.monitor_mask}; токи потока читаются в амперах",
         )
 
     def _mark_monitor_configuration_started(self) -> None:
@@ -5044,8 +5020,20 @@ class MainWindow(QMainWindow):
         self.record_button.setText("Остановить запись")
         self._log("RECORD", f"Запись начата: {path}")
 
-    def _send(self, command: str) -> bool:
+    def _send_raw_command(self) -> None:
+        if self._manual_control_blocked("ручная отправка Commander-команды"):
+            return
+        self._send(self.raw_command.text())
+
+    def _send(self, command: str, *, program_step: bool = False) -> bool:
+        if self._program_running and not program_step:
+            message = "Команда заблокирована до завершения текущей программы"
+            self._log("PROGRAM", f"{message}: {command}")
+            self.statusBar().showMessage(message, 5000)
+            return False
         self._log("TX", command)
+        if hasattr(self, "raw_output"):
+            self.raw_output.appendPlainText(f"TX  {command}")
         try:
             self.device.send(command)
         except Exception as exc:  # noqa: BLE001
@@ -5070,6 +5058,12 @@ class MainWindow(QMainWindow):
         self.pwm_state_label.setText("PWM: отключён (best-effort)")
         self._log("EMERGENCY", f"Best-effort stop; sent: {sent or 'nothing (not connected)'}")
         self.statusBar().showMessage("Аварийный стоп отправлен; при сомнениях отключите питание", 10000)
+        if self._program_running:
+            self._finish_program(
+                "stopped",
+                "Аварийный стоп FOCTwin",
+                emergency_commands=sent,
+            )
         current_trial = self._current_trial_experiment
         if current_trial is not None and self._current_trial_running():
             current_trial.abort("Аварийный стоп FOCTwin")
@@ -5082,18 +5076,335 @@ class MainWindow(QMainWindow):
             experiment.abort("Аварийный стоп FOCTwin")
             self._finalize_friction_experiment("interrupted", experiment.abort_reason)
 
-    def _compile_scenario(self) -> None:
-        compiler = ScenarioCompiler(self.protocol, self.profile.safety)
-        try:
-            steps = compiler.compile(self.scenario_editor.toPlainText())
-        except (ScenarioError, ValueError) as exc:
-            self.scenario_output.setPlainText(f"ОШИБКА: {exc}")
+    def _invalidate_program_validation(self) -> None:
+        if self._program_running:
             return
-        output: list[str] = []
-        for step in steps:
-            rendered = ", ".join(step.commander_commands) or "локальная операция"
-            output.append(f"{step.line_number:03d}: {step.operation} → {rendered}")
-        self.scenario_output.setPlainText("\n".join(output) + "\n\nСценарий прошёл проверку.")
+        self._compiled_program = None
+        self._program_steps = ()
+        self.program_run_button.setEnabled(False)
+        self.program_status_label.setText("Программа изменена — проверьте её заново")
+
+    def _open_program_file(self) -> None:
+        if self._program_running:
+            QMessageBox.information(self, "Программа", "Сначала остановите текущую программу")
+            return
+        start_directory = (
+            self._program_path.parent
+            if self._program_path is not None
+            else self._program_input_directory
+        )
+        filename, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Открыть программу FOCTwin",
+            str(start_directory),
+            "Программы FOCTwin (*.focscript *.txt);;Все файлы (*)",
+        )
+        if not filename:
+            return
+        path = Path(filename).expanduser().resolve()
+        try:
+            if path.stat().st_size > 256 * 1024:
+                raise ValueError("Файл программы больше допустимых 256 КиБ")
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
+            QMessageBox.critical(self, "Программа не открыта", str(exc))
+            return
+        self._program_path = path
+        self._program_input_directory = path.parent
+        self.program_file_label.setText(str(path))
+        self.program_editor.setPlainText(source)
+        self.program_status_label.setText("Файл загружен — проверьте программу перед запуском")
+        self._schedule_user_settings_save()
+
+    def _save_program_file(self) -> bool:
+        if self._program_path is None:
+            return self._save_program_file_as()
+        try:
+            path = save_program_source(self._program_path, self.program_editor.toPlainText())
+        except OSError as exc:
+            QMessageBox.critical(self, "Программа не сохранена", str(exc))
+            return False
+        self.program_file_label.setText(str(path))
+        self.program_status_label.setText("Программа сохранена; после правок нужна новая проверка")
+        return True
+
+    def _save_program_file_as(self) -> bool:
+        suggested = self._program_path or self._program_input_directory / "program.focscript"
+        filename, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить программу FOCTwin",
+            str(suggested),
+            "Программы FOCTwin (*.focscript);;Текстовые файлы (*.txt);;Все файлы (*)",
+        )
+        if not filename:
+            return False
+        path = Path(filename).expanduser()
+        if not path.suffix:
+            path = path.with_suffix(".focscript")
+        self._program_path = path.resolve()
+        self._program_input_directory = self._program_path.parent
+        self._schedule_user_settings_save()
+        return self._save_program_file()
+
+    def _choose_program_output_root(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку журналов программ",
+            self.program_output_root_edit.text().strip() or str(self._program_output_root),
+        )
+        if directory:
+            self._program_output_root = Path(directory).expanduser().resolve()
+            self.program_output_root_edit.setText(str(self._program_output_root))
+            self._schedule_user_settings_save()
+
+    def _compile_program(self) -> None:
+        compiler = MotorProgramCompiler(self.device_id_edit.text().strip() or "A")
+        try:
+            program = compiler.compile(self.program_editor.toPlainText())
+        except (ProgramError, ValueError) as exc:
+            self._compiled_program = None
+            self._program_steps = ()
+            self.program_run_button.setEnabled(False)
+            self.program_output.setPlainText(f"ОШИБКА: {exc}")
+            self.program_status_label.setText("Проверка не пройдена")
+            return
+        self._compiled_program = program
+        self._program_steps = program.steps
+        self.program_output.setPlainText(render_program(program) + "\n\nПроверка пройдена.")
+        self.program_status_label.setText(
+            f"Готово к ручному запуску: {program.command_count} команд, "
+            f"{program.wait_count} задержек"
+        )
+        self.program_run_button.setEnabled(not self._program_running)
+
+    def _program_event(
+        self,
+        kind: str,
+        *,
+        line_number: int | None = None,
+        **details: object,
+    ) -> bool:
+        logger = self._program_logger
+        if logger is None:
+            return True
+        try:
+            logger.event(kind, line_number=line_number, **details)
+        except OSError as exc:
+            self._log("ERROR", f"Не удалось записать журнал программы: {exc}")
+            self.program_output.appendPlainText(f"ОШИБКА ЖУРНАЛА: {exc}")
+            return False
+        return True
+
+    def _start_program(self) -> None:
+        if self._program_running:
+            return
+        if self._compiled_program is None:
+            self._compile_program()
+        program = self._compiled_program
+        if program is None:
+            return
+        if not self.device.connected:
+            QMessageBox.warning(self, "Программа", "Сначала подключите мотор")
+            return
+        if self._current_trial_running() or self._friction_running():
+            QMessageBox.warning(
+                self,
+                "Программа",
+                "Нельзя запускать программу одновременно с моторным опытом",
+            )
+            return
+        if self._configuration_apply_in_progress or self._command_queue:
+            QMessageBox.warning(
+                self,
+                "Программа",
+                "Дождитесь завершения отправки текущей конфигурации",
+            )
+            return
+        output_text = self.program_output_root_edit.text().strip()
+        if not output_text:
+            QMessageBox.warning(self, "Программа", "Выберите папку журналов запусков")
+            return
+        self._program_output_root = Path(output_text).expanduser().resolve()
+        program_name = self._program_path.stem if self._program_path is not None else "untitled"
+        logger: ProgramRunLogger | None = None
+        try:
+            logger = ProgramRunLogger(
+                self._program_output_root,
+                program,
+                program_name=program_name,
+                source_path=str(self._program_path or ""),
+                metadata={
+                    "foctwin_version": __version__,
+                    "port": self.port_combo.currentText().strip(),
+                    "baudrate": int(self.baud_combo.currentText()),
+                    "device_id": self.protocol.device_id,
+                },
+            )
+            self.program_recorder.start(logger.telemetry_path)
+        except (OSError, ValueError) as exc:
+            if logger is not None:
+                try:
+                    logger.finalize("failed", error=str(exc))
+                except OSError:
+                    pass
+            QMessageBox.critical(self, "Программа не запущена", str(exc))
+            return
+
+        self._program_logger = logger
+        self._program_steps = program.steps
+        self._program_step_index = 0
+        self._program_waiting_step = None
+        self._program_running = True
+        self.program_editor.setReadOnly(True)
+        self.program_run_button.setEnabled(False)
+        self.program_stop_button.setEnabled(True)
+        self.program_status_label.setText("Программа выполняется")
+        self.program_output.appendPlainText(f"\nЗАПУСК: {logger.run_dir}")
+        self._log("PROGRAM", f"Запущена программа: {logger.run_dir}")
+        self._save_user_settings()
+        self._program_timer.start(0)
+
+    def _advance_program(self) -> None:
+        if not self._program_running:
+            return
+
+        waiting = self._program_waiting_step
+        if waiting is not None:
+            if not self._program_event(
+                "wait_finished",
+                line_number=waiting.line_number,
+                seconds=waiting.wait_seconds,
+            ):
+                self._finish_program(
+                    "failed",
+                    "Потеряна возможность записывать журнал программы",
+                    send_emergency=True,
+                )
+                return
+            self.program_output.appendPlainText(
+                f"{waiting.line_number:04d} WAIT завершён ({waiting.wait_seconds:g} с)"
+            )
+            self._program_waiting_step = None
+            self._program_step_index += 1
+
+        if self._program_step_index >= len(self._program_steps):
+            self._finish_program("completed")
+            return
+
+        step = self._program_steps[self._program_step_index]
+        if step.wait_seconds is not None:
+            if not self._program_event(
+                "wait_started",
+                line_number=step.line_number,
+                seconds=step.wait_seconds,
+            ):
+                self._finish_program(
+                    "failed",
+                    "Потеряна возможность записывать журнал программы",
+                    send_emergency=True,
+                )
+                return
+            self._program_waiting_step = step
+            self.program_status_label.setText(
+                f"Строка {step.line_number}: ожидание {step.wait_seconds:g} с"
+            )
+            self.program_output.appendPlainText(
+                f"{step.line_number:04d} WAIT {step.wait_seconds:g} с"
+            )
+            self._program_timer.start(max(0, round(step.wait_seconds * 1000)))
+            return
+
+        command = step.command or ""
+        self.program_status_label.setText(f"Строка {step.line_number}: {command}")
+        written = self._send(command, program_step=True)
+        if not self._program_event(
+            "command",
+            line_number=step.line_number,
+            command=command,
+            serial_write_ok=written,
+        ):
+            self._finish_program(
+                "failed",
+                "Потеряна возможность записывать журнал программы",
+                send_emergency=True,
+            )
+            return
+        self.program_output.appendPlainText(
+            f"{step.line_number:04d} TX {command} — {'отправлено' if written else 'ошибка'}"
+        )
+        if not written:
+            self._finish_program(
+                "failed",
+                f"Не удалось отправить строку {step.line_number}: {command}",
+                send_emergency=True,
+            )
+            return
+        self._program_step_index += 1
+        self._program_timer.start(self.COMMAND_INTERVAL_MS)
+
+    def _stop_program(self) -> None:
+        if self._program_running:
+            self._finish_program(
+                "stopped",
+                "Остановлено пользователем",
+                send_emergency=True,
+            )
+
+    def _finish_program(
+        self,
+        status: str,
+        error: str = "",
+        *,
+        send_emergency: bool = False,
+        emergency_commands: list[str] | None = None,
+    ) -> None:
+        if not self._program_running and self._program_logger is None:
+            return
+        self._program_timer.stop()
+        if send_emergency:
+            emergency_commands = self.device.emergency_stop()
+            self._pwm_requested = False
+            self.pwm_state_label.setText("PWM: отключён (best-effort)")
+        if emergency_commands is not None:
+            self._program_event(
+                "emergency_stop",
+                commands=emergency_commands,
+                reason=error or status,
+            )
+
+        self.program_recorder.stop()
+        recorder_error = self.program_recorder.last_error
+        if recorder_error:
+            self._program_event("telemetry_error", error=recorder_error)
+            error = "; ".join(value for value in (error, recorder_error) if value)
+            if status == "completed":
+                status = "completed_with_errors"
+
+        logger = self._program_logger
+        summary_path: Path | None = None
+        if logger is not None:
+            try:
+                summary_path = logger.finalize(status, error=error)
+            except OSError as exc:
+                error = "; ".join(value for value in (error, str(exc)) if value)
+                self._log("ERROR", f"Не удалось завершить журнал программы: {exc}")
+
+        self._program_running = False
+        self._program_logger = None
+        self._program_waiting_step = None
+        self._program_step_index = 0
+        self.program_editor.setReadOnly(False)
+        self.program_run_button.setEnabled(self._compiled_program is not None)
+        self.program_stop_button.setEnabled(False)
+        if status == "completed":
+            message = "Программа завершена"
+        else:
+            message = f"Программа завершена со статусом {status}: {error or 'без пояснения'}"
+        if summary_path is not None:
+            message += f". Итог: {summary_path}"
+        self.program_status_label.setText(message)
+        self.program_output.appendPlainText(f"ИТОГ: {message}")
+        self._log("PROGRAM", message)
 
     def _start_matlab(self) -> None:
         if self.matlab.connected:
@@ -5143,6 +5454,11 @@ class MainWindow(QMainWindow):
         self.side_connection.setText("● Мотор подключён" if connected else "● Мотор отключён")
         self.dashboard_motor.setText("Подключён" if connected else "Отключён")
         self._log("SERIAL", message)
+        if not connected and self._program_running:
+            self._finish_program(
+                "interrupted",
+                f"Serial/питание отключены: {message}",
+            )
         current_trial = self._current_trial_experiment
         if (
             not connected
@@ -5169,6 +5485,7 @@ class MainWindow(QMainWindow):
         if response is not None:
             self.raw_output.appendPlainText(f"RX  {line}")
             self._log("RX", line)
+            self._program_event("response", text=line, key=response.key)
             self._apply_commander_response(response)
             return
         parsed = parse_monitor_line(line, self.monitor_mask)
@@ -5185,6 +5502,7 @@ class MainWindow(QMainWindow):
                     )
             else:
                 self._log("RX", line)
+                self._program_event("response", text=line)
             return
         if self.raw_telemetry_checkbox.isChecked():
             self.raw_output.appendPlainText(f"RX  {line}")
@@ -5219,6 +5537,7 @@ class MainWindow(QMainWindow):
         self.telemetry_recorder.append(sample)
         self.friction_recorder.append(sample)
         self.current_trial_recorder.append(sample)
+        self.program_recorder.append(sample)
         for name in MONITOR_FIELDS:
             value = getattr(sample, name)
             if value is None:
@@ -5299,6 +5618,13 @@ class MainWindow(QMainWindow):
             self._abort_current_trial(
                 f"Ошибка записи данных токового опыта: {current_trial_error}"
             )
+        program_error = self.program_recorder.last_error
+        if program_error and self._program_running:
+            self._finish_program(
+                "failed",
+                f"Ошибка записи телеметрии программы: {program_error}",
+                send_emergency=True,
+            )
 
     def _refresh_live_plot(self) -> None:
         if self.live_plot is None:
@@ -5351,6 +5677,13 @@ class MainWindow(QMainWindow):
         self.monitor_health_label.setText(
             f"Поток: нет отсчётов {age:.1f} с — автоматический перезапуск"
         )
+        if self._program_running:
+            self._finish_program(
+                "failed",
+                f"Телеметрия отсутствует {age:.1f} с",
+                send_emergency=True,
+            )
+            return
         if now - self._last_monitor_restart_at < timeout:
             return
         if self._command_queue or self._command_timer.isActive():
@@ -5458,11 +5791,17 @@ class MainWindow(QMainWindow):
         self._telemetry_watchdog_timer.stop()
         self._friction_timer.stop()
         self._current_trial_timer.stop()
-        if self._instruction_runner_dialog is not None:
-            self._instruction_runner_dialog.poll_timer.stop()
+        if self._program_running or self._program_logger is not None:
+            self._finish_program(
+                "interrupted",
+                "Приложение закрыто во время выполнения программы",
+                send_emergency=True,
+            )
+        self._program_timer.stop()
         self.telemetry_recorder.stop()
         self.friction_recorder.stop()
         self.current_trial_recorder.stop()
+        self.program_recorder.stop()
         self.device.emergency_stop()
         if self.device.connected:
             try:

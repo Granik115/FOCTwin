@@ -1,90 +1,62 @@
 # FOCTwin requirements baseline
 
-This baseline records the user's answers from 2026-07-19. It is the source of truth for
-the first implementation; every safety value remains editable in a project profile.
+Базовые требования сформированы 2026-07-19; файловый цикл программ уточнён для 0.5.0b1.
 
 ## Platform and dependencies
 
-- Windows 10 and Windows 11, x64.
-- Russian-only interface.
-- MATLAB R2022b with MATLAB, Simulink, Simscape, Simscape Electrical, Motor Control
-  Blockset, Global Optimization Toolbox, MATLAB Compiler and Simulink Compiler available.
-- Full MATLAB is installed on the work computer.
-- Core motor, project and MATLAB workspaces remain offline-capable. The optional Drive Bridge
-  requires Internet only while its separate chat window is connected.
-- The local instruction runner remains offline-capable. FolderBridge may independently transport
-  its files through Drive, but FOCTwin requires neither FolderBridge nor Google authorization for
-  local command tests.
-- Both source/development mode and an installed application are required.
-- Python 3.10 is selected because it is compatible with MATLAB Engine R2022b.
+- Windows 10/11 x64, русский интерфейс.
+- Python 3.10 в режиме исходников; portable Windows-сборка не требует отдельного Python.
+- MATLAB R2022b и перечисленные проектом toolbox нужны для моделирования, но не для локального
+  управления мотором.
+- Основные разделы должны работать без Интернета.
+- FOCTwin не авторизуется в Google и не синхронизирует Drive. Внешний FolderBridge может
+  независимо переносить обычные файлы между Drive и локальными папками.
 
 ## Hardware scope
 
-- First target: azimuth axis, one JCM115x25S motor and Commander ID `A`.
-- Future target: two axes and multiple saved motor/setup profiles.
-- Firmware must not be changed or flashed by FOCTwin.
-- Existing USB CDC / Serial protocol, nominally 115200 baud.
-- Expected telemetry: angle, velocity, Id and Iq; voltage/other fields are read when the
-  existing Commander monitor exposes them.
-- COM number is stable; automatic VID/PID search is not required.
-- No torque or temperature sensor.
-- The cable can wind around the rotating assembly; default software travel is ±2π and is
-  user configurable.
-- There is no confirmed independent emergency stop. Physical power removal is the last
-  resort.
+- Первая цель: азимутальная ось, один JCM115x25S и Commander ID `A`.
+- Прошивка не изменяется и не прошивается из FOCTwin.
+- Existing USB CDC / Serial, номинально 115200 baud.
+- Ожидаемая телеметрия: angle, velocity, Id, Iq и доступные поля напряжения.
+- COM выбирается только из реально найденных портов; VID/PID auto-discovery пока не требуется.
+- Нет отдельного датчика момента или температуры.
+- Физическое снятие питания остаётся последней гарантированной мерой остановки.
 
-## Baseline safety envelope
+## Safety baseline
 
 - Current: 1 A.
-- Motor/driver voltage limit: 12 V, even though the supply bus is 48 V.
+- Motor/driver voltage: 12 V при шине питания до 48 V.
 - Position: ±2π rad.
-- Velocity: configurable; initial profile keeps the current 0.7 rad/s limit.
-- Every excitation type has current, voltage, velocity, position and duration limits.
-- A telemetry violation triggers target zero and repeated `AE0` commands.
-- Because firmware cannot be changed, USB/PC failure cannot provide a guaranteed shutdown.
+- Velocity: редактируется, стартовый профиль ограничивает 0.7 rad/s.
+- Телеметрическое нарушение вызывает target zero и несколько `AE0` best-effort.
+- USB/PC failure не может гарантировать shutdown при неизменяемой прошивке.
 
-## Identification
+## Local command programs
 
-- Primary parameters: inertia, viscous/Coulomb/breakaway friction, friction asymmetry and
-  position-dependent irregularity/cogging.
-- Rs, Ld, Lq and flux linkage can be enabled later with catalogue values as initial guesses.
-- Excitations: step, ramp, sine, chirp, PRBS and custom FOCTwin scenarios.
-- Repetitions, initial positions and bounds are configurable, potentially hundreds of trials.
-- Target validation tolerances start at 0.001 rad, 0.001 rad/s and 0.001 A, all configurable.
-- Models must be validated on trajectories/positions outside the immediate fit batch.
-- Profiles preserve identified setups as separate versions.
+- Программа — UTF-8 text file, предпочтительно `.focscript`.
+- Выполняются только точные однострочные команды существующей прошивки и `WAIT <seconds>`.
+- В 0.5.0b1 отсутствуют переменные, выражения, условия, циклы и автоматический удалённый запуск.
+- Перед каждым запуском пользователь открывает/редактирует файл, явно проверяет его и нажимает
+  **«Запустить»** при подключённом моторе.
+- Потерянное Serial-соединение прерывает запуск без auto-resume.
+- Каждый запуск сохраняет source copy, ordered JSONL events, CSV telemetry и JSON summary в
+  отдельной локальной папке.
+- Папку открытия и папку результатов можно связать с Google Drive только внешней программой.
 
-## Controller tuning
+## Identification and tuning
 
-- Supported torque modes: Voltage and FOC Current.
-- Current q/d loops can be tuned jointly or separately.
-- Position, velocity and current P/I/D, LPF, output ramps, output limits and simulated Kc
-  are selectable tuning parameters.
-- Objectives and weights are selectable; default priority is steady-state position/velocity
-  accuracy under hard safety constraints.
-- Test several initial/target positions.
-- Typical virtual tuning budget: about one hour, each simulation a few seconds.
-- Worker count/resource use is configurable.
-- Store at least the best five configurations.
-- Optional manual approval between stages.
-
-## Real-motor refinement
-
-- Manual approval, fully automatic and hybrid modes.
-- Configurable per-parameter step; default 10%.
-- Hundreds of trials are permitted, with resume after power/Serial interruption.
-- Current interrupted trial is invalidated and repeated from a known state.
-- Default targets: 30 arcsec position and 30 arcsec/s velocity error.
-- Preserve every attempted and accepted parameter set; support rollback to known-good.
+- Основные параметры: inertia, viscous/Coulomb/breakaway friction, асимметрия и зависимость от
+  координаты.
+- Supported torque modes: Voltage и FOC Current.
+- Position, velocity, current q/d P/I/D, LPF, ramps и limits доступны как параметры тюнинга.
+- Модели проверяются на траекториях и координатах вне непосредственного fit batch.
+- Каждый испытанный и принятый набор параметров сохраняется; требуется rollback к known-good.
 
 ## Interface and data
 
-- Separate full-control sections rather than a mandatory wizard.
-- Manual SimpleFOC Studio-like control is required.
-- Optional real/virtual overlay and configurable signal selection.
-- Full data-analysis workspace; one run need not be permanently overlaid with another.
-- JSON and Excel export.
-- Project is a user-selected folder and retains all raw data for now.
-- Raw Commander console plus a FOCTwin scenario language.
-- Detailed diagnostic logging can include all available working data.
-- Stable/beta update channels, GitHub Releases, hash/signature verification and rollback.
+- Раздельные full-control sections без обязательного wizard.
+- Ручное SimpleFOC Studio-like управление.
+- Raw Commander console и локальные `.focscript`-программы.
+- Configurable live signals, CSV telemetry, JSON/Excel export и подробные журналы.
+- Проект — выбранная пользователем переносимая папка.
+- Stable/beta channels через GitHub Releases, SHA-256 verification и rollback архивом.
