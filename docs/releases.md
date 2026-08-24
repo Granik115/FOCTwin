@@ -19,6 +19,22 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.5.0b2
+
+- Restore the documented SimpleFOC monitor conversion from milliamperes to amperes. SimpleFOC's
+  monitor prints Q/D currents as `current * 1000`, while Commander current-limit commands such as
+  `ALC` remain in amperes.
+- Prevent false emergency stops from ordinary monitor packets. The observed manual-control packet
+  `Iq=42.6634`, `Id=70.4849` is now interpreted as `0.0426634 A` and `0.0704849 A` rather than as
+  physically impossible tens of amperes.
+- Keep real current protection active after conversion: a streamed value of `12000.0000 mA` still
+  reaches the host guard as `12 A` and trips a `5 A` limit immediately.
+- Correct the mistaken 0.4.2b5 current-unit assumption inherited by 0.4.2b6 and 0.5.0b1. Current
+  columns in CSV files produced by those affected versions are labelled as amperes but must be
+  divided by 1000 before analysis.
+- Preserve the local `.focscript` workflow, external FolderBridge synchronization and all other
+  0.5.0b1 behaviour.
+
 ## 0.5.0b1
 
 - Replace the inactive high-level scenario editor with an executable, deliberately small
@@ -35,8 +51,9 @@ Until code signing is introduced, Windows SmartScreen may warn when the executab
   FolderBridge remains an external file synchronizer with no direct motor path.
 - Replace stale editable COM fallbacks with the actual enumerated ports and explain missing cable,
   power or driver when no port exists.
-- Preserve the 0.4.2b6 current-unit correction, passive current-sense baseline and guarded motor
-  experiments while removing their remote-instruction UI entry points.
+- Preserve the 0.4.2b6 passive current-sense baseline and guarded motor experiments while removing
+  their remote-instruction UI entry points. Its inherited current-unit assumption is corrected in
+  0.5.0b2.
 
 ## 0.4.2b6
 
@@ -57,6 +74,10 @@ Until code signing is introduced, Windows SmartScreen may warn when the executab
   that both values reach the immediate emergency guard.
 - Keep remote hardware execution disabled until the corrected build is installed and a fresh
   PWM-off baseline establishes whether the board current-sense itself is usable.
+
+This release note records what 0.4.2b5 changed, but its unit assumption was incorrect: the
+SimpleFOC monitor serializes Q/D currents in milliamperes. Version 0.5.0b2 restores the required
+division by 1000.
 
 ## 0.4.2b4
 

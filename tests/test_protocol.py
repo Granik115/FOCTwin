@@ -31,38 +31,51 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(protocol.pid("velocity", "lpf", 0.01), "AVF0.01")
         self.assertEqual(protocol.monitor_clear(), "AMC")
 
-    def test_monitor_parser_preserves_streamed_amperes(self):
+    def test_monitor_parser_converts_streamed_milliamperes_to_amperes(self):
         parsed = parse_monitor_line(
             "0.0588\t-0.5818\t0.0017\t-5.8088\t-29.9526\t0.0958\t0.0587"
         )
+        self.assertAlmostEqual(parsed.pop("current_q_a"), -0.0058088)
+        self.assertAlmostEqual(parsed.pop("current_d_a"), -0.0299526)
         self.assertEqual(parsed, {
             "target": 0.0588,
             "voltage_q_v": -0.5818,
             "voltage_d_v": 0.0017,
-            "current_q_a": -5.8088,
-            "current_d_a": -29.9526,
             "velocity_rad_s": 0.0958,
             "angle_rad": 0.0587,
         })
         self.assertIsNone(parse_monitor_line("Status: enabled"))
 
-    def test_trial_61_current_packet_reaches_emergency_guard_without_rescaling(self):
+    def test_real_manual_packet_does_not_cause_a_false_current_emergency(self):
         parsed = parse_monitor_line(
-            "0.0588\t-0.5818\t0.0017\t-5.8088\t-29.9526\t0.0958\t0.0587"
+            "1.0000\t-1.3500\t0.0000\t42.6634\t70.4849\t0.0000\t0.2433"
         )
         sample = TelemetrySample(timestamp_s=0.0, **parsed)
 
-        violations = SafetyGuard(SafetyLimits(current_a=0.1)).check(sample)
+        violations = SafetyGuard(SafetyLimits(current_a=5.0)).check(sample)
 
+        self.assertAlmostEqual(sample.current_q_a, 0.0426634)
+        self.assertAlmostEqual(sample.current_d_a, 0.0704849)
+        self.assertEqual(violations, [])
+
+    def test_true_twelve_amp_monitor_value_reaches_emergency_guard(self):
+        parsed = parse_monitor_line(
+            "1.0000\t1.0000\t0.0000\t12000.0000\t0.0000\t0.0000\t0.2433"
+        )
+        sample = TelemetrySample(timestamp_s=0.0, **parsed)
+
+        violations = SafetyGuard(SafetyLimits(current_a=5.0)).check(sample)
+
+        self.assertAlmostEqual(sample.current_q_a, 12.0)
         self.assertEqual(
             {violation.signal for violation in violations},
-            {"current_q_a", "current_d_a"},
+            {"current_q_a"},
         )
 
     def test_monitor_parser_supports_selected_variables(self):
         self.assertEqual(
             parse_monitor_line("1.0000\t0.2500\t0.5000", "1001010"),
-            {"target": 1.0, "current_q_a": 0.25, "velocity_rad_s": 0.5},
+            {"target": 1.0, "current_q_a": 0.00025, "velocity_rad_s": 0.5},
         )
 
     def test_monitor_parser_rejects_character_loss_that_still_looks_numeric(self):

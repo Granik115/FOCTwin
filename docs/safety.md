@@ -14,9 +14,10 @@
 - For the guarded current trial, repeat the entire unfinished attempt after any telemetry or
   connection interruption instead of joining measurements across an unknown PWM interval.
 
-SimpleFOC streams `current.q` and `current.d` in amperes. FOCTwin preserves those native units
-when applying thresholds and calculating torque. It must never divide monitor currents by 1000:
-that would weaken every host-side current limit by the same factor.
+SimpleFOC stores `current.q` and `current.d` internally in amperes, but serializes those two fields
+in its monitor stream as `current * 1000`, i.e. milliamperes. FOCTwin divides only the streamed
+Q/D fields by 1000 before applying thresholds, calculating torque, displaying or recording them.
+Commander values such as `ALC` remain in amperes and are not rescaled.
 
 ## What FOCTwin cannot guarantee with the current firmware
 
@@ -29,7 +30,7 @@ that would weaken every host-side current limit by the same factor.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Local command programs (0.5.0b1)
+## Local command programs (0.5.0b2)
 
 A synchronized file cannot start the motor. FOCTwin neither watches the input directory nor owns
 a Google Drive client. A person must open the file, validate the rendered `TX`/`WAIT` sequence and
