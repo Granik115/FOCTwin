@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -149,6 +150,41 @@ class UiSmokeTests(unittest.TestCase):
                 "21.5",
             )
             second.close()
+
+    def test_last_project_and_its_parent_directory_are_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = f"{temporary}/settings.ini"
+            project_root = Path(temporary) / "motor-projects" / "bench.foctwin"
+            first = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
+            first._activate_project(project_root, initialize=True)
+            first.close()
+
+            second = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
+            self.assertIsNotNone(second.project)
+            self.assertEqual(second.project.root, project_root.resolve())
+            self.assertEqual(second._project_dialog_directory, project_root.parent.resolve())
+            self.assertEqual(second.side_project.text(), str(project_root.resolve()))
+            second.close()
+
+    def test_project_picker_starts_in_last_project_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            start = Path(temporary) / "saved-parent"
+            window._project_dialog_directory = start
+
+            with patch(
+                "foctwin.ui.QFileDialog.getExistingDirectory",
+                return_value="",
+            ) as picker:
+                window._open_project()
+
+            picker.assert_called_once_with(
+                window,
+                "Откройте папку *.foctwin",
+                str(start),
+            )
+            window.close()
 
     def test_missing_saved_port_is_replaced_by_a_real_detected_port(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -559,6 +595,26 @@ class UiSmokeTests(unittest.TestCase):
             self.assertIn("AQP8.4222", commands)
             self.assertIn("ADP8.4222", commands)
             self.assertEqual(commands[-6:], ["AT0", "AC2", "A0", "AMC", "AMD20", "AMS1111111"])
+            window.close()
+
+    def test_manual_torque_voltage_mode_sends_direct_uq_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = QSettings(f"{temporary}/settings.ini", QSettings.Format.IniFormat)
+            window = MainWindow(settings)
+            window.motion_combo.setCurrentIndex(
+                window.motion_combo.findData("torque")
+            )
+            window.torque_combo.setCurrentIndex(
+                window.torque_combo.findData("voltage")
+            )
+            pid_values = {loop: window._pid_values(loop) for loop in window.pid_tables}
+
+            commands = window._full_configuration_commands(pid_values, "1111111")
+
+            self.assertEqual(commands[0], "AR-12345")
+            self.assertEqual(commands[-6:-3], ["AT0", "AC0", "A0"])
+            self.assertEqual(window.target_label.text(), "Прямой Uq, В")
+            self.assertIn("A1 означает 1 В", window.target_spin.toolTip())
             window.close()
 
     def test_automatic_readback_does_not_replace_desired_device_limit(self):

@@ -30,7 +30,7 @@ Commander values such as `ALC` remain in amperes and are not rescaled.
 Automated real-motor tests therefore remain attended operations. A human must be able to remove
 motor power immediately.
 
-## Local command programs (0.5.0b2)
+## Local command programs (0.5.0b3)
 
 A synchronized file cannot start the motor. FOCTwin neither watches the input directory nor owns
 a Google Drive client. A person must open the file, validate the rendered `TX`/`WAIT` sequence and
@@ -39,8 +39,9 @@ press **Запустить** while Serial is connected. Editing the text invalid
 The language accepts only one printable ASCII Commander token beginning with the active motor ID,
 `WAIT <nonnegative seconds>`, blank lines and full-line comments. It has no Python, PowerShell,
 shell, executable launch, include, variable, condition, loop or network feature. The format check
-does not prove that an opcode is suitable for the installed firmware or mechanism; that remains
-part of the visible human review.
+does not prove that an arbitrary opcode is suitable for the installed firmware or mechanism; that
+remains part of the visible human review. A narrow known-state check rejects direct `Uq` above a
+visible `ALU` limit but never rewrites the program.
 
 Files are bounded to 256 KiB and 10,000 executable lines. An individual wait is limited to 24
 hours and total waits to seven days. Each attended run stores the reviewed source, its SHA-256,

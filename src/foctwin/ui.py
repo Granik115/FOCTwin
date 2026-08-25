@@ -229,6 +229,8 @@ class MainWindow(QMainWindow):
             QStandardPaths.StandardLocation.DocumentsLocation
         )
         documents = Path(documents_path) if documents_path else Path.home() / "Documents"
+        self._project_dialog_directory = documents
+        self._last_project_path: Path | None = None
         exchange_root = documents / "AutotunerExchange"
         self._program_input_directory = exchange_root / "inbox" / "programs"
         self._program_output_root = exchange_root / "outbox" / "runs"
@@ -297,6 +299,7 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.setInterval(250)
         self._settings_save_timer.timeout.connect(self._save_user_settings)
         self._restore_user_settings()
+        self._restore_last_project()
         self._refresh_ports()
         self._connect_settings_persistence()
         self._reconnect_timer = QTimer(self)
@@ -495,7 +498,10 @@ class MainWindow(QMainWindow):
         self.torque_combo.addItem("Voltage", TorqueMode.VOLTAGE)
         self.torque_combo.addItem("FOC Current", TorqueMode.FOC_CURRENT)
         self.torque_combo.addItem("DC Current", TorqueMode.DC_CURRENT)
+        self.motion_combo.currentIndexChanged.connect(self._update_target_presentation)
+        self.torque_combo.currentIndexChanged.connect(self._update_target_presentation)
         self.target_spin = spin(0.0, -100000, 100000)
+        self.target_label = QLabel("Цель положения, рад")
         self.apply_modes_button = QPushButton("Применить режимы и всю конфигурацию")
         self.apply_modes_button.setToolTip(
             "Отправляет лимиты, PID/LPF, режимы, цель и настройки мониторинга. PWM не включает."
@@ -525,10 +531,11 @@ class MainWindow(QMainWindow):
         self.allow_live_changes_checkbox.setChecked(False)
         control_form.addRow("Контур движения", self.motion_combo)
         control_form.addRow("Контур момента", self.torque_combo)
-        control_form.addRow("Цель", self.target_spin)
+        control_form.addRow(self.target_label, self.target_spin)
         control_form.addRow(control_buttons)
         control_form.addRow(self.pwm_state_label)
         control_form.addRow(self.allow_live_changes_checkbox)
+        self._update_target_presentation()
         left_layout.addWidget(control)
 
         device_limits = QGroupBox("Ограничения внутри SimpleFOC")
@@ -4081,18 +4088,31 @@ class MainWindow(QMainWindow):
         return page
 
     def _new_project(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "Выберите родительскую папку проекта")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите родительскую папку проекта",
+            str(self._project_dialog_directory),
+        )
         if not directory:
             return
+        self._project_dialog_directory = Path(directory).expanduser().resolve()
+        self._save_user_settings()
         name, accepted = self._ask_project_name()
         if not accepted:
             return
         self._activate_project(Path(directory) / f"{name}.foctwin", initialize=True)
 
     def _open_project(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "Откройте папку *.foctwin")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Откройте папку *.foctwin",
+            str(self._project_dialog_directory),
+        )
         if directory:
-            self._activate_project(Path(directory), initialize=False)
+            try:
+                self._activate_project(Path(directory), initialize=False)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Проект не открыт", str(exc))
 
     def _ask_project_name(self) -> tuple[str, bool]:
         dialog = QDialog(self)
@@ -4110,13 +4130,35 @@ class MainWindow(QMainWindow):
         return name or "foctwin-project", accepted
 
     def _activate_project(self, root: Path, initialize: bool) -> None:
-        self.project = ProjectStore(root)
-        if initialize or not self.project.db_path.exists():
-            self.project.initialize(self.profile)
-        self.side_project.setText(str(root))
-        self.dashboard_project.setText(str(root))
-        self.statusBar().showMessage(f"Проект открыт: {root}", 5000)
-        self._log("INFO", f"Проект открыт: {root}")
+        candidate = ProjectStore(root)
+        if initialize or not candidate.db_path.exists():
+            candidate.initialize(self.profile)
+        self.project = candidate
+        self._last_project_path = candidate.root
+        self._project_dialog_directory = candidate.root.parent
+        self.side_project.setText(str(candidate.root))
+        self.dashboard_project.setText(str(candidate.root))
+        self.statusBar().showMessage(f"Проект открыт: {candidate.root}", 5000)
+        self._log("INFO", f"Проект открыт: {candidate.root}")
+        self._save_user_settings()
+
+    def _restore_last_project(self) -> None:
+        root = self._last_project_path
+        if root is None:
+            return
+        candidate = ProjectStore(root)
+        if not candidate.root.is_dir() or not candidate.db_path.is_file():
+            self._log(
+                "PROJECT",
+                f"Последний проект не найден: {candidate.root}. "
+                "Папка выбора сохранена.",
+            )
+            return
+        try:
+            self._activate_project(candidate.root, initialize=False)
+        except (OSError, ValueError) as exc:
+            self.project = None
+            self._log("ERROR", f"Последний проект не открыт: {exc}")
 
     def _connect_settings_persistence(self) -> None:
         spin_boxes = [
@@ -4247,6 +4289,10 @@ class MainWindow(QMainWindow):
                 "input_directory": str(self._program_input_directory),
                 "output_root": self.program_output_root_edit.text().strip(),
             },
+            "project": {
+                "last_directory": str(self._project_dialog_directory),
+                "last_open_path": str(self._last_project_path or ""),
+            },
             "friction": self._friction_config_from_widgets().to_dict(),
             "current_trial": {
                 "schema": CURRENT_TRIAL_CHECKPOINT_SCHEMA,
@@ -4343,6 +4389,17 @@ class MainWindow(QMainWindow):
                 if output_root:
                     self._program_output_root = Path(output_root).expanduser().resolve()
                     self.program_output_root_edit.setText(str(self._program_output_root))
+
+            project = payload.get("project", {})
+            if isinstance(project, dict):
+                last_directory = str(project.get("last_directory", "")).strip()
+                last_open_path = str(project.get("last_open_path", "")).strip()
+                if last_directory:
+                    self._project_dialog_directory = (
+                        Path(last_directory).expanduser().resolve()
+                    )
+                if last_open_path:
+                    self._last_project_path = Path(last_open_path).expanduser().resolve()
 
             friction = payload.get("friction")
             if isinstance(friction, dict):
@@ -4642,8 +4699,13 @@ class MainWindow(QMainWindow):
         pid_values: dict[str, dict[str, float]],
         monitor_mask: str,
     ) -> list[str]:
+        phase_resistance = (
+            FRICTION_DIRECT_VOLTAGE_SENTINEL
+            if self._manual_direct_voltage_mode()
+            else self.profile.phase_resistance_ohm
+        )
         commands = [
-            self.protocol.phase_resistance(self.profile.phase_resistance_ohm),
+            self.protocol.phase_resistance(phase_resistance),
             self.protocol.current_limit(self.device_limit_spins["current_a"].value()),
             self.protocol.voltage_limit(self.device_limit_spins["voltage_v"].value()),
             self.protocol.velocity_limit(self.device_limit_spins["velocity_rad_s"].value()),
@@ -4664,6 +4726,34 @@ class MainWindow(QMainWindow):
             )
         )
         return commands
+
+    def _manual_direct_voltage_mode(self) -> bool:
+        return (
+            self.motion_combo.currentData() == MotionMode.TORQUE
+            and self.torque_combo.currentData() == TorqueMode.VOLTAGE
+        )
+
+    def _update_target_presentation(self, *_args: object) -> None:
+        if not hasattr(self, "target_label"):
+            return
+        motion = self.motion_combo.currentData()
+        if motion in {MotionMode.ANGLE, MotionMode.ANGLE_OPEN_LOOP}:
+            label = "Цель положения, рад"
+            tooltip = "Механическая координата в радианах."
+        elif motion in {MotionMode.VELOCITY, MotionMode.VELOCITY_OPEN_LOOP}:
+            label = "Цель скорости, рад/с"
+            tooltip = "Механическая скорость в радианах в секунду."
+        elif self.torque_combo.currentData() == TorqueMode.VOLTAGE:
+            label = "Прямой Uq, В"
+            tooltip = (
+                "Прямое задание квадратурного напряжения. При применении конфигурации "
+                "FOCTwin отправляет AR-12345, поэтому A1 означает 1 В, а не 1 А."
+            )
+        else:
+            label = "Цель тока, А"
+            tooltip = "Задание тока для выбранного токового контура."
+        self.target_label.setText(label)
+        self.target_spin.setToolTip(tooltip)
 
     def _finish_configuration_apply(self) -> None:
         self._configuration_apply_in_progress = False

@@ -19,6 +19,23 @@ prevents accidentally publishing a commit under the wrong version number.
 
 Until code signing is introduced, Windows SmartScreen may warn when the executable starts.
 
+## 0.5.0b3
+
+- Make manual **Torque + Voltage** control genuinely direct: FOCTwin sends the SimpleFOC
+  `NOT_SET` phase-resistance sentinel before applying the mode, so target `A1` means `Uq=1 V`
+  instead of a one-ampere target converted through the configured phase resistance.
+- Restore the configured `0.675 ohm` phase resistance whenever manual control returns to angle,
+  velocity or a current torque mode.
+- Label the manual target with its active physical unit and explain the direct-Uq conversion in a
+  tooltip.
+- Reject a visible direct-voltage program whose known target exceeds its known `ALU` limit. For
+  example, `AR-12345 / AT0 / AC0 / ALU1 / A2` now fails validation instead of silently producing
+  only a 1 V pulse. Raw commands are never rewritten.
+- Persist the last project path and its parent directory. A valid previous project opens
+  automatically on the next launch, and both project pickers start in the remembered directory.
+- Preserve the corrected SimpleFOC monitor current units from 0.5.0b2 and the local FolderBridge
+  file workflow from 0.5.0b1.
+
 ## 0.5.0b2
 
 - Restore the documented SimpleFOC monitor conversion from milliamperes to amperes. SimpleFOC's

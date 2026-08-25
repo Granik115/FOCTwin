@@ -52,6 +52,27 @@ class MotorProgramTests(unittest.TestCase):
         with self.assertRaisesRegex(ProgramError, "неотрицательным"):
             compiler.compile("AE0\nWAIT -1")
 
+    def test_direct_voltage_target_must_not_exceed_programmed_voltage_limit(self):
+        compiler = MotorProgramCompiler("A")
+        source = "AE0\nAR-12345\nAT0\nAC0\nALU1\nA2\nAE1\n"
+
+        with self.assertRaisesRegex(ProgramError, r"Строка 6.*Uq 2 В.*ALU 1 В"):
+            compiler.compile(source)
+
+    def test_direct_voltage_target_accepts_matching_limit_and_other_modes(self):
+        compiler = MotorProgramCompiler("A")
+        direct = compiler.compile("AR-12345\nAT0\nAC0\nALU4\nA4\n")
+        position = compiler.compile("AR0.675\nAT0\nAC2\nALU1\nA4\n")
+
+        self.assertEqual(direct.steps[-1].command, "A4")
+        self.assertEqual(position.steps[-1].command, "A4")
+
+    def test_direct_voltage_limit_cannot_be_lowered_below_existing_target(self):
+        source = "AR-12345\nAT0\nAC0\nALU4\nA4\nALU1\n"
+
+        with self.assertRaisesRegex(ProgramError, r"Строка 6.*Uq 4 В.*ALU 1 В"):
+            MotorProgramCompiler("A").compile(source)
+
     def test_source_save_and_run_journal_are_plain_durable_files(self):
         program = MotorProgramCompiler("A").compile("AE0\nWAIT 0\nAE1")
         with tempfile.TemporaryDirectory() as temporary:

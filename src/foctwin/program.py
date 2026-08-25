@@ -24,6 +24,8 @@ _WAIT_PATTERN = re.compile(
     r"^WAIT\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)$",
     flags=re.IGNORECASE,
 )
+_NUMBER_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_DIRECT_VOLTAGE_PHASE_RESISTANCE = -12345.0
 
 
 def utc_now() -> str:
@@ -68,6 +70,25 @@ class ProgramError(ValueError):
     pass
 
 
+@dataclass(slots=True)
+class _CommanderProgramState:
+    """Known Commander state used only for a narrow direct-voltage safety check."""
+
+    phase_resistance_unset: bool | None = None
+    torque_mode: int | None = None
+    motion_mode: int | None = None
+    voltage_limit_v: float | None = None
+    target: float | None = None
+
+    @property
+    def direct_voltage_mode(self) -> bool:
+        return (
+            self.phase_resistance_unset is True
+            and self.torque_mode == 0
+            and self.motion_mode == 0
+        )
+
+
 class MotorProgramCompiler:
     """Parse an auditable program made only of raw firmware commands and WAIT."""
 
@@ -82,6 +103,7 @@ class MotorProgramCompiler:
 
         steps: list[ProgramStep] = []
         total_wait_seconds = 0.0
+        commander_state = _CommanderProgramState()
         for line_number, raw_line in enumerate(source.splitlines(), start=1):
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -114,6 +136,11 @@ class MotorProgramCompiler:
                         f"Строка {line_number}: ожидается WAIT <секунды>, например WAIT 0.5"
                     )
                 self._validate_command(line_number, line)
+                self._validate_known_commander_state(
+                    line_number,
+                    line,
+                    commander_state,
+                )
                 steps.append(
                     ProgramStep(
                         line_number=line_number,
@@ -154,6 +181,64 @@ class MotorProgramCompiler:
             raise ProgramError(
                 f"Строка {line_number}: команда содержит недопустимый управляющий символ"
             )
+
+    def _validate_known_commander_state(
+        self,
+        line_number: int,
+        command: str,
+        state: _CommanderProgramState,
+    ) -> None:
+        payload = command[1:]
+
+        phase_resistance = self._command_number(payload, "R")
+        if phase_resistance is not None:
+            state.phase_resistance_unset = math.isclose(
+                phase_resistance,
+                _DIRECT_VOLTAGE_PHASE_RESISTANCE,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+
+        torque_mode = self._command_integer(payload, "T")
+        if torque_mode is not None:
+            state.torque_mode = torque_mode
+
+        motion_mode = self._command_integer(payload, "C")
+        if motion_mode is not None:
+            state.motion_mode = motion_mode
+
+        voltage_limit = self._command_number(payload, "LU")
+        if voltage_limit is not None:
+            state.voltage_limit_v = abs(voltage_limit)
+
+        target = self._command_number(payload, "")
+        if target is not None:
+            state.target = target
+
+        if (
+            state.target is not None
+            and state.direct_voltage_mode
+            and state.voltage_limit_v is not None
+            and abs(state.target) > state.voltage_limit_v + 1e-12
+        ):
+            raise ProgramError(
+                f"Строка {line_number}: прямой Uq {state.target:g} В превышает "
+                f"заданный ALU {state.voltage_limit_v:g} В; увеличьте ALU "
+                "или уменьшите амплитуду команды A"
+            )
+
+    @staticmethod
+    def _command_number(payload: str, prefix: str) -> float | None:
+        match = re.fullmatch(rf"{re.escape(prefix)}({_NUMBER_PATTERN})", payload)
+        if match is None:
+            return None
+        value = float(match.group(1))
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _command_integer(payload: str, prefix: str) -> int | None:
+        match = re.fullmatch(rf"{re.escape(prefix)}(\d+)", payload)
+        return int(match.group(1)) if match is not None else None
 
 
 def render_program(program: MotorProgram) -> str:
